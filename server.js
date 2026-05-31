@@ -46,6 +46,17 @@ app.use('/api/leads',     leadsRoutes);
 app.use('/api/salary',    salaryRoutes);
 app.use('/api/finance',   financeRoutes);
 
+app.get('/setup', async (req, res) => {
+  try {
+    const { User } = require('./models');
+    await User.deleteOne({ phone: '9008865545' });
+    await User.create({ name: 'Admin', phone: '9008865545', password: 'Admin@123', role: 'owner', isActive: true });
+    res.json({ message: 'Admin user created successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });
 });

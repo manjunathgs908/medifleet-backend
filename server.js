@@ -50,7 +50,7 @@ app.get('/setup', async (req, res) => {
   try {
     const { User } = require('./models');
     await User.deleteOne({ phone: '9008865545' });
-    await User.create({ name: 'Admin', phone: '9008865545', password: 'Admin@123', role: 'owner', isActive: true });
+    const bcrypt = require('bcryptjs'); const hash = await bcrypt.hash('Admin@123', 10); await User.collection.insertOne({ name: 'A
     res.json({ message: 'Admin user created successfully!' });
   } catch (err) {
     res.status(500).json({ error: err.message });

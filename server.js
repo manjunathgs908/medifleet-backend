@@ -5,6 +5,7 @@ const cors       = require('cors');
 const helmet     = require('helmet');
 const morgan     = require('morgan');
 const dotenv     = require('dotenv');
+const bcrypt     = require('bcryptjs');
 
 dotenv.config();
 
@@ -49,8 +50,17 @@ app.use('/api/finance',   financeRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User } = require('./models');
-    await User.deleteOne({ phone: '9008865545' });
-    const bcrypt = require('bcryptjs'); const hash = await bcrypt.hash('Admin@123', 10); await User.collection.insertOne({ name: 'A
+    await User.deleteMany({ phone: '9008865545' });
+    const hash = await bcrypt.hash('Admin@123', 10);
+    const user = new User({
+      name: 'Admin',
+      phone: '9008865545',
+      password: hash,
+      role: 'owner',
+      isActive: true
+    });
+    user.$skipHashPassword = true;
+    await user.save();
     res.json({ message: 'Admin user created successfully!' });
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -5,7 +5,6 @@ const cors       = require('cors');
 const helmet     = require('helmet');
 const morgan     = require('morgan');
 const dotenv     = require('dotenv');
-const bcrypt     = require('bcryptjs');
 
 dotenv.config();
 
@@ -50,18 +49,10 @@ app.use('/api/finance',   financeRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User } = require('./models');
-    await User.deleteMany({ phone: '9008865545' });
-    const hash = await bcrypt.hash('Admin@123', 10);
-    const user = new User({
-      name: 'Admin',
-      phone: '9008865545',
-      password: hash,
-      role: 'owner',
-      isActive: true
-    });
-    user.$skipHashPassword = true;
-    await user.save();
-    res.json({ message: 'Admin user created successfully!' });
+    await User.deleteMany({ phone: { $in: ['8884092777', '9986844442'] } });
+    await User.create({ name: 'Driver', phone: '8884092777', password: 'Driver@123', role: 'driver', isActive: true });
+    await User.create({ name: 'Telecaller', phone: '9986844442', password: 'Tele@123', role: 'telecaller', isActive: true });
+    res.json({ message: 'Driver and Telecaller created successfully!' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

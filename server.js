@@ -49,8 +49,7 @@ app.use('/api/finance',   financeRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');
-    await User.deleteMany({ phone: { $in: ['9008865545', '8884092777', '9986844442'] } });
-    await User.create({ name: 'Admin', phone: '9008865545', password: 'Admin@123', role: 'owner', isActive: true });
+    await User.deleteMany({ phone: { $in: ['8884092777', '9986844442'] } });
     await User.create({ name: 'Driver', phone: '8884092777', password: 'Driver@123', role: 'driver', isActive: true });
     await User.create({ name: 'Telecaller', phone: '9986844442', password: 'Tele@123', role: 'telecaller', isActive: true });
     await Hospital.deleteMany({ name: { $in: ['Manipal Hospital', 'Apollo Hospital'] } });

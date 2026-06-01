@@ -5,7 +5,7 @@ const tripCtrl = require('../controllers/tripController');
 const { protect, authorize } = require('../middleware/auth');
 
 router.post('/', protect, authorize('owner','telecaller'), tripCtrl.createTrip);
-router.get('/live', protect, authorize('owner','telecaller'), tripCtrl.getLiveBoard);
+router.get('/live', protect, authorize('owner','telecaller','driver'), tripCtrl.getLiveBoard);
 router.get('/', protect, tripCtrl.getTrips);
 router.get('/:id', protect, tripCtrl.getTripById);
 router.put('/:id/assign', protect, authorize('owner','telecaller'), tripCtrl.assignVehicle);

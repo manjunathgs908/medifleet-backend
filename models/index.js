@@ -1,23 +1,23 @@
-/**
+﻿/**
  * models/index.js
  * ============================================================
  * Central export of ALL Mongoose schemas and models.
  *
  * Models defined here:
- *   1. User          — Staff (Owner / Telecaller / Driver)
- *   2. Vehicle       — Fleet asset with compliance documents
- *   3. Attendance    — Driver punch-in/out + shift record
- *   4. Hospital      — Tie-up hospital master + contract terms
- *   5. Lead          — Inbound leads from FB/Google Ads + calls
- *   6. Trip          — Booking lifecycle + fare computation
- *   7. Bill          — Auto-generated bill on trip completion
- *   8. HospitalInvoice — Monthly consolidated hospital invoice
- *   9. Expense       — All outflows (diesel, maintenance, EMI…)
- *  10. Income        — All inflows (trip fares, hospital credits)
- *  11. Loan          — Vehicle loan + EMI schedule
- *  12. SalaryRecord  — Computed monthly salary per driver
- *  13. ServiceLog    — Vehicle maintenance history
- *  14. Notification  — System compliance / alert notifications
+ *   1. User          â€” Staff (Owner / Telecaller / Driver)
+ *   2. Vehicle       â€” Fleet asset with compliance documents
+ *   3. Attendance    â€” Driver punch-in/out + shift record
+ *   4. Hospital      â€” Tie-up hospital master + contract terms
+ *   5. Lead          â€” Inbound leads from FB/Google Ads + calls
+ *   6. Trip          â€” Booking lifecycle + fare computation
+ *   7. Bill          â€” Auto-generated bill on trip completion
+ *   8. HospitalInvoice â€” Monthly consolidated hospital invoice
+ *   9. Expense       â€” All outflows (diesel, maintenance, EMIâ€¦)
+ *  10. Income        â€” All inflows (trip fares, hospital credits)
+ *  11. Loan          â€” Vehicle loan + EMI schedule
+ *  12. SalaryRecord  â€” Computed monthly salary per driver
+ *  13. ServiceLog    â€” Vehicle maintenance history
+ *  14. Notification  â€” System compliance / alert notifications
  * ============================================================
  */
 
@@ -57,32 +57,32 @@ const userSchema = new Schema(
       select   : false, // Never returned in queries by default
     },
 
-    // ── RBAC Role ────────────────────────────────────────────
+    // â”€â”€ RBAC Role â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     role: {
       type    : String,
       enum    : ['owner', 'telecaller', 'driver'],
       default : 'driver',
     },
 
-    // ── Driver-specific fields (only populated when role=driver)
+    // â”€â”€ Driver-specific fields (only populated when role=driver)
     licenseNumber : { type: String, trim: true },
     licenseExpiry : { type: Date },
     vehicleId     : { type: Schema.Types.ObjectId, ref: 'Vehicle' }, // Assigned ambulance
     shiftType     : { type: String, enum: ['day', 'night', 'flexible'], default: 'day' },
 driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 'shift_driver' },
 
-    // ── Salary configuration (used by salary engine) ─────────
+    // â”€â”€ Salary configuration (used by salary engine) â”€â”€â”€â”€â”€â”€â”€â”€â”€
     baseSalary  : { type: Number, default: 15000 },  // Fixed monthly component
     perTripBonus: { type: Number, default: 100 },    // Bonus per completed trip
 
-    // ── OTP & auth state ─────────────────────────────────────
+    // â”€â”€ OTP & auth state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     otp           : { type: String, select: false },
     otpExpiry     : { type: Date,   select: false },
     refreshToken  : { type: String, select: false },
     isActive      : { type: Boolean, default: true },
     lastLogin     : { type: Date },
 
-    // ── Driver current availability (synced from mobile app) ──
+    // â”€â”€ Driver current availability (synced from mobile app) â”€â”€
     availability  : {
       status   : { type: String, enum: ['available', 'on_trip', 'offline'], default: 'offline' },
       updatedAt: { type: Date,   default: Date.now },
@@ -95,7 +95,7 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
   { timestamps: true }
 );
 
-// ── Hash password before save ─────────────────────────────────
+// â”€â”€ Hash password before save â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password') || !this.password) return next();
   const salt    = await bcrypt.genSalt(12);
@@ -103,12 +103,12 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
-// ── Instance method: compare password ────────────────────────
+// â”€â”€ Instance method: compare password â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 userSchema.methods.comparePassword = async function (candidate) {
   return bcrypt.compare(candidate, this.password);
 };
 
-// ── Instance method: check if OTP is valid ───────────────────
+// â”€â”€ Instance method: check if OTP is valid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 userSchema.methods.isOtpValid = function (otp) {
   return this.otp === otp && this.otpExpiry > Date.now();
 };
@@ -137,7 +137,7 @@ const vehicleSchema = new Schema(
       default : 'offline',
     },
 
-    // ── GPS — updated via driver app WebSocket / REST ─────────
+    // â”€â”€ GPS â€” updated via driver app WebSocket / REST â”€â”€â”€â”€â”€â”€â”€â”€â”€
     gps: {
       lat      : { type: Number },
       lng      : { type: Number },
@@ -147,7 +147,7 @@ const vehicleSchema = new Schema(
     odometer: { type: Number, default: 0 }, // km
     fuelType : { type: String, enum: ['diesel', 'petrol', 'cng', 'electric'], default: 'diesel' },
 
-    // ── Compliance Documents ──────────────────────────────────
+    // â”€â”€ Compliance Documents â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Each sub-document has expiry date + alert tracking fields
     documents: {
       insurance: {
@@ -184,7 +184,7 @@ const vehicleSchema = new Schema(
       },
     },
 
-    // ── Loan reference ────────────────────────────────────────
+    // â”€â”€ Loan reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     loanId: { type: Schema.Types.ObjectId, ref: 'Loan' },
 
     notes    : { type: String },
@@ -233,7 +233,7 @@ const attendanceSchema = new Schema(
       default: 'absent',
     },
 
-    // Pre-shift mandatory checklist — vehicle must pass before driver goes Available
+    // Pre-shift mandatory checklist â€” vehicle must pass before driver goes Available
     shiftChecklist: {
       oxygenLevelPct  : { type: Number },      // Must be >= 80 to unlock Available status
       kitComplete     : { type: Boolean },
@@ -300,18 +300,18 @@ const Hospital = mongoose.model('Hospital', hospitalSchema);
 // ============================================================
 const leadSchema = new Schema(
   {
-    // ── Lead source ──────────────────────────────────────────
+    // â”€â”€ Lead source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     source: {
       type    : String,
       enum    : ['facebook_ad', 'google_ad', 'inbound_call', 'walk_in', 'referral', 'manual'],
       default : 'manual',
     },
 
-    // ── Raw platform IDs for deduplication ───────────────────
+    // â”€â”€ Raw platform IDs for deduplication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     fbLeadId     : { type: String, sparse: true }, // Facebook form lead ID
     googleLeadId : { type: String, sparse: true }, // Google Lead Extension ID
 
-    // ── Patient / Customer Details ───────────────────────────
+    // â”€â”€ Patient / Customer Details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     patientName : { type: String, trim: true },
     phone       : { type: String, required: true, index: true },
     email       : { type: String, trim: true, lowercase: true },
@@ -319,7 +319,7 @@ const leadSchema = new Schema(
     adName      : { type: String },            // Which ad/campaign triggered this
     formName    : { type: String },
 
-    // ── CRM state ────────────────────────────────────────────
+    // â”€â”€ CRM state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status: {
       type   : String,
       enum   : ['new', 'contacted', 'converted', 'lost', 'spam'],
@@ -329,7 +329,7 @@ const leadSchema = new Schema(
     notes       : { type: String },
     convertedTrip: { type: Schema.Types.ObjectId, ref: 'Trip' }, // If lead became a trip
 
-    // ── Call popup data (populated from telephony webhook) ───
+    // â”€â”€ Call popup data (populated from telephony webhook) â”€â”€â”€
     callHistory: [
       {
         callSid   : String,
@@ -355,7 +355,7 @@ const tripSchema = new Schema(
   {
     tripNumber: { type: String, unique: true }, // Auto-generated: TRP-YYYYMMDD-001
 
-    // ── Patient Details ───────────────────────────────────────
+    // â”€â”€ Patient Details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     patientName   : { type: String, required: true, trim: true },
     patientPhone  : { type: String, required: true },
     emergencyType : {
@@ -364,7 +364,7 @@ const tripSchema = new Schema(
       default : 'general',
     },
 
-    // ── Locations ─────────────────────────────────────────────
+    // â”€â”€ Locations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pickup: {
       address: { type: String, required: true },
       lat    : Number,
@@ -373,13 +373,13 @@ const tripSchema = new Schema(
     dropHospital  : { type: Schema.Types.ObjectId, ref: 'Hospital', required: true },
     dropAddress   : { type: String },
 
-    // ── Assignment ────────────────────────────────────────────
+    // â”€â”€ Assignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     vehicle       : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
     driver        : { type: Schema.Types.ObjectId, ref: 'User' },
     bookedBy      : { type: Schema.Types.ObjectId, ref: 'User' }, // Telecaller
     leadId        : { type: Schema.Types.ObjectId, ref: 'Lead' }, // If originated from ad lead
 
-    // ── Fare Computation ──────────────────────────────────────
+    // â”€â”€ Fare Computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     baseFare      : { type: Number, required: true, default: 1500 },
     distanceKm    : { type: Number, default: 0 },
     perKmRate     : { type: Number, default: 25 },
@@ -388,7 +388,7 @@ const tripSchema = new Schema(
     gstAmount     : { type: Number },
     grandTotal    : { type: Number },               // totalFare + GST
 
-    // ── Lifecycle ─────────────────────────────────────────────
+    // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status: {
       type   : String,
       enum   : ['booked', 'dispatched', 'en_route', 'completed', 'cancelled'],
@@ -403,7 +403,7 @@ const tripSchema = new Schema(
     cancelledAt   : Date,
     cancellationReason: String,
 
-    // ── Billing state ─────────────────────────────────────────
+    // â”€â”€ Billing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
   },
@@ -433,7 +433,7 @@ const billSchema = new Schema(
     patient     : { type: String },
     hospital    : { type: Schema.Types.ObjectId, ref: 'Hospital' },
 
-    // ── Fare Breakdown ────────────────────────────────────────
+    // â”€â”€ Fare Breakdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     baseFare          : { type: Number },
     distanceKm        : { type: Number },
     perKmRate         : { type: Number },
@@ -444,7 +444,7 @@ const billSchema = new Schema(
     gstAmount         : { type: Number },
     grandTotal        : { type: Number },
 
-    // ── Payment State ─────────────────────────────────────────
+    // â”€â”€ Payment State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     paymentStatus: {
       type   : String,
       enum   : ['pending', 'paid', 'partial', 'waived'],
@@ -454,7 +454,7 @@ const billSchema = new Schema(
     paidAmount  : { type: Number, default: 0 },
     paidAt      : { type: Date },
 
-    // ── Hospital Invoice Reference ────────────────────────────
+    // â”€â”€ Hospital Invoice Reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     invoiceId   : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },
 
     notes       : String,
@@ -490,7 +490,7 @@ const hospitalInvoiceSchema = new Schema(
     trips          : [{ type: Schema.Types.ObjectId, ref: 'Trip' }], // All trips in period
     bills          : [{ type: Schema.Types.ObjectId, ref: 'Bill' }],
 
-    // ── Totals ────────────────────────────────────────────────
+    // â”€â”€ Totals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     totalTrips     : { type: Number },
     grossAmount    : { type: Number },  // Sum of all grandTotals
     discountPercent: { type: Number },  // From hospital.tieUp.discountPercent
@@ -531,7 +531,7 @@ const expenseSchema = new Schema(
     vehicle     : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
     date        : { type: Date, required: true, default: Date.now },
 
-    // ── Diesel-specific ───────────────────────────────────────
+    // â”€â”€ Diesel-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     diesel: {
       litres        : Number,
       pricePerLitre : Number,
@@ -540,7 +540,7 @@ const expenseSchema = new Schema(
       receiptUrl    : String,  // Cloudinary URL
     },
 
-    // ── EMI-specific ──────────────────────────────────────────
+    // â”€â”€ EMI-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     emi: {
       loanId    : { type: Schema.Types.ObjectId, ref: 'Loan' },
       emiMonth  : Number,
@@ -571,7 +571,7 @@ const incomeSchema = new Schema(
     description : { type: String },
     date        : { type: Date, required: true, default: Date.now },
 
-    // ── Reference links ───────────────────────────────────────
+    // â”€â”€ Reference links â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     trip       : { type: Schema.Types.ObjectId, ref: 'Trip' },
     invoice    : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },
     vehicle    : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
@@ -600,7 +600,7 @@ const loanSchema = new Schema(
     emiDueDay   : { type: Number, default: 1, min: 1, max: 28 }, // Day of month EMI is due
     startDate   : { type: Date, required: true },
 
-    // ── Repayment tracking ────────────────────────────────────
+    // â”€â”€ Repayment tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     paidInstallments : { type: Number, default: 0 },
     totalPaidAmount  : { type: Number, default: 0 },
     status : { type: String, enum: ['active', 'closed', 'defaulted'], default: 'active' },
@@ -638,21 +638,21 @@ const salaryRecordSchema = new Schema(
     month        : { type: Number, required: true, min: 1, max: 12 },
     year         : { type: Number, required: true },
 
-    // ── Computation Inputs ────────────────────────────────────
+    // â”€â”€ Computation Inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     workingDays     : { type: Number },  // Total working days in month
     presentDays     : { type: Number },  // From Attendance records
     completedTrips  : { type: Number },  // From Trip records
     baseSalary      : { type: Number },  // Snapshot of driver.baseSalary at calc time
     perTripBonus    : { type: Number },  // Snapshot of driver.perTripBonus
 
-    // ── Calculation Results ───────────────────────────────────
+    // â”€â”€ Calculation Results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     earnedBase      : { type: Number },  // baseSalary * (presentDays / workingDays)
     tripBonusAmount : { type: Number },  // completedTrips * perTripBonus
     grossSalary     : { type: Number },  // earnedBase + tripBonusAmount
     deductions      : { type: Number, default: 0 }, // Advances, penalties
     netSalary       : { type: Number },  // grossSalary - deductions
 
-    // ── Payment ───────────────────────────────────────────────
+    // â”€â”€ Payment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status    : { type: String, enum: ['draft', 'approved', 'paid'], default: 'draft' },
     approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     paidAt    : Date,
@@ -688,19 +688,19 @@ const serviceLogSchema = new Schema(
     description   : { type: String },
     receiptUrl    : { type: String },
 
-    // ── Tyre-specific ─────────────────────────────────────────
+    // â”€â”€ Tyre-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     tyre: {
       position: { type: String, enum: ['FL', 'FR', 'RL', 'RR', 'spare'] },
       brand   : String,
     },
 
-    // ── O2 Cylinder-specific ──────────────────────────────────
+    // â”€â”€ O2 Cylinder-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     oxygen: {
       cylinderId  : String,
       fillLevelPct: Number,
     },
 
-    // ── Next service reminder ─────────────────────────────────
+    // â”€â”€ Next service reminder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     nextServiceDate  : Date,
     nextServiceOdoKm : Number,
 
@@ -726,7 +726,7 @@ const notificationSchema = new Schema(
     message : { type: String, required: true },
     severity: { type: String, enum: ['info', 'warning', 'critical'], default: 'info' },
 
-    // ── References ────────────────────────────────────────────
+    // â”€â”€ References â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     vehicle  : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
     user     : { type: Schema.Types.ObjectId, ref: 'User' },
     trip     : { type: Schema.Types.ObjectId, ref: 'Trip' },
@@ -762,7 +762,7 @@ const advanceSchema = new Schema(
   { timestamps: true }
 );
 const Advance = mongoose.model('Advance', advanceSchema);
-// ── Single export object ──────────────────────────────────────
+// â”€â”€ Single export object â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 module.exports = {
   User,
   Vehicle,
@@ -780,4 +780,4 @@ module.exports = {
   Notification,
   Advance,
 };
-};
+

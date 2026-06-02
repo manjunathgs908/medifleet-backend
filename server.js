@@ -36,6 +36,7 @@ const hospitalRoutes = require('./routes/hospitals');
 const leadsRoutes    = require('./routes/leads');
 const salaryRoutes   = require('./routes/salary');
 const financeRoutes  = require('./routes/finance');
+const tripActivityRoutes = require('./routes/tripActivity');
 const attendanceRoutes = require('./routes/attendance');
 
 app.use('/api/auth',      authRoutes);
@@ -46,6 +47,7 @@ app.use('/api/hospitals', hospitalRoutes);
 app.use('/api/leads',     leadsRoutes);
 app.use('/api/salary',    salaryRoutes);
 app.use('/api/finance',   financeRoutes);
+app.use('/api/trip-activity', tripActivityRoutes);
 app.use('/api/attendance', attendanceRoutes);
 
 app.get('/setup', async (req, res) => {

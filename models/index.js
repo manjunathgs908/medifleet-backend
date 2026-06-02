@@ -69,6 +69,7 @@ const userSchema = new Schema(
     licenseExpiry : { type: Date },
     vehicleId     : { type: Schema.Types.ObjectId, ref: 'Vehicle' }, // Assigned ambulance
     shiftType     : { type: String, enum: ['day', 'night', 'flexible'], default: 'day' },
+driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 'shift_driver' },
 
     // ── Salary configuration (used by salary engine) ─────────
     baseSalary  : { type: Number, default: 15000 },  // Fixed monthly component

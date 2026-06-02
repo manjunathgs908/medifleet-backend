@@ -743,7 +743,25 @@ const notificationSchema = new Schema(
 
 const Notification = mongoose.model('Notification', notificationSchema);
 
-
+// ============================================================
+// 15. ADVANCE MODEL
+// ============================================================
+const advanceSchema = new Schema(
+  {
+    driver        : { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    amount        : { type: Number, required: true },
+    reason        : { type: String, required: true },
+    status        : { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    approvedBy    : { type: Schema.Types.ObjectId, ref: 'User' },
+    approvedAt    : { type: Date },
+    rejectedReason: { type: String },
+    deductedMonth : { type: Number },
+    deductedYear  : { type: Number },
+    isDeducted    : { type: Boolean, default: false },
+  },
+  { timestamps: true }
+);
+const Advance = mongoose.model('Advance', advanceSchema);
 // ── Single export object ──────────────────────────────────────
 module.exports = {
   User,
@@ -760,4 +778,6 @@ module.exports = {
   SalaryRecord,
   ServiceLog,
   Notification,
+  Advance,
+};
 };

@@ -38,6 +38,7 @@ const salaryRoutes   = require('./routes/salary');
 const financeRoutes  = require('./routes/finance');
 const tripActivityRoutes = require('./routes/tripActivity');
 const attendanceRoutes = require('./routes/attendance');
+const advanceRoutes = require('./routes/advance');
 
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
@@ -49,7 +50,7 @@ app.use('/api/salary',    salaryRoutes);
 app.use('/api/finance',   financeRoutes);
 app.use('/api/trip-activity', tripActivityRoutes);
 app.use('/api/attendance', attendanceRoutes);
-
+app.use('/api/advances', advanceRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');

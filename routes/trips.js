@@ -4,7 +4,7 @@ const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
 const { protect, authorize } = require('../middleware/auth');
 
-router.post('/', protect, authorize('owner','telecaller'), tripCtrl.createTrip);
+router.post('/', tripCtrl.createTrip);
 router.get('/live', protect, authorize('owner','telecaller','driver'), tripCtrl.getLiveBoard);
 router.get('/', protect, tripCtrl.getTrips);
 router.get('/:id', protect, tripCtrl.getTripById);

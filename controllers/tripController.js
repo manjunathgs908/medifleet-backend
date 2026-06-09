@@ -45,9 +45,8 @@ exports.createTrip = async (req, res, next) => {
       leadId,    // optional — if originated from ad lead
     } = req.body;
 
-    // ── Validate hospital exists ──────────────────────────────
-    const hospital = await Hospital.findById(dropHospitalId);
-    if (!hospital) return res.status(404).json({ success: false, message: 'Hospital not found.' });
+    // Hospital lookup skipped for customer app bookings
+    const hospital = null;
 
     // ── Build trip document ───────────────────────────────────
     const tripData = {

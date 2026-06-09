@@ -37,30 +37,31 @@ const haversineKm = (lat1, lng1, lat2, lng2) => {
 exports.createTrip = async (req, res, next) => {
   try {
     const {
+      // Internal (telecaller/owner) fields
       patientName, patientPhone, emergencyType,
       pickupAddress, pickupLat, pickupLng,
       dropHospitalId, dropAddress,
       baseFare, distanceKm, perKmRate, additionalCharges,
-      vehicleId, // optional — if dispatcher manually selects
-      leadId,    // optional — if originated from ad lead
+      vehicleId,
+      leadId,
+      // Customer app fields
+      pickupLabel, dropLabel, dist,
+      scheduleType, scheduleDate, selectedType,
     } = req.body;
-
-    // Hospital lookup skipped for customer app bookings
-    const hospital = null;
 
     // ── Build trip document ───────────────────────────────────
     const tripData = {
-      patientName,
-      patientPhone,
+      patientName   : patientName   || 'Customer Booking',
+      patientPhone  : patientPhone  || 'N/A',
       emergencyType : emergencyType || 'general',
-      pickup        : { address: pickupAddress, lat: pickupLat, lng: pickupLng },
-      dropHospital  : dropHospitalId,
-      dropAddress   : dropAddress || hospital.address,
-      baseFare      : baseFare     || Number(process.env.DEFAULT_BASE_FARE) || 1500,
-      distanceKm    : distanceKm   || 0,
-      perKmRate     : perKmRate    || Number(process.env.DEFAULT_PER_KM_RATE) || 25,
+      pickup        : { address: pickupAddress || pickupLabel, lat: pickupLat, lng: pickupLng },
+      dropHospital  : dropHospitalId || undefined,
+      dropAddress   : dropAddress   || dropLabel,
+      baseFare      : baseFare      || Number(process.env.DEFAULT_BASE_FARE) || 1500,
+      distanceKm    : distanceKm    || dist || 0,
+      perKmRate     : perKmRate     || Number(process.env.DEFAULT_PER_KM_RATE) || 25,
       additionalCharges: additionalCharges || 0,
-      bookedBy      : req.user._id,
+      bookedBy      : req.user?._id || undefined,
       leadId,
       status        : 'booked',
     };

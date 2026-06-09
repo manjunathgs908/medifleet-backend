@@ -370,7 +370,7 @@ const tripSchema = new Schema(
       lat    : Number,
       lng    : Number,
     },
-    dropHospital  : { type: Schema.Types.ObjectId, ref: 'Hospital', required: true },
+    dropHospital  : { type: Schema.Types.ObjectId, ref: 'Hospital' },
     dropAddress   : { type: String },
 
     // â”€â”€ Assignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

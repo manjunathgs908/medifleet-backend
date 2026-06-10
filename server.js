@@ -40,6 +40,7 @@ const tripActivityRoutes = require('./routes/tripActivity');
 const attendanceRoutes = require('./routes/attendance');
 const advanceRoutes = require('./routes/advance');
 const bookingTripRoutes = require('./routes/bookingTrip');
+const pricingRoutes = require('./routes/pricing');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -52,6 +53,7 @@ app.use('/api/trip-activity', tripActivityRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/advances', advanceRoutes);
 app.use('/api/booking-trips', bookingTripRoutes);
+app.use('/api/pricing', pricingRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');

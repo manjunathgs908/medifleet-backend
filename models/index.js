@@ -760,6 +760,23 @@ const advanceSchema = new Schema(
   { timestamps: true }
 );
 const Advance = mongoose.model('Advance', advanceSchema);
+const pricingSchema = new Schema(
+  {
+    vehicleType: String,
+    serviceType: String,
+    nightMultiplier: Number,
+    nightStartHour: Number,
+    nightEndHour: Number,
+    oxygenPerKm: Number,
+    acPerKm: Number,
+    after300KmRate: Number,
+    slabs: Array,
+    active: Boolean,
+  },
+  { timestamps: true }
+);
+
+const Pricing = mongoose.model('Pricing', pricingSchema);
 // â”€â”€ Single export object â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 module.exports = {
   User,
@@ -777,5 +794,6 @@ module.exports = {
   ServiceLog,
   Notification,
   Advance,
+  Pricing,
 };
 

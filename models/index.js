@@ -411,12 +411,10 @@ const tripSchema = new Schema(
 );
 
 // Auto-generate trip number before save
-tripSchema.pre('save', async function (next) {
+tripSchema.pre('save', function (next) {
   if (!this.isNew) return next();
-  const today  = new Date();
-  const prefix = `TRP-${today.getFullYear()}${String(today.getMonth() + 1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
-  const count  = await mongoose.model('Trip').countDocuments({ createdAt: { $gte: new Date(today.setHours(0,0,0,0)) } });
-  this.tripNumber = `${prefix}-${String(count + 1).padStart(3, '0')}`;
+  const rand = Math.random().toString(36).substr(2, 4).toUpperCase();
+  this.tripNumber = `TRP-${Date.now()}-${rand}`;
   next();
 });
 

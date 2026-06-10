@@ -4,8 +4,12 @@ const { Pricing } = require('../models');
 
 exports.getPricing = async (req, res) => {
   try {
-    const pricing = await Pricing.find({ active: true });
-    res.json({ success: true, pricing });
+   const pricing = await Pricing.find({});
+
+console.log("PRICING COUNT =", pricing.length);
+console.log("PRICING DATA =", pricing);
+
+res.json({ success: true, pricing });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

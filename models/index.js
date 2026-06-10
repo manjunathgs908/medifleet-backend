@@ -776,7 +776,7 @@ const pricingSchema = new Schema(
   { timestamps: true }
 );
 
-const Pricing = mongoose.model('Pricing', pricingSchema);
+const Pricing = mongoose.model('Pricing', pricingSchema, 'pricing');
 // â”€â”€ Single export object â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 module.exports = {
   User,

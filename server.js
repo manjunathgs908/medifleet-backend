@@ -14,6 +14,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({
   origin: [
+    'https://crm.savelife.health',
+    'https://api.savelife.health',
     'https://medifleet-frontend-1.onrender.com',
     'http://localhost:3000',
     'http://localhost:8081',

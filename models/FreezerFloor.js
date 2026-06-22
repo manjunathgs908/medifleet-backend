@@ -6,8 +6,9 @@ const FreezerFloorSchema = new mongoose.Schema({
   boxId       : { type: String, required: true, enum: ['normal_box', 'standard_box', 'vip_digital_box'] },
   floorId     : { type: String, required: true },
   label       : { type: String, required: true },
-  helperCharge: { type: Number, default: 0 },
-  sortOrder   : { type: Number, default: 0 },
+  charge      : { type: Number, default: 0 },
+  isFree      : { type: Boolean, default: false },
+  displayOrder: { type: Number, default: 0 },
   active      : { type: Boolean, default: true },
 }, { timestamps: true });
 

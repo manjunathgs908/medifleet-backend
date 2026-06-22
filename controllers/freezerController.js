@@ -16,7 +16,9 @@ function sanitizeQuery(req, res) {
     return null;
   }
 
-  const filter = { boxId, active: true };
+  // active:false explicitly disables a doc; docs with no active field at
+  // all (e.g. data inserted directly into MongoDB) are treated as active.
+  const filter = { boxId, active: { $ne: false } };
   if (typeof city === 'string' && city.trim()) {
     filter.city = city.trim();
   }
@@ -28,7 +30,7 @@ exports.getDurations = async (req, res) => {
     const filter = sanitizeQuery(req, res);
     if (!filter) return;
 
-    const durations = await FreezerDuration.find(filter).sort({ sortOrder: 1, basePrice: 1 });
+    const durations = await FreezerDuration.find(filter).sort({ displayOrder: 1, basePrice: 1 });
     res.json({ success: true, durations });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -40,7 +42,7 @@ exports.getFloors = async (req, res) => {
     const filter = sanitizeQuery(req, res);
     if (!filter) return;
 
-    const floors = await FreezerFloor.find(filter).sort({ sortOrder: 1 });
+    const floors = await FreezerFloor.find(filter).sort({ displayOrder: 1 });
     res.json({ success: true, floors });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

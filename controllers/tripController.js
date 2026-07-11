@@ -357,6 +357,53 @@ exports.completeTrip = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/decline
+// @desc    Driver declines a trip that was just dispatched to them.
+//          Unlike /cancel (owner/telecaller-only, ends the trip), this
+//          returns the trip to the unassigned pool ('booked') so a
+//          telecaller/owner can reassign it to a different vehicle/driver.
+//          Additive — does not touch cancelTrip below.
+// @access  Private [driver] — only the currently-assigned driver
+// ============================================================
+exports.declineTrip = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You can only decline your own assigned trip.' });
+    }
+    if (trip.status !== 'dispatched') {
+      return res.status(400).json({ success: false, message: `Cannot decline a trip with status '${trip.status}'.` });
+    }
+
+    const previousVehicle = trip.vehicle;
+    const previousDriver  = trip.driver;
+
+    trip.status       = 'booked';
+    trip.vehicle       = undefined;
+    trip.driver        = undefined;
+    trip.dispatchedAt  = undefined;
+    await trip.save();
+
+    if (previousVehicle) {
+      await Vehicle.findByIdAndUpdate(previousVehicle, { status: 'available' });
+    }
+    if (previousDriver) {
+      await User.findByIdAndUpdate(previousDriver, {
+        'availability.status'   : 'available',
+        'availability.updatedAt': new Date(),
+      });
+    }
+
+    return res.json({ success: true, message: 'Trip declined and returned to the assignment pool.', trip });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   PUT /api/trips/:id/cancel
 // @desc    Cancel a trip and release the vehicle
 // @access  Private [owner, telecaller]

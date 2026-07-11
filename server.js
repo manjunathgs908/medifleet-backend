@@ -48,6 +48,7 @@ const ownerRoutes = require('./routes/owners');
 const fleetRoutes = require('./routes/fleets');
 const ambulanceRoutes = require('./routes/ambulances');
 const driverAuthRoutes = require('./routes/driverAuth');
+const assignmentRoutes = require('./routes/assignments');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -66,6 +67,7 @@ app.use('/api/owners', ownerRoutes);
 app.use('/api/fleets', fleetRoutes);
 app.use('/api/ambulances', ambulanceRoutes);
 app.use('/api/driver-auth', driverAuthRoutes);
+app.use('/api/assignments', assignmentRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');

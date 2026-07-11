@@ -258,3 +258,231 @@ exports.updatePassword = async (req, res, next) => {
     next(err);
   }
 };
+
+
+// ============================================================
+// Phase 2 — Employee ID + PIN driver login (additive, alongside the
+// existing phone+password loginPassword and OTP flows above, which
+// are untouched). Mounted at /api/driver-auth (routes/driverAuth.js).
+// ============================================================
+
+// ============================================================
+// @route   POST /api/driver-auth/login
+// @desc    Employee ID + PIN login with device binding:
+//            - blocked until approvalStatus === 'approved'
+//            - first successful login binds req.body.deviceId
+//            - subsequent logins must come from the bound device
+// @access  Public
+// ============================================================
+exports.loginWithPin = async (req, res, next) => {
+  try {
+    const { employeeId, pin, deviceId } = req.body;
+    if (!employeeId || !pin || !deviceId) {
+      return res.status(400).json({ success: false, message: 'employeeId, pin and deviceId are required.' });
+    }
+
+    const user = await User.findOne({ employeeId }).select('+pin +refreshToken');
+    if (!user || !user.pin) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
+    }
+
+    if (user.approvalStatus !== 'approved') {
+      return res.status(403).json({ success: false, message: 'Your account is pending approval.' });
+    }
+
+    if (user.deviceId && user.deviceId !== deviceId) {
+      return res.status(403).json({
+        success: false,
+        message: 'This device is not registered for this ambulance. Contact Owner/Admin.',
+      });
+    }
+
+    const isMatch = await user.comparePin(pin);
+    if (!isMatch) {
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({ success: false, message: 'Account is deactivated.' });
+    }
+
+    // First successful login binds this device to the account.
+    if (!user.deviceId) {
+      user.deviceId = deviceId;
+    }
+
+    const accessToken  = signAccessToken(user._id);
+    const refreshToken = signRefreshToken(user._id);
+    user.refreshToken = crypto.createHash('sha256').update(refreshToken).digest('hex');
+    user.lastLogin    = Date.now();
+    await user.save({ validateBeforeSave: false });
+
+    return res.json({
+      success: true,
+      accessToken,
+      refreshToken,
+      pinChangeRequired: user.pinChangeRequired,
+      user: {
+        id        : user._id,
+        name      : user.name,
+        phone     : user.phone,
+        role      : user.role,
+        employeeId: user.employeeId,
+        deviceId  : user.deviceId,
+        vehicleId : user.vehicleId,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/driver-auth/change-pin
+// @desc    Change own PIN. Clears pinChangeRequired.
+// @access  Private (protect)
+// ============================================================
+exports.changePin = async (req, res, next) => {
+  try {
+    const { oldPin, newPin } = req.body;
+    if (!oldPin || !newPin) {
+      return res.status(400).json({ success: false, message: 'oldPin and newPin are required.' });
+    }
+
+    const user = await User.findById(req.user._id).select('+pin');
+    if (!user || !user.pin) {
+      return res.status(400).json({ success: false, message: 'PIN login is not set up for this account.' });
+    }
+
+    const isMatch = await user.comparePin(oldPin);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Current PIN is incorrect.' });
+    }
+
+    user.pin               = newPin; // re-hashed by the pin pre('save') hook
+    user.pinChangeRequired = false;
+    await user.save();
+
+    return res.json({ success: true, message: 'PIN changed successfully.' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/driver-auth/register
+// @desc    Owner creates a new driver account for Employee ID + PIN
+//          login. Starts as approvalStatus:'pending', pinChangeRequired:true.
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.createDriverAccount = async (req, res, next) => {
+  try {
+    const { employeeId, name, phone, tempPin, assignedAmbulanceId } = req.body;
+    if (!employeeId || !name || !phone || !tempPin) {
+      return res.status(400).json({ success: false, message: 'employeeId, name, phone and tempPin are required.' });
+    }
+
+    const existing = await User.findOne({ $or: [{ employeeId }, { phone }] });
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'A user with this employeeId or phone already exists.' });
+    }
+
+    const user = await User.create({
+      employeeId,
+      name,
+      phone,
+      role               : 'driver',
+      pin                : tempPin,
+      pinChangeRequired  : true,
+      approvalStatus     : 'pending',
+      assignedAmbulanceId: assignedAmbulanceId || undefined,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Driver account created. Pending approval.',
+      driver : {
+        id            : user._id,
+        employeeId    : user.employeeId,
+        name          : user.name,
+        phone         : user.phone,
+        approvalStatus: user.approvalStatus,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/:id/approve
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.approveDriver = async (req, res, next) => {
+  try {
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'driver' },
+      { approvalStatus: 'approved' },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    return res.json({
+      success: true,
+      message: 'Driver approved.',
+      driver : { id: user._id, employeeId: user.employeeId, approvalStatus: user.approvalStatus },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/:id/reject
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.rejectDriver = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'driver' },
+      { approvalStatus: 'rejected' },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    return res.json({
+      success: true,
+      message: 'Driver rejected.',
+      reason : reason || null,
+      driver : { id: user._id, employeeId: user.employeeId, approvalStatus: user.approvalStatus },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/:id/unbind-device
+// @desc    Clears deviceId so the driver can log in from a new device.
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.unbindDevice = async (req, res, next) => {
+  try {
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'driver' },
+      { $unset: { deviceId: '' } },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    return res.json({ success: true, message: 'Device unbound. Driver can log in from a new device.' });
+  } catch (err) {
+    next(err);
+  }
+};

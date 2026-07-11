@@ -1,27 +1,84 @@
 /**
  * utils/fareCalculator.js
  * ────────────────────────────────────────────────────────────
- * Pure fare computation engine.
+ * Fare computation engine. MongoDB's Pricing collection is the only
+ * source of truth for baseFare/slabs/acPerKm — nothing here is guessed
+ * or defaulted. Mirrors the slab-interpolation algorithm in the
+ * frontend's src/utils/pricingUtils.js so both sides compute identically.
  */
 'use strict';
 
-exports.compute = ({
-  baseFare          = 1500,
-  distanceKm        = 0,
-  perKmRate         = 25,
-  additionalCharges = 0,
-  gstRate           = 5,
-}) => {
-  const distanceCharge = Math.round(distanceKm * perKmRate);
-  const subTotal       = baseFare + distanceCharge + additionalCharges;
-  const gstAmount      = Math.round(subTotal * gstRate / 100);
-  const grandTotal     = subTotal + gstAmount;
+const { Pricing } = require('../models');
 
-  return { baseFare, distanceKm, perKmRate, distanceCharge, additionalCharges, subTotal, gstRate, gstAmount, grandTotal };
+function interpolateSlabFare(doc, km) {
+  const pts = doc.slabs.map(s => (Array.isArray(s) ? s : [s.km, s.price]));
+
+  if (km <= pts[0][0]) return pts[0][1];
+
+  for (let i = 1; i < pts.length; i++) {
+    const [x0, y0] = pts[i - 1];
+    const [x1, y1] = pts[i];
+    if (km <= x1) return Math.round(y0 + ((km - x0) * (y1 - y0)) / (x1 - x0));
+  }
+
+  const [lastKm, lastPrice] = pts[pts.length - 1];
+  if (doc.after300KmRate) {
+    return Math.round(lastPrice + (km - lastKm) * doc.after300KmRate);
+  }
+  const [x0, y0] = pts[pts.length - 2];
+  const [x1, y1] = pts[pts.length - 1];
+  return Math.round(y0 + ((km - x0) * (y1 - y0)) / (x1 - x0));
+}
+
+// Matches the frontend's calcFare() lookup: active Pricing doc whose
+// serviceType equals the selected vehicle/service type, case-insensitively.
+async function findPricingDoc(selectedType) {
+  if (!selectedType) return null;
+  return Pricing.findOne({
+    active     : true,
+    serviceType: { $regex: new RegExp(`^${selectedType}$`, 'i') },
+  });
+}
+exports.findPricingDoc = findPricingDoc;
+
+exports.compute = async ({
+  selectedType,
+  distanceKm        = 0,
+  acEnabled         = false,
+  additionalCharges = 0,
+  gstRate,
+}) => {
+  if (gstRate == null) throw new Error('gstRate is required to compute a fare');
+
+  const doc = await findPricingDoc(selectedType);
+  if (!doc || !Array.isArray(doc.slabs) || doc.slabs.length < 2) {
+    throw new Error(`No active pricing found for vehicle type "${selectedType}"`);
+  }
+
+  const baseFare = interpolateSlabFare(doc, distanceKm);
+  const acCharge = acEnabled && doc.acPerKm ? Math.round(doc.acPerKm * distanceKm) : 0;
+  const totalAdditionalCharges = additionalCharges + acCharge;
+
+  const subTotal   = baseFare + totalAdditionalCharges;
+  const gstAmount   = Math.round((subTotal * gstRate) / 100);
+  const grandTotal  = subTotal + gstAmount;
+
+  return {
+    vehicleType: doc.vehicleType,
+    serviceType: doc.serviceType,
+    baseFare,
+    distanceKm,
+    additionalCharges: totalAdditionalCharges,
+    subTotal,
+    gstRate,
+    gstAmount,
+    grandTotal,
+  };
 };
 
-exports.estimateFare = (params) => {
-  return { ...exports.compute(params), isEstimate: true };
+exports.estimateFare = async (params) => {
+  const result = await exports.compute(params);
+  return { ...result, isEstimate: true };
 };
 
 // ────────────────────────────────────────────────────────────

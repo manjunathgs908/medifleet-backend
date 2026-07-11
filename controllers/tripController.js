@@ -17,6 +17,10 @@
 const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead } = require('../models');
 const fareCalculator = require('../utils/fareCalculator');
 
+// 5% GST on medical transport — not a Pricing-collection field, applied uniformly
+// here rather than as a silent Mongoose schema default.
+const GST_RATE = 5;
+
 // ── Utility: calculate straight-line distance (Haversine) ────
 const haversineKm = (lat1, lng1, lat2, lng2) => {
   const R    = 6371;
@@ -41,13 +45,31 @@ exports.createTrip = async (req, res, next) => {
       patientName, patientPhone, emergencyType,
       pickupAddress, pickupLat, pickupLng,
       dropHospitalId, dropAddress,
-      baseFare, distanceKm, perKmRate, additionalCharges,
       vehicleId,
       leadId,
       // Customer app fields
-      pickupLabel, dropLabel, dist,
+      pickupLabel, dropLabel, dist, effectiveDist,
       scheduleType, scheduleDate, selectedType,
+      tripType, returnAddress, acEnabled,
     } = req.body;
+
+    // Authoritative distance for billing: the round-trip-aware effectiveDist
+    // computed by the client, falling back to the one-way dist.
+    const distanceKm = effectiveDist ?? dist ?? 0;
+
+    // ── Compute the authoritative fare server-side from MongoDB Pricing —
+    //    never trust a client-supplied baseFare/perKmRate/totalFare. ──────
+    let fare;
+    try {
+      fare = await fareCalculator.compute({
+        selectedType,
+        distanceKm,
+        acEnabled: !!acEnabled,
+        gstRate  : GST_RATE,
+      });
+    } catch (fareErr) {
+      return res.status(400).json({ success: false, message: fareErr.message });
+    }
 
     // ── Build trip document ───────────────────────────────────
     const tripData = {
@@ -57,10 +79,15 @@ exports.createTrip = async (req, res, next) => {
       pickup        : { address: pickupAddress || pickupLabel, lat: pickupLat, lng: pickupLng },
       dropHospital  : dropHospitalId || undefined,
       dropAddress   : dropAddress   || dropLabel,
-      baseFare      : baseFare      || Number(process.env.DEFAULT_BASE_FARE) || 1500,
-      distanceKm    : distanceKm    || dist || 0,
-      perKmRate     : perKmRate     || Number(process.env.DEFAULT_PER_KM_RATE) || 25,
-      additionalCharges: additionalCharges || 0,
+      selectedType,
+      tripType      : tripType || 'one_way',
+      returnAddress : tripType === 'round_trip' ? returnAddress : undefined,
+      scheduleType  : scheduleType || 'now',
+      scheduleDate  : scheduleType === 'later' && scheduleDate ? new Date(scheduleDate) : undefined,
+      acEnabled     : !!acEnabled,
+      baseFare      : fare.baseFare,
+      distanceKm    : fare.distanceKm,
+      additionalCharges: fare.additionalCharges,
       bookedBy      : req.user?._id || undefined,
       leadId,
       status        : 'booked',
@@ -249,20 +276,28 @@ exports.completeTrip = async (req, res, next) => {
     }
 
     // ── 1. Update distance if provided by driver GPS ─────────
-    if (distanceKm)        trip.distanceKm       = distanceKm;
-    if (additionalCharges) trip.additionalCharges = additionalCharges;
+    if (distanceKm) trip.distanceKm = distanceKm;
 
-    // ── 2. Compute fare ───────────────────────────────────────
-    const { subTotal, gstAmount, grandTotal } = fareCalculator.compute({
-      baseFare         : trip.baseFare,
-      distanceKm       : trip.distanceKm,
-      perKmRate        : trip.perKmRate,
-      additionalCharges: trip.additionalCharges || 0,
-    });
+    // ── 2. Recompute the authoritative fare from MongoDB Pricing —
+    //      distanceKm may have changed since booking (driver GPS update). ──
+    let fare;
+    try {
+      fare = await fareCalculator.compute({
+        selectedType     : trip.selectedType,
+        distanceKm       : trip.distanceKm,
+        acEnabled        : trip.acEnabled,
+        additionalCharges: additionalCharges ? additionalCharges : 0,
+        gstRate          : GST_RATE,
+      });
+    } catch (fareErr) {
+      return res.status(400).json({ success: false, message: fareErr.message });
+    }
 
-    trip.totalFare    = subTotal;
-    trip.gstAmount    = gstAmount;
-    trip.grandTotal   = grandTotal;
+    trip.baseFare     = fare.baseFare;
+    trip.additionalCharges = fare.additionalCharges;
+    trip.totalFare    = fare.subTotal;
+    trip.gstAmount    = fare.gstAmount;
+    trip.grandTotal   = fare.grandTotal;
     trip.status       = 'completed';
     trip.completedAt  = new Date();
     await trip.save();
@@ -274,13 +309,11 @@ exports.completeTrip = async (req, res, next) => {
       hospital        : trip.dropHospital?._id,
       baseFare        : trip.baseFare,
       distanceKm      : trip.distanceKm,
-      perKmRate       : trip.perKmRate,
-      distanceCharge  : trip.distanceKm * trip.perKmRate,
-      additionalCharges: trip.additionalCharges || 0,
-      subTotal,
-      gstRate         : 5,
-      gstAmount,
-      grandTotal,
+      additionalCharges: trip.additionalCharges,
+      subTotal        : fare.subTotal,
+      gstRate         : GST_RATE,
+      gstAmount       : fare.gstAmount,
+      grandTotal      : fare.grandTotal,
     });
 
     // Link bill to trip

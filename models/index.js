@@ -91,6 +91,38 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     },
 
     profileImage : { type: String }, // Cloudinary URL
+
+    // ────────────────────────────────────────────────────────────
+    // Employee ID + PIN login (Phase 2 of the driver-auth redesign)
+    // All optional/additive — existing users are unaffected until an
+    // owner explicitly runs them through createDriverAccount(). The
+    // existing phone+password (loginPassword) and OTP flows are
+    // untouched and keep working exactly as before.
+    // ────────────────────────────────────────────────────────────
+    employeeId: { type: String, unique: true, sparse: true, trim: true },
+    pin       : { type: String, select: false }, // bcrypt-hashed, same pattern as password
+
+    pinChangeRequired: { type: Boolean, default: true }, // forces a PIN change on first login
+
+    approvalStatus: {
+      type   : String,
+      enum   : ['pending', 'approved', 'rejected'],
+      default: 'pending',
+    },
+
+    deviceId: { type: String, trim: true }, // bound device identifier — set on first successful PIN login
+
+    // Not in the original field list, but required to persist
+    // createDriverAccount()'s assignedAmbulanceId — refs the new
+    // Phase 1 Ambulance model (models/Ambulance.js), not the legacy
+    // Vehicle model. Optional/additive.
+    assignedAmbulanceId: { type: Schema.Types.ObjectId, ref: 'Ambulance' },
+
+    driverDocuments: {
+      dl     : { url: String, uploadedAt: Date },
+      aadhaar: { url: String, uploadedAt: Date },
+      photo  : { url: String, uploadedAt: Date },
+    },
   },
   { timestamps: true }
 );
@@ -103,9 +135,22 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
+// â”€â”€ Hash PIN before save (Phase 2 â€” same pattern as password, own hook) â”€â”€
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('pin') || !this.pin) return next();
+  const salt = await bcrypt.genSalt(12);
+  this.pin   = await bcrypt.hash(this.pin, salt);
+  next();
+});
+
 // â”€â”€ Instance method: compare password â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 userSchema.methods.comparePassword = async function (candidate) {
   return bcrypt.compare(candidate, this.password);
+};
+
+// â”€â”€ Instance method: compare PIN (Phase 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+userSchema.methods.comparePin = async function (candidate) {
+  return bcrypt.compare(candidate, this.pin);
 };
 
 // â”€â”€ Instance method: check if OTP is valid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -373,6 +418,14 @@ const tripSchema = new Schema(
     dropHospital  : { type: Schema.Types.ObjectId, ref: 'Hospital' },
     dropAddress   : { type: String },
 
+    // â”€â”€ Trip / Schedule details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    selectedType  : { type: String }, // Vehicle/service type id, matched against Pricing.serviceType
+    tripType      : { type: String, enum: ['one_way', 'round_trip'], default: 'one_way' },
+    returnAddress : { type: String },
+    scheduleType  : { type: String, enum: ['now', 'later'], default: 'now' },
+    scheduleDate  : { type: Date },
+    acEnabled     : { type: Boolean, default: false },
+
     // â”€â”€ Assignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     vehicle       : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
     driver        : { type: Schema.Types.ObjectId, ref: 'User' },
@@ -380,10 +433,9 @@ const tripSchema = new Schema(
     leadId        : { type: Schema.Types.ObjectId, ref: 'Lead' }, // If originated from ad lead
 
     // â”€â”€ Fare Computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    baseFare      : { type: Number, required: true, default: 1500 },
+    baseFare      : { type: Number, required: true }, // Slab-derived fare from MongoDB Pricing — no fallback default
     distanceKm    : { type: Number, default: 0 },
-    perKmRate     : { type: Number, default: 25 },
-    additionalCharges: { type: Number, default: 0 }, // Consumables, extra time, etc.
+    additionalCharges: { type: Number, default: 0 }, // AC add-on, consumables, extra time, etc.
     totalFare     : { type: Number },               // Computed on completion
     gstAmount     : { type: Number },
     grandTotal    : { type: Number },               // totalFare + GST
@@ -432,13 +484,11 @@ const billSchema = new Schema(
     hospital    : { type: Schema.Types.ObjectId, ref: 'Hospital' },
 
     // â”€â”€ Fare Breakdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    baseFare          : { type: Number },
+    baseFare          : { type: Number }, // Slab-derived fare from MongoDB Pricing
     distanceKm        : { type: Number },
-    perKmRate         : { type: Number },
-    distanceCharge    : { type: Number },   // distanceKm * perKmRate
     additionalCharges : { type: Number, default: 0 },
     subTotal          : { type: Number },
-    gstRate           : { type: Number, default: 5 }, // 5% GST on medical transport
+    gstRate           : { type: Number, required: true }, // No fallback default — must be explicitly supplied
     gstAmount         : { type: Number },
     grandTotal        : { type: Number },
 

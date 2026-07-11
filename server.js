@@ -44,6 +44,10 @@ const advanceRoutes = require('./routes/advance');
 const bookingTripRoutes = require('./routes/bookingTrip');
 const pricingRoutes = require('./routes/pricing');
 const freezerRoutes = require('./routes/freezer');
+const ownerRoutes = require('./routes/owners');
+const fleetRoutes = require('./routes/fleets');
+const ambulanceRoutes = require('./routes/ambulances');
+const driverAuthRoutes = require('./routes/driverAuth');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -58,6 +62,10 @@ app.use('/api/advances', advanceRoutes);
 app.use('/api/booking-trips', bookingTripRoutes);
 app.use('/api/pricing', pricingRoutes);
 app.use('/api/freezer', freezerRoutes);
+app.use('/api/owners', ownerRoutes);
+app.use('/api/fleets', fleetRoutes);
+app.use('/api/ambulances', ambulanceRoutes);
+app.use('/api/driver-auth', driverAuthRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');

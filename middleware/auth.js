@@ -32,6 +32,7 @@
 
 const jwt  = require('jsonwebtoken');
 const { User } = require('../models');
+const Owner = require('../models/Owner');
 
 /**
  * protect — JWT verification middleware
@@ -75,6 +76,54 @@ const protect = async (req, res, next) => {
 
   } catch (err) {
     // Distinguish between expired and invalid tokens for better UX
+    const message = err.name === 'TokenExpiredError'
+      ? 'Session expired. Please log in again.'
+      : 'Invalid token. Please log in again.';
+
+    return res.status(401).json({ success: false, message });
+  }
+};
+
+
+/**
+ * protectOwner — JWT verification middleware for the new fleet-Owner
+ * actor (Phase 1 of the driver-auth redesign, see models/Owner.js).
+ * Parallel to protect() but looks the subject up in the Owner
+ * collection instead of User. Owner documents have no `role` field of
+ * their own, so it's synthesized here as 'owner' — this lets the
+ * existing authorize('owner') gate below be reused unchanged for the
+ * new owner-facing routes (routes/owners.js, fleets.js, ambulances.js).
+ */
+const protectOwner = async (req, res, next) => {
+  let token;
+
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Not authorised. No token provided.',
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    const owner = await Owner.findById(decoded.id);
+    if (!owner) {
+      return res.status(401).json({ success: false, message: 'Owner not found. Token may be stale.' });
+    }
+    if (!owner.isActive) {
+      return res.status(403).json({ success: false, message: 'Account is deactivated. Contact admin.' });
+    }
+
+    owner.role = 'owner'; // synthesized for authorize() — not a schema field, not persisted
+    req.user = owner;
+    next();
+
+  } catch (err) {
     const message = err.name === 'TokenExpiredError'
       ? 'Session expired. Please log in again.'
       : 'Invalid token. Please log in again.';
@@ -134,4 +183,4 @@ const driverSelfOnly = (req, res, next) => {
 };
 
 
-module.exports = { protect, authorize, driverSelfOnly };
+module.exports = { protect, protectOwner, authorize, driverSelfOnly };

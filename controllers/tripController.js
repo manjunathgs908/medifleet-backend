@@ -545,3 +545,42 @@ exports.getTripById = async (req, res, next) => {
     next(err);
   }
 };
+// ============================================================
+// @route   PUT /api/trips/:id/verify-otp
+// @desc    Driver enters the 4-digit pickup OTP the customer shares
+//          at the pickup location. On success, marks the trip's
+//          pickup as verified (does not change trip status — the
+//          driver's separate en_route/completed flow stays as-is).
+// @access  Private [driver] — driver can only verify their own trip
+// ============================================================
+exports.verifyPickupOtp = async (req, res, next) => {
+  try {
+    const { otp } = req.body;
+    if (!otp) {
+      return res.status(400).json({ success: false, message: 'OTP is required.' });
+    }
+
+    const trip = await Trip.findById(req.params.id).select('+pickupOtp');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (req.user.role === 'driver' && trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'This trip is not assigned to you.' });
+    }
+
+    if (trip.pickupVerified) {
+      return res.json({ success: true, message: 'Pickup already verified.', alreadyVerified: true });
+    }
+
+    if (String(otp) !== String(trip.pickupOtp)) {
+      return res.status(400).json({ success: false, message: 'Incorrect OTP. Please check with the patient.' });
+    }
+
+    trip.pickupVerified = true;
+    trip.pickupVerifiedAt = new Date();
+    await trip.save();
+
+    return res.json({ success: true, message: 'Pickup verified successfully.' });
+  } catch (err) {
+    next(err);
+  }
+};

@@ -455,6 +455,12 @@ const tripSchema = new Schema(
     cancelledAt   : Date,
     cancellationReason: String,
 
+    // ── Pickup OTP verification (select:false — hidden from normal
+    // queries; driver app must never see this value, only the customer
+    // does. Only explicitly selected when verifying.) ──
+    pickupOtp        : { type: String, select: false },
+    pickupVerified   : { type: Boolean, default: false },
+    pickupVerifiedAt : { type: Date },
     // â”€â”€ Billing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
@@ -467,9 +473,9 @@ tripSchema.pre('save', function (next) {
   if (!this.isNew) return next();
   const rand = Math.random().toString(36).substr(2, 4).toUpperCase();
   this.tripNumber = `TRP-${Date.now()}-${rand}`;
+  this.pickupOtp = String(Math.floor(1000 + Math.random() * 9000));
   next();
 });
-
 const Trip = mongoose.model('Trip', tripSchema);
 
 

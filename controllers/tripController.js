@@ -545,3 +545,37 @@ exports.getTripById = async (req, res, next) => {
     next(err);
   }
 };
+// ============================================================
+// @route   GET /api/trips/:id/track
+// @desc    Public, minimal trip info for the customer app's tracking
+//          screen — no login required. Deliberately exposes only
+//          what's needed to show live status (driver name/phone,
+//          vehicle number, status) and nothing sensitive (fare,
+//          OTP, internal notes, bookedBy, etc).
+// @access  Public
+// ============================================================
+exports.trackTrip = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id)
+      .populate('vehicle', 'registrationNumber type')
+      .populate('driver', 'name phone');
+
+    if (!trip) {
+      return res.status(404).json({ success: false, message: 'Trip not found.' });
+    }
+
+    return res.json({
+      success: true,
+      trip: {
+        status        : trip.status,
+        pickupVerified: trip.pickupVerified,
+        driver        : trip.driver ? { name: trip.driver.name, phone: trip.driver.phone } : null,
+        vehicle       : trip.vehicle ? { registrationNumber: trip.vehicle.registrationNumber, type: trip.vehicle.type } : null,
+        pickup        : trip.pickup,
+        dropAddress   : trip.dropAddress,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};

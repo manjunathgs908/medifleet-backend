@@ -486,3 +486,42 @@ exports.unbindDevice = async (req, res, next) => {
     next(err);
   }
 };
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/location
+// @desc    Driver updates their own current lat/lng + availability
+//          status. Called periodically (every few seconds) from the
+//          driver app while the app is in the foreground.
+// @access  Private [driver] (protect)
+// ============================================================
+exports.updateLocation = async (req, res, next) => {
+  try {
+    const { lat, lng, status } = req.body;
+
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ success: false, message: 'lat and lng (numbers) are required.' });
+    }
+
+    const update = {
+      'availability.lat': lat,
+      'availability.lng': lng,
+      'availability.updatedAt': new Date(),
+    };
+
+    // status is optional — only update it if the driver app sent one
+    if (status && ['available', 'on_trip', 'offline'].includes(status)) {
+      update['availability.status'] = status;
+    }
+
+    const user = await User.findByIdAndUpdate(req.user._id, update, { new: true });
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Driver not found.' });
+    }
+
+    return res.json({ success: true, availability: user.availability });
+  } catch (err) {
+    next(err);
+  }
+};

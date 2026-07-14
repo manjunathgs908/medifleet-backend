@@ -388,6 +388,28 @@ exports.changePin = async (req, res, next) => {
 
 
 // ============================================================
+// @route   GET /api/driver-auth
+// @desc    List all Employee ID/PIN drivers — for the Owner app's
+//          device-unbind tool. Unscoped by owner (the User schema has no
+//          owner/ownerId link — the driver-auth system predates the
+//          multi-owner Ambulance/Fleet model and is effectively
+//          single-tenant today), so every protectOwner-authenticated
+//          Owner currently sees every driver in the system.
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.listDrivers = async (req, res, next) => {
+  try {
+    const drivers = await User.find({ role: 'driver' })
+      .select('name employeeId phone deviceId approvalStatus')
+      .sort({ name: 1 });
+    return res.json({ success: true, drivers });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   POST /api/driver-auth/register
 // @desc    Owner creates a new driver account for Employee ID + PIN
 //          login. Starts as approvalStatus:'pending', pinChangeRequired:true.

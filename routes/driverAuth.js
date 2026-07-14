@@ -22,6 +22,7 @@ router.post('/change-pin', protect, authCtrl.changePin);
 router.put ('/location', protect, authCtrl.updateLocation);
 
 // Private [owner] — driver onboarding/approval/device management
+router.get ('/',                   protectOwner, authorize('owner'), authCtrl.listDrivers);
 router.post('/register',           protectOwner, authorize('owner'), authCtrl.createDriverAccount);
 router.put ('/:id/approve',        protectOwner, authorize('owner'), authCtrl.approveDriver);
 router.put ('/:id/reject',         protectOwner, authorize('owner'), authCtrl.rejectDriver);

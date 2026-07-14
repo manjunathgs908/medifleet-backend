@@ -13,6 +13,7 @@ router.put('/:id/assign', protect, authorize('owner','telecaller'), tripCtrl.ass
 router.put('/:id/status', protect, tripCtrl.updateStatus);
 router.put('/:id/verify-otp', protect, tripCtrl.verifyPickupOtp);
 router.put('/:id/complete', protect, tripCtrl.completeTrip);
+router.put('/:id/confirm', protect, authorize('driver'), tripCtrl.confirmTrip);
 router.put('/:id/decline', protect, authorize('driver'), tripCtrl.declineTrip);
 router.put('/:id/cancel', protect, authorize('owner','telecaller'), tripCtrl.cancelTrip);
 

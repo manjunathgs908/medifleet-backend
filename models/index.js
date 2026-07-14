@@ -455,6 +455,14 @@ const tripSchema = new Schema(
     cancelledAt   : Date,
     cancellationReason: String,
 
+    // Driver's explicit accept of a 'dispatched' assignment. 'dispatched'
+    // alone only means "assigned to a vehicle/driver" — this flag is what
+    // distinguishes "awaiting driver accept" (show Accept/Reject popup)
+    // from "driver accepted, awaiting pickup" (show as active trip).
+    // Does not alter the booked/dispatched/en_route/completed/cancelled
+    // status enum or its transitions.
+    driverConfirmed: { type: Boolean, default: false },
+
     // ── Pickup OTP verification (select:false — hidden from normal
     // queries; driver app must never see this value, only the customer
     // does. Only explicitly selected when verifying.) ──

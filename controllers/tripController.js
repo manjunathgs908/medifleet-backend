@@ -150,6 +150,7 @@ const assignTripToVehicle = async (trip, vehicle) => {
   trip.driver      = vehicle.assignedDriver;
   trip.status      = 'dispatched';
   trip.dispatchedAt = new Date();
+  trip.driverConfirmed = false; // (re)assignment always re-prompts the driver
   await trip.save();
 
   // Update vehicle and driver status
@@ -398,6 +399,40 @@ exports.completeTrip = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/confirm
+// @desc    Driver accepts a trip that was just dispatched to them —
+//          the Accept half of the Accept/Reject popup. 'dispatched'
+//          alone only means "assigned"; this flips driverConfirmed so
+//          the driver app can distinguish "awaiting accept" from
+//          "accepted, awaiting pickup". Does not touch trip.status —
+//          the dispatched -> en_route transition still happens via
+//          the existing /status route on "Trip Started".
+// @access  Private [driver] — only the currently-assigned driver
+// ============================================================
+exports.confirmTrip = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You can only confirm your own assigned trip.' });
+    }
+    if (trip.status !== 'dispatched') {
+      return res.status(400).json({ success: false, message: `Cannot confirm a trip with status '${trip.status}'.` });
+    }
+
+    trip.driverConfirmed = true;
+    await trip.save();
+    await trip.populate(['vehicle', 'driver', 'dropHospital']);
+
+    return res.json({ success: true, trip });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   PUT /api/trips/:id/decline
 // @desc    Driver declines a trip that was just dispatched to them.
 //          Unlike /cancel (owner/telecaller-only, ends the trip), this
@@ -425,6 +460,7 @@ exports.declineTrip = async (req, res, next) => {
     trip.vehicle       = undefined;
     trip.driver        = undefined;
     trip.dispatchedAt  = undefined;
+    trip.driverConfirmed = false; // defensive — trip is unassigned again anyway
     await trip.save();
 
     if (previousVehicle) {

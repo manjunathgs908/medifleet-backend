@@ -643,13 +643,20 @@ exports.trackTrip = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Trip not found.' });
     }
 
+    // A 'dispatched' trip the driver hasn't tapped Accept on yet
+    // (driverConfirmed) is still just "searching" from the customer's
+    // point of view — keep reporting 'booked' and withhold driver/vehicle
+    // details rather than showing "en route" prematurely. Does not touch
+    // trip.status itself or the dispatched -> en_route lifecycle.
+    const awaitingDriverAccept = trip.status === 'dispatched' && !trip.driverConfirmed;
+
     return res.json({
       success: true,
       trip: {
-        status        : trip.status,
+        status        : awaitingDriverAccept ? 'booked' : trip.status,
         pickupVerified: trip.pickupVerified,
-        driver        : trip.driver ? { name: trip.driver.name, phone: trip.driver.phone } : null,
-        vehicle       : trip.vehicle ? { registrationNumber: trip.vehicle.registrationNumber, type: trip.vehicle.type } : null,
+        driver        : !awaitingDriverAccept && trip.driver ? { name: trip.driver.name, phone: trip.driver.phone } : null,
+        vehicle       : !awaitingDriverAccept && trip.vehicle ? { registrationNumber: trip.vehicle.registrationNumber, type: trip.vehicle.type } : null,
         pickup        : trip.pickup,
         dropAddress   : trip.dropAddress,
       },

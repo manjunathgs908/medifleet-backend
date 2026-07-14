@@ -231,7 +231,11 @@ exports.logout = async (req, res, next) => {
 // @access  Private
 // ============================================================
 exports.getMe = async (req, res) => {
-  return res.json({ success: true, user: req.user });
+  // req.user (set by `protect`) doesn't populate refs — Driver Profile
+  // Check / pre-go-online gate need assignedAmbulanceId's registrationNumber,
+  // not just its raw id.
+  const user = await req.user.populate('assignedAmbulanceId', 'registrationNumber status');
+  return res.json({ success: true, user });
 };
 
 
@@ -317,19 +321,31 @@ exports.loginWithPin = async (req, res, next) => {
     user.lastLogin    = Date.now();
     await user.save({ validateBeforeSave: false });
 
+    // Driver-onboarding flow (Device Verification / Driver Profile Check /
+    // pre-go-online gate) needs approvalStatus, driverDocuments, and the
+    // assigned Ambulance's registrationNumber — none of these were returned
+    // by this endpoint before. assignedAmbulanceId is populated here (not
+    // vehicleId) because it's the same field POST /assignments/start-duty
+    // requires as ambulanceId; the Ambulance model has no `type`, only
+    // `registrationNumber`.
+    await user.populate('assignedAmbulanceId', 'registrationNumber status');
+
     return res.json({
       success: true,
       accessToken,
       refreshToken,
       pinChangeRequired: user.pinChangeRequired,
       user: {
-        id        : user._id,
-        name      : user.name,
-        phone     : user.phone,
-        role      : user.role,
-        employeeId: user.employeeId,
-        deviceId  : user.deviceId,
-        vehicleId : user.vehicleId,
+        id                 : user._id,
+        name               : user.name,
+        phone              : user.phone,
+        role               : user.role,
+        employeeId         : user.employeeId,
+        deviceId           : user.deviceId,
+        vehicleId          : user.vehicleId,
+        approvalStatus     : user.approvalStatus,
+        assignedAmbulanceId: user.assignedAmbulanceId,
+        driverDocuments    : user.driverDocuments,
       },
     });
   } catch (err) {

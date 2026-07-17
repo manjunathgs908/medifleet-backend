@@ -10,12 +10,18 @@ dotenv.config();
 
 const app = express();
 
+// Render terminates TLS in front of this app — without this, express-rate-limit
+// (used by routes/places.js) buckets every client behind the proxy as one IP.
+app.set('trust proxy', 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({
   origin: [
     'https://crm.savelife.health',
     'https://api.savelife.health',
+    'https://savelife.health',
+    'https://www.savelife.health',
     'https://medifleet-frontend-1.onrender.com',
     'http://localhost:3000',
     'http://localhost:8081',
@@ -49,6 +55,7 @@ const fleetRoutes = require('./routes/fleets');
 const ambulanceRoutes = require('./routes/ambulances');
 const driverAuthRoutes = require('./routes/driverAuth');
 const assignmentRoutes = require('./routes/assignments');
+const placesRoutes = require('./routes/places');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -68,6 +75,7 @@ app.use('/api/fleets', fleetRoutes);
 app.use('/api/ambulances', ambulanceRoutes);
 app.use('/api/driver-auth', driverAuthRoutes);
 app.use('/api/assignments', assignmentRoutes);
+app.use('/api/places',    placesRoutes);
 app.get('/setup', async (req, res) => {
   try {
     const { User, Hospital } = require('./models');

@@ -76,20 +76,6 @@ app.use('/api/ambulances', ambulanceRoutes);
 app.use('/api/driver-auth', driverAuthRoutes);
 app.use('/api/assignments', assignmentRoutes);
 app.use('/api/places',    placesRoutes);
-app.get('/setup', async (req, res) => {
-  try {
-    const { User, Hospital } = require('./models');
-    await User.deleteMany({ phone: { $in: ['8884092777', '9986844442'] } });
-    await User.create({ name: 'Driver', phone: '8884092777', password: 'Driver@123', role: 'driver', isActive: true });
-    await User.create({ name: 'Telecaller', phone: '9986844442', password: 'Tele@123', role: 'telecaller', isActive: true });
-    await Hospital.deleteMany({ name: { $in: ['Manipal Hospital', 'Apollo Hospital'] } });
-    await Hospital.create({ name: 'Manipal Hospital', address: 'Mysore', phone: '0821-2222222', isActive: true });
-    await Hospital.create({ name: 'Apollo Hospital', address: 'Mysore', phone: '0821-3333333', isActive: true });
-    res.json({ message: 'Setup completed successfully!' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

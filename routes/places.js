@@ -21,5 +21,6 @@ router.use(placesLimiter);
 
 router.get('/autocomplete', placesCtrl.autocomplete);
 router.get('/details',      placesCtrl.details);
+router.get('/reverse',      placesCtrl.reverse);
 
 module.exports = router;

@@ -17,6 +17,9 @@ const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
 const { User } = require('../models');
 const smsService = require('../utils/smsService');
+const { uploadToCloudinary } = require('../utils/cloudinary');
+
+const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
 // ── Token factories ───────────────────────────────────────────
 // deviceId is embedded in BOTH tokens (undefined for non-driver logins,
@@ -54,6 +57,7 @@ const sendTokenResponse = async (user, statusCode, res, deviceId) => {
   if (user.role === 'driver') {
     await user.populate('assignedAmbulanceId', 'registrationNumber status');
     userPayload.approvalStatus      = user.approvalStatus;
+    userPayload.rejectionReason     = user.rejectionReason;
     userPayload.assignedAmbulanceId = user.assignedAmbulanceId;
     userPayload.driverDocuments     = user.driverDocuments;
     userPayload.deviceId            = user.deviceId;
@@ -151,15 +155,17 @@ exports.verifyOtp = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'OTP is invalid or has expired.' });
     }
 
-    // Driver-only hardening — device binding and the approval gate are
-    // meaningless for Owner/Telecaller password-based staff accounts,
-    // so scoped to role:'driver' rather than applied blanket.
+    // Driver-only hardening — device binding is meaningless for
+    // Owner/Telecaller password-based staff accounts, so scoped to
+    // role:'driver' rather than applied blanket. Deliberately does NOT
+    // block login on approvalStatus (Phase 1 did — corrected here): a
+    // pending/rejected driver must still be able to log in to complete
+    // onboarding (upload documents) or see their rejection reason and
+    // re-submit. The actual privileged action — going on duty — is what's
+    // gated on approvalStatus now, at POST /assignments/start-duty.
     if (user.role === 'driver') {
       if (!deviceId) {
         return res.status(400).json({ success: false, message: 'deviceId is required.' });
-      }
-      if (user.approvalStatus !== 'approved') {
-        return res.status(403).json({ success: false, message: 'Your account is pending approval.' });
       }
       // Most recent OTP login always wins — unconditional rebind (unlike
       // the old PIN flow, which only bound once and then locked to it).
@@ -434,19 +440,23 @@ exports.changePin = async (req, res, next) => {
 
 
 // ============================================================
-// @route   GET /api/driver-auth
-// @desc    List all Employee ID/PIN drivers — for the Owner app's
-//          device-unbind tool. Unscoped by owner (the User schema has no
-//          owner/ownerId link — the driver-auth system predates the
-//          multi-owner Ambulance/Fleet model and is effectively
-//          single-tenant today), so every protectOwner-authenticated
-//          Owner currently sees every driver in the system.
+// @route   GET /api/driver-auth?approvalStatus=pending
+// @desc    List drivers — Owner app's device-unbind tool and Pending
+//          Drivers screen share this endpoint. Unscoped by owner (the
+//          User schema has no owner/ownerId link — the driver-auth
+//          system predates the multi-owner Ambulance/Fleet model and is
+//          effectively single-tenant today), so every protectOwner-
+//          authenticated Owner currently sees every driver in the system.
 // @access  Private [owner] (protectOwner)
 // ============================================================
 exports.listDrivers = async (req, res, next) => {
   try {
-    const drivers = await User.find({ role: 'driver' })
-      .select('name employeeId phone deviceId approvalStatus')
+    const { approvalStatus } = req.query;
+    const filter = { role: 'driver' };
+    if (approvalStatus) filter.approvalStatus = approvalStatus;
+
+    const drivers = await User.find(filter)
+      .select('name employeeId phone deviceId approvalStatus rejectionReason driverDocuments')
       .sort({ name: 1 });
     return res.json({ success: true, drivers });
   } catch (err) {
@@ -509,7 +519,7 @@ exports.approveDriver = async (req, res, next) => {
   try {
     const user = await User.findOneAndUpdate(
       { _id: req.params.id, role: 'driver' },
-      { approvalStatus: 'approved' },
+      { approvalStatus: 'approved', $unset: { rejectionReason: '' } },
       { new: true }
     );
     if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
@@ -534,7 +544,7 @@ exports.rejectDriver = async (req, res, next) => {
     const { reason } = req.body;
     const user = await User.findOneAndUpdate(
       { _id: req.params.id, role: 'driver' },
-      { approvalStatus: 'rejected' },
+      { approvalStatus: 'rejected', rejectionReason: reason || undefined },
       { new: true }
     );
     if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
@@ -542,8 +552,7 @@ exports.rejectDriver = async (req, res, next) => {
     return res.json({
       success: true,
       message: 'Driver rejected.',
-      reason : reason || null,
-      driver : { id: user._id, employeeId: user.employeeId, approvalStatus: user.approvalStatus },
+      driver : { id: user._id, employeeId: user.employeeId, approvalStatus: user.approvalStatus, rejectionReason: user.rejectionReason },
     });
   } catch (err) {
     next(err);
@@ -566,6 +575,60 @@ exports.unbindDevice = async (req, res, next) => {
     if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
     return res.json({ success: true, message: 'Device unbound. Driver can log in from a new device.' });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/documents
+// @desc    Driver uploads their OWN onboarding document (dl/aadhaar/
+//          photo) — same one-upload-per-call Cloudinary pattern as
+//          ambulanceController.updateDocument. Re-submitting while
+//          rejected flips approvalStatus back to 'pending' and clears
+//          the rejection reason, so it naturally re-enters the owner's
+//          Pending Drivers queue without a separate "resubmit" action.
+// @access  Private [driver]
+// ============================================================
+exports.uploadDriverDocument = async (req, res, next) => {
+  try {
+    const { docType, base64, number, expiryDate } = req.body;
+
+    if (!DRIVER_DOC_TYPES.includes(docType)) {
+      return res.status(400).json({ success: false, message: `docType must be one of: ${DRIVER_DOC_TYPES.join(', ')}` });
+    }
+    if (!base64) {
+      return res.status(400).json({ success: false, message: 'base64 is required.' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    const result = await uploadToCloudinary(base64, `drivers/${user._id}/documents`);
+
+    const existing = user.driverDocuments?.[docType] || {};
+    user.driverDocuments = user.driverDocuments || {};
+    user.driverDocuments[docType] = {
+      url       : result.secure_url,
+      publicId  : result.public_id,
+      number    : number !== undefined ? number : existing.number,
+      expiryDate: expiryDate ? new Date(expiryDate) : existing.expiryDate,
+      uploadedAt: new Date(),
+    };
+
+    if (user.approvalStatus === 'rejected') {
+      user.approvalStatus  = 'pending';
+      user.rejectionReason = undefined;
+    }
+
+    await user.save({ validateBeforeSave: false });
+
+    return res.json({
+      success       : true,
+      driverDocuments: user.driverDocuments,
+      approvalStatus : user.approvalStatus,
+    });
   } catch (err) {
     next(err);
   }

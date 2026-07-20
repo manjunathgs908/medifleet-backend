@@ -109,6 +109,7 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
       enum   : ['pending', 'approved', 'rejected'],
       default: 'pending',
     },
+    rejectionReason: { type: String }, // set by rejectDriver; cleared on approve or re-submission
 
     deviceId: { type: String, trim: true }, // bound device identifier — set on first successful PIN login
 
@@ -119,9 +120,9 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     assignedAmbulanceId: { type: Schema.Types.ObjectId, ref: 'Ambulance' },
 
     driverDocuments: {
-      dl     : { url: String, uploadedAt: Date },
-      aadhaar: { url: String, uploadedAt: Date },
-      photo  : { url: String, uploadedAt: Date },
+      dl     : { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },
+      aadhaar: { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },
+      photo  : { url: String, publicId: String, uploadedAt: Date },
     },
   },
   { timestamps: true }

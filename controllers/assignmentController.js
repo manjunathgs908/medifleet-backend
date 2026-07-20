@@ -31,6 +31,13 @@ exports.startDuty = async (req, res, next) => {
     const driverId = req.user._id;
     const { ambulanceId, deviceId, lat, lng } = req.body;
 
+    // Login-time approval check can go stale (owner rejects mid-session,
+    // JWT stays valid up to 7 days) — re-check here since going on duty is
+    // the actual privileged action, not just holding a valid token.
+    if (req.user.approvalStatus !== 'approved') {
+      return res.status(403).json({ success: false, message: 'Your account is not approved yet. Contact your Owner/Admin.' });
+    }
+
     if (!ambulanceId) {
       return res.status(400).json({ success: false, message: 'ambulanceId is required.' });
     }

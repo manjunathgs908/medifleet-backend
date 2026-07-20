@@ -18,6 +18,9 @@ router.post('/login', authCtrl.loginWithPin);
 // Private — driver changes their own PIN
 router.post('/change-pin', protect, authCtrl.changePin);
 
+// Private [driver] — driver uploads their own onboarding documents
+router.put('/documents', protect, authorize('driver'), authCtrl.uploadDriverDocument);
+
 // Private [driver] — driver sends their live GPS location periodically
 router.put ('/location', protect, authCtrl.updateLocation);
 

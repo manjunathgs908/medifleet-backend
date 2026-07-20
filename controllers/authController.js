@@ -598,23 +598,28 @@ exports.uploadDriverDocument = async (req, res, next) => {
     if (!DRIVER_DOC_TYPES.includes(docType)) {
       return res.status(400).json({ success: false, message: `docType must be one of: ${DRIVER_DOC_TYPES.join(', ')}` });
     }
-    if (!base64) {
-      return res.status(400).json({ success: false, message: 'base64 is required.' });
-    }
 
     const user = await User.findById(req.user._id);
     if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
-    const result = await uploadToCloudinary(base64, `drivers/${user._id}/documents`);
-
+    // base64 is optional (matches ambulanceController.updateDocument's
+    // pattern) — lets the app save just a number/expiry edit without
+    // forcing a re-upload of the photo.
     const existing = user.driverDocuments?.[docType] || {};
+    let { url, publicId } = existing;
+    if (base64) {
+      const result = await uploadToCloudinary(base64, `drivers/${user._id}/documents`);
+      url      = result.secure_url;
+      publicId = result.public_id;
+    }
+
     user.driverDocuments = user.driverDocuments || {};
     user.driverDocuments[docType] = {
-      url       : result.secure_url,
-      publicId  : result.public_id,
+      url,
+      publicId,
       number    : number !== undefined ? number : existing.number,
       expiryDate: expiryDate ? new Date(expiryDate) : existing.expiryDate,
-      uploadedAt: new Date(),
+      uploadedAt: base64 ? new Date() : existing.uploadedAt,
     };
 
     if (user.approvalStatus === 'rejected') {

@@ -42,16 +42,10 @@ exports.startDuty = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'ambulanceId is required.' });
     }
 
-    const ambulance = await Ambulance.findById(ambulanceId);
-    if (!ambulance) {
-      return res.status(404).json({ success: false, message: 'Ambulance not found.' });
-    }
-
-    const ambulanceBusy = await Assignment.findOne({ ambulance: ambulanceId, active: true });
-    if (ambulanceBusy) {
-      return res.status(409).json({ success: false, message: 'Ambulance already assigned to another active driver.' });
-    }
-
+    // Fast pre-check for a clear, specific error on the common case — NOT
+    // the actual concurrency guarantee (see below). A findOne-then-create
+    // here would race: two concurrent start-duty calls could both pass
+    // this check before either write lands.
     const driverBusy = await Assignment.findOne({ driver: driverId, active: true });
     if (driverBusy) {
       return res.status(409).json({
@@ -60,29 +54,84 @@ exports.startDuty = async (req, res, next) => {
       });
     }
 
+    // Atomic claim — the {status:'available'} filter means only ONE of
+    // two concurrent requests for the same ambulance can ever get a
+    // non-null result back; the loser sees this as a normal "unavailable"
+    // outcome, not a race it has to detect itself.
+    const ambulance = await Ambulance.findOneAndUpdate(
+      { _id: ambulanceId, status: 'available' },
+      { status: 'assigned', assignedDriver: driverId },
+      { new: true }
+    );
+    if (!ambulance) {
+      const exists = await Ambulance.exists({ _id: ambulanceId });
+      return res.status(409).json({
+        success: false,
+        message: exists
+          ? 'This ambulance was just taken by another driver. Please pick a different one.'
+          : 'Ambulance not found.',
+      });
+    }
+
     const location = toLocation(lat, lng);
 
-    const assignment = await Assignment.create({
-      driver   : driverId,
-      ambulance: ambulanceId,
-      active   : true,
-      deviceId,
-      startLocation: location,
-    });
+    let assignment, shift;
+    try {
+      // Backstop for the driver-busy pre-check's own race (e.g. the same
+      // driver double-tapping "start duty" from two ambulances at once) —
+      // Assignment's partial unique index on {driver, active:true} rejects
+      // a second one; caught below and rolled back.
+      assignment = await Assignment.create({
+        driver   : driverId,
+        ambulance: ambulanceId,
+        active   : true,
+        deviceId,
+        startLocation: location,
+      });
 
-    const shift = await Shift.create({
-      driver   : driverId,
-      ambulance: ambulanceId,
-      status   : 'active',
-      deviceId,
-      loginLocation: location,
-    });
+      shift = await Shift.create({
+        driver   : driverId,
+        ambulance: ambulanceId,
+        status   : 'active',
+        deviceId,
+        loginLocation: location,
+      });
+    } catch (err) {
+      // Don't leave the ambulance stuck 'assigned' with nobody actually on duty.
+      await Ambulance.updateOne({ _id: ambulanceId }, { status: 'available', assignedDriver: null });
+      if (err.code === 11000) {
+        return res.status(409).json({
+          success: false,
+          message: 'You already have an active duty, or this ambulance was just taken. Please refresh and try again.',
+        });
+      }
+      throw err;
+    }
 
-    ambulance.status         = 'assigned';
-    ambulance.assignedDriver = driverId;
-    await ambulance.save();
+    return res.status(201).json({ success: true, message: 'Duty started.', assignment, shift, ambulance });
+  } catch (err) {
+    next(err);
+  }
+};
 
-    return res.status(201).json({ success: true, message: 'Duty started.', assignment, shift });
+// ============================================================
+// @route   GET /api/assignments/available-ambulances
+// @desc    Ambulances a driver can pick at start-duty — scoped to the
+//          driver's owner if linked (see User.owner), else platform-wide
+//          (today's pre-Phase-4 single-tenant reality: drivers created
+//          before this field existed).
+// @access  Private [driver]
+// ============================================================
+exports.getAvailableAmbulances = async (req, res, next) => {
+  try {
+    const filter = { status: 'available', isActive: true };
+    if (req.user.owner) filter.owner = req.user.owner;
+
+    const ambulances = await Ambulance.find(filter)
+      .select('registrationNumber serviceType serviceTypeLabel vehicleModel status year')
+      .sort({ registrationNumber: 1 });
+
+    return res.json({ success: true, ambulances });
   } catch (err) {
     next(err);
   }

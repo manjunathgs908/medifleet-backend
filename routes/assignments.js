@@ -13,6 +13,7 @@ const ctrl    = require('../controllers/assignmentController');
 const { protect, protectOwner, authorize } = require('../middleware/auth');
 
 // Private [driver]
+router.get ('/available-ambulances', protect, authorize('driver'), ctrl.getAvailableAmbulances);
 router.post('/start-duty', protect, authorize('driver'), ctrl.startDuty);
 router.post('/break',      protect, authorize('driver'), ctrl.breakDuty);
 router.post('/resume',     protect, authorize('driver'), ctrl.resumeDuty);

@@ -116,8 +116,17 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // Not in the original field list, but required to persist
     // createDriverAccount()'s assignedAmbulanceId — refs the new
     // Phase 1 Ambulance model (models/Ambulance.js), not the legacy
-    // Vehicle model. Optional/additive.
+    // Vehicle model. Optional/additive. Superseded for day-to-day duty by
+    // the flexible ambulance picker (Phase 4) — a driver is no longer
+    // fixed to this one ambulance, it's just an optional default.
     assignedAmbulanceId: { type: Schema.Types.ObjectId, ref: 'Ambulance' },
+
+    // Which Owner (Phase 1 fleet-Owner model) this driver belongs to —
+    // set by createDriverAccount (the authenticated Owner creating them).
+    // Unset = today's pre-Phase-4 single-tenant reality (drivers created
+    // before this field existed) — getAvailableAmbulances falls back to
+    // platform-wide when this is unset, rather than showing nothing.
+    owner: { type: Schema.Types.ObjectId, ref: 'Owner' },
 
     driverDocuments: {
       dl     : { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },

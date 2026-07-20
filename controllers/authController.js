@@ -491,6 +491,7 @@ exports.createDriverAccount = async (req, res, next) => {
       pin                : tempPin,
       pinChangeRequired  : true,
       approvalStatus     : 'pending',
+      owner              : req.user._id, // links this driver to the Owner creating them (Phase 4 ambulance-picker scoping)
       assignedAmbulanceId: assignedAmbulanceId || undefined,
     });
 

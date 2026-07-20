@@ -17,8 +17,11 @@ const locationSchema = new Schema({ lat: Number, lng: Number }, { _id: false });
 
 const assignmentSchema = new Schema(
   {
-    driver   : { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    ambulance: { type: Schema.Types.ObjectId, ref: 'Ambulance', required: true, index: true },
+    // No index:true here — the partial unique indexes below already cover
+    // both fields for this schema's actual query patterns (always filtered
+    // on active:true); declaring both raised a "duplicate schema index" warning.
+    driver   : { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    ambulance: { type: Schema.Types.ObjectId, ref: 'Ambulance', required: true },
 
     active: { type: Boolean, default: true, index: true },
 
@@ -32,5 +35,14 @@ const assignmentSchema = new Schema(
   },
   { timestamps: true }
 );
+
+// Partial unique indexes — the actual concurrency guarantee (not just the
+// findOne-then-create pre-checks in the controller, which can race: two
+// concurrent start-duty calls could both pass a findOne check before
+// either write lands). Only one *active* Assignment can exist per
+// ambulance, and per driver, at a time; ended (active:false) history
+// rows are excluded via partialFilterExpression so they never collide.
+assignmentSchema.index({ ambulance: 1 }, { unique: true, partialFilterExpression: { active: true } });
+assignmentSchema.index({ driver: 1 }, { unique: true, partialFilterExpression: { active: true } });
 
 module.exports = mongoose.model('Assignment', assignmentSchema);

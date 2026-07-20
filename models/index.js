@@ -526,6 +526,7 @@ const billSchema = new Schema(
     subTotal          : { type: Number },
     gstRate           : { type: Number, required: true }, // No fallback default — must be explicitly supplied
     gstAmount         : { type: Number },
+    waitCharge        : { type: Number, default: 0 }, // Pickup/drop wait — outside subTotal/GST, added straight into grandTotal
     grandTotal        : { type: Number },
 
     // â”€â”€ Payment State â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

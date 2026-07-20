@@ -258,6 +258,40 @@ exports.updateStatus = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/arrive-pickup
+// @desc    Driver taps "Reached Pickup" — marks arrival at the pickup
+//          location. Mirrors verify-otp: a sub-event within 'en_route',
+//          does not change trip.status. Pairs with pickupVerifiedAt
+//          (set by verify-otp below) to bracket pickup wait time,
+//          computed later in completeTrip.
+// @access  Private [driver] — driver can only mark their own trip
+// ============================================================
+exports.arrivePickup = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (req.user.role === 'driver' && trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'This trip is not assigned to you.' });
+    }
+
+    if (trip.status !== 'en_route') {
+      return res.status(400).json({ success: false, message: 'Trip must be en route to mark pickup arrival.' });
+    }
+
+    if (!trip.arrivedAtPickupAt) {
+      trip.arrivedAtPickupAt = new Date();
+      await trip.save();
+    }
+
+    return res.json({ success: true, message: 'Pickup arrival recorded.', arrivedAtPickupAt: trip.arrivedAtPickupAt });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   PUT /api/trips/:id/verify-otp
 // @desc    Driver enters the 4-digit pickup OTP the customer shares
 //          at the pickup location. On success, marks the trip's
@@ -309,7 +343,7 @@ exports.verifyPickupOtp = async (req, res, next) => {
 // ============================================================
 exports.completeTrip = async (req, res, next) => {
   try {
-    const { distanceKm, additionalCharges } = req.body;
+    const { distanceKm, actualDistanceKm, additionalCharges } = req.body;
 
     const trip = await Trip.findById(req.params.id).populate('dropHospital');
     if (!trip)                    return res.status(404).json({ success: false, message: 'Trip not found.' });
@@ -321,8 +355,17 @@ exports.completeTrip = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'You can only complete your own trips.' });
     }
 
-    // ── 1. Update distance if provided by driver GPS ─────────
-    if (distanceKm) trip.distanceKm = distanceKm;
+    // ── 1. Update distance — actualDistanceKm (driver app's client-side
+    //      haversine accumulation over the en_route GPS pings) takes
+    //      precedence over the legacy distanceKm body param. Also stored
+    //      on its own field so estimate-vs-actual stays comparable;
+    //      estimatedDistanceKm/estimatedFare (booking-time snapshot) are
+    //      never touched here. ──
+    const finalDistanceKm = actualDistanceKm != null ? actualDistanceKm : distanceKm;
+    if (finalDistanceKm) {
+      trip.distanceKm       = finalDistanceKm;
+      trip.actualDistanceKm = finalDistanceKm;
+    }
 
     // ── 2. Recompute the authoritative fare from MongoDB Pricing —
     //      distanceKm may have changed since booking (driver GPS update). ──
@@ -339,11 +382,29 @@ exports.completeTrip = async (req, res, next) => {
       return res.status(400).json({ success: false, message: fareErr.message });
     }
 
+    // ── 2b. Pickup wait charge — bracketed by arrivedAtPickupAt (driver's
+    //      "Reached Pickup" tap) and pickupVerifiedAt (OTP verify). Both
+    //      are optional (older trips / telecaller-completed trips won't
+    //      have them), so wait stays 0 unless the full bracket exists.
+    //      Rate/free-minutes always come from Pricing — never hardcoded. ──
+    let pickupWaitMinutes = 0;
+    let waitCharge        = 0;
+    if (trip.arrivedAtPickupAt && trip.pickupVerifiedAt) {
+      const pricingDoc = await fareCalculator.findPricingDoc(trip.selectedType);
+      const freeMin = pricingDoc?.pickupFreeWaitMinutes ?? 0;
+      const perMin  = pricingDoc?.pickupWaitPerMin ?? 0;
+      const rawMinutes = Math.max(0, Math.round((trip.pickupVerifiedAt - trip.arrivedAtPickupAt) / 60000));
+      pickupWaitMinutes = Math.max(0, rawMinutes - freeMin);
+      waitCharge = pickupWaitMinutes * perMin;
+    }
+    trip.pickupWaitMinutes = pickupWaitMinutes;
+    trip.waitCharge        = waitCharge;
+
     trip.baseFare     = fare.baseFare;
     trip.additionalCharges = fare.additionalCharges;
     trip.totalFare    = fare.subTotal;
     trip.gstAmount    = fare.gstAmount;
-    trip.grandTotal   = fare.grandTotal;
+    trip.grandTotal   = fare.grandTotal + waitCharge;
     trip.status       = 'completed';
     trip.completedAt  = new Date();
     await trip.save();
@@ -359,7 +420,8 @@ exports.completeTrip = async (req, res, next) => {
       subTotal        : fare.subTotal,
       gstRate         : GST_RATE,
       gstAmount       : fare.gstAmount,
-      grandTotal      : fare.grandTotal,
+      waitCharge      : trip.waitCharge,
+      grandTotal      : trip.grandTotal,
     });
 
     // Link bill to trip
@@ -369,7 +431,7 @@ exports.completeTrip = async (req, res, next) => {
     // ── 4. Auto-create Income ledger entry ─────────────────────
     await Income.create({
       category   : 'trip_fare',
-      amount     : fare.grandTotal,
+      amount     : trip.grandTotal,
       description: `Trip ${trip.tripNumber} — ${trip.patientName}`,
       date       : new Date(),
       trip       : trip._id,

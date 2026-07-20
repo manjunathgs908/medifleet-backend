@@ -150,9 +150,11 @@ exports.reverse = async (req, res) => {
 // ============================================================
 // @route   GET /api/places/directions?originLat=&originLng=&destLat=&destLng=
 // @desc    Proxies Google Directions — returns real driving distance/
-//          duration (not straight-line) for fare calculation. Same
-//          source of truth the customer app's routeUtils.js uses,
-//          just server-side instead of a client-embedded key.
+//          duration (not straight-line) for fare calculation, plus the
+//          route's encoded overview polyline so the frontend can draw
+//          the actual driving route on a map. Same source of truth the
+//          customer app's routeUtils.js uses, just server-side instead
+//          of a client-embedded key.
 // @access  Public (rate-limited)
 // ============================================================
 exports.directions = async (req, res) => {
@@ -198,6 +200,7 @@ exports.directions = async (req, res) => {
       success    : true,
       distanceKm : leg.distance.value / 1000,
       durationSec: leg.duration.value,
+      polyline   : data.routes[0].overview_polyline?.points || null,
     });
   } catch (err) {
     console.error('[places] directions request error:', err.message);

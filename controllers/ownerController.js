@@ -20,6 +20,7 @@ const crypto = require('crypto');
 const Owner  = require('../models/Owner');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
+const { isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE AFTER DLT APPROVAL
 
 const ALLOWED_KYC_DOCS = ['aadhaar', 'pan', 'addressProof', 'photo'];
 
@@ -74,9 +75,19 @@ exports.sendOtp = async (req, res, next) => {
       owner = new Owner({ phone, name });
     }
 
-    // Generate 6-digit OTP
-    const otp       = String(Math.floor(100000 + Math.random() * 900000));
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    // TEMPORARY — REMOVE AFTER DLT APPROVAL. See utils/testOtp.js.
+    // Whitelisted test numbers get a fixed OTP, no real SMS attempt.
+    if (isTestOtpNumber(phone)) {
+      owner.otp       = getTestOtpCode();
+      owner.otpExpiry = otpExpiry;
+      await owner.save({ validateBeforeSave: false });
+      return res.json({ success: true, message: `OTP sent to ${phone}.` });
+    }
+
+    // Generate 6-digit OTP
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
 
     owner.otp       = otp;
     owner.otpExpiry = otpExpiry;

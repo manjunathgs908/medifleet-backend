@@ -19,6 +19,7 @@ const { User, Trip } = require('../models');
 const Shift = require('../models/Shift');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
+const { isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE AFTER DLT APPROVAL
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -134,9 +135,19 @@ exports.sendOtp = async (req, res, next) => {
     const user = await User.findOne({ phone, isActive: true }).select('+otp +otpExpiry');
     if (!user) return res.status(404).json({ success: false, message: 'No active account found for this number.' });
 
-    // Generate 6-digit OTP
-    const otp       = String(Math.floor(100000 + Math.random() * 900000));
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    // TEMPORARY — REMOVE AFTER DLT APPROVAL. See utils/testOtp.js.
+    // Whitelisted test numbers get a fixed OTP, no real SMS attempt.
+    if (isTestOtpNumber(phone)) {
+      user.otp       = getTestOtpCode();
+      user.otpExpiry = otpExpiry;
+      await user.save({ validateBeforeSave: false });
+      return res.json({ success: true, message: `OTP sent to ${phone}.` });
+    }
+
+    // Generate 6-digit OTP
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
 
     user.otp       = otp;
     user.otpExpiry = otpExpiry;

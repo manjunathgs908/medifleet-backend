@@ -79,11 +79,15 @@ exports.sendOtp = async (req, res, next) => {
 
     // TEMPORARY — REMOVE AFTER DLT APPROVAL. See utils/testOtp.js.
     // Whitelisted test numbers get a fixed OTP, no real SMS attempt.
+    // testOtp is echoed back so the app can show/auto-fill it — safe
+    // because this whole branch only runs for numbers already on the
+    // whitelist, never a general echo of every OTP sent.
     if (isTestOtpNumber(phone)) {
-      owner.otp       = getTestOtpCode();
+      const testOtp = getTestOtpCode();
+      owner.otp       = testOtp;
       owner.otpExpiry = otpExpiry;
       await owner.save({ validateBeforeSave: false });
-      return res.json({ success: true, message: `OTP sent to ${phone}.` });
+      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
     }
 
     // Generate 6-digit OTP

@@ -440,6 +440,28 @@ const tripSchema = new Schema(
     gstAmount     : { type: Number },
     grandTotal    : { type: Number },               // totalFare + GST
 
+    // ── Estimate snapshot — set ONCE at booking (createTrip), NEVER
+    // overwritten afterward. distanceKm/baseFare/grandTotal above get
+    // recomputed at completion from actual data; these two preserve what
+    // the customer was originally quoted, so the final bill can show
+    // "Estimated ₹X → Final ₹Y" like Ola/Uber.
+    estimatedDistanceKm: { type: Number },
+    estimatedFare      : { type: Number },
+
+    // ── Actual trip telemetry — set at completion (not this pass; see
+    // fareCalculator/completeTrip work, tracked separately).
+    actualDistanceKm: { type: Number },
+    arrivedAtPickupAt: { type: Date }, // driver's "Reached Pickup" tap — pairs with the existing pickupVerifiedAt below to bracket pickup wait time
+
+    // ── Wait-time breakdown — computed server-side at completion from
+    // Pricing's wait-charge fields (see pricingSchema above). Not written
+    // by this pass; fields exist now so completeTrip can populate them
+    // once that logic is built.
+    pickupWaitMinutes : { type: Number, default: 0 },
+    dropWaitMinutes   : { type: Number, default: 0 },
+    trafficWaitMinutes: { type: Number, default: 0 },
+    waitCharge        : { type: Number, default: 0 },
+
     // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status: {
       type   : String,
@@ -836,6 +858,23 @@ const pricingSchema = new Schema(
     after300KmRate: Number,
     slabs: Array,
     active: Boolean,
+
+    // ── Wait-time charges (Ola/Uber-style), editable in DB/CRM — never
+    // hardcoded in fare logic. Three independent brackets, each with its
+    // own free-minutes threshold and rate; return-drop wait is two-tier
+    // (tier1 rate for its first N paid minutes, tier2 rate beyond that).
+    pickupFreeWaitMinutes: { type: Number, default: 10 },
+    pickupWaitPerMin     : { type: Number, default: 5 },
+
+    dropFreeWaitMinutes: { type: Number, default: 10 },
+    dropWaitPerMin     : { type: Number, default: 10 },
+
+    returnDropFreeWaitMinutes : { type: Number, default: 10 },
+    returnDropWaitTier1PerMin : { type: Number, default: 5 },   // rate for the first returnDropWaitTier1Minutes paid minutes
+    returnDropWaitTier1Minutes: { type: Number, default: 120 }, // tier-1 duration, in minutes
+    returnDropWaitTier2PerMin : { type: Number, default: 10 },  // rate beyond tier 1
+
+    trafficWaitPerMin: { type: Number, default: 3 }, // no free minutes — charged from minute 1
   },
   { timestamps: true }
 );

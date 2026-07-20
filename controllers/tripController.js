@@ -88,6 +88,10 @@ exports.createTrip = async (req, res, next) => {
       baseFare      : fare.baseFare,
       distanceKm    : fare.distanceKm,
       additionalCharges: fare.additionalCharges,
+      // Estimate snapshot — preserved as-is even after distanceKm/baseFare/
+      // grandTotal get recomputed at completion (see Trip schema comment).
+      estimatedDistanceKm: fare.distanceKm,
+      estimatedFare      : fare.grandTotal,
       bookedBy      : req.user?._id || undefined,
       leadId,
       status        : 'booked',

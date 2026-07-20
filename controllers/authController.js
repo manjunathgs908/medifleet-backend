@@ -15,11 +15,28 @@
 
 const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
-const { User } = require('../models');
+const { User, Trip } = require('../models');
+const Shift = require('../models/Shift');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
+
+// ── Logout safety rule — ambulance operations, not a generic nicety.
+// Live-checked every call (never a cached/stale flag): a driver on duty
+// or mid-trip must not be logged out, voluntarily or by an owner's
+// unbind-device. Does NOT apply to the DEVICE_MISMATCH forced kick
+// (a new-phone login) — that's a distinct mechanism in protect()/refresh(),
+// never routed through this check.
+async function getDriverActiveDutyOrTripReason(driverId) {
+  const activeShift = await Shift.findOne({ driver: driverId, status: { $in: ['active', 'break'] } });
+  if (activeShift) return 'duty';
+
+  const activeTrip = await Trip.findOne({ driver: driverId, status: { $in: ['dispatched', 'en_route'] } });
+  if (activeTrip) return 'trip';
+
+  return null;
+}
 
 // ── Token factories ───────────────────────────────────────────
 // deviceId is embedded in BOTH tokens (undefined for non-driver logins,
@@ -260,11 +277,23 @@ exports.refresh = async (req, res, next) => {
 
 // ============================================================
 // @route   POST /api/auth/logout
-// @desc    Invalidate refresh token (server-side logout)
+// @desc    Invalidate refresh token (server-side logout). Blocked for a
+//          driver who is on duty or has an active trip — ambulance
+//          safety rule, not applicable to Owner/Telecaller sessions.
 // @access  Private
 // ============================================================
 exports.logout = async (req, res, next) => {
   try {
+    if (req.user.role === 'driver') {
+      const reason = await getDriverActiveDutyOrTripReason(req.user._id);
+      if (reason === 'duty') {
+        return res.status(403).json({ success: false, message: 'You are on duty. Please end your duty before logging out.' });
+      }
+      if (reason === 'trip') {
+        return res.status(403).json({ success: false, message: 'You have an active trip. Please complete it before logging out.' });
+      }
+    }
+
     await User.findByIdAndUpdate(req.user._id, { $unset: { refreshToken: '' } });
     return res.json({ success: true, message: 'Logged out successfully.' });
   } catch (err) {
@@ -568,12 +597,21 @@ exports.rejectDriver = async (req, res, next) => {
 // ============================================================
 exports.unbindDevice = async (req, res, next) => {
   try {
-    const user = await User.findOneAndUpdate(
-      { _id: req.params.id, role: 'driver' },
-      { $unset: { deviceId: '' } },
-      { new: true }
-    );
-    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+    const driver = await User.findOne({ _id: req.params.id, role: 'driver' });
+    if (!driver) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    // Same ambulance-safety rule as voluntary logout — an owner can't
+    // force a driver off their device mid-duty/mid-trip either.
+    const reason = await getDriverActiveDutyOrTripReason(driver._id);
+    if (reason === 'duty') {
+      return res.status(403).json({ success: false, message: "This driver is currently on duty and can't be logged out right now." });
+    }
+    if (reason === 'trip') {
+      return res.status(403).json({ success: false, message: "This driver is on an active trip and can't be logged out right now." });
+    }
+
+    driver.deviceId = undefined;
+    await driver.save({ validateBeforeSave: false });
 
     return res.json({ success: true, message: 'Device unbound. Driver can log in from a new device.' });
   } catch (err) {

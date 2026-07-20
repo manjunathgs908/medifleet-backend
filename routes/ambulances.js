@@ -12,5 +12,6 @@ router.get   ('/:id',           ambulanceCtrl.getAmbulanceById);
 router.put   ('/:id',           ambulanceCtrl.updateAmbulance);
 router.delete('/:id',           ambulanceCtrl.deleteAmbulance);
 router.put   ('/:id/document',  ambulanceCtrl.updateDocument);
+router.post  ('/:id/photos',    ambulanceCtrl.addPhoto);
 
 module.exports = router;

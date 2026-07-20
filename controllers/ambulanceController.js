@@ -1,8 +1,9 @@
 /**
  * controllers/ambulanceController.js
  * ============================================================
- * Ambulance CRUD + per-ambulance document upload — Phase 1 of the
- * driver-auth redesign. Every operation is scoped to req.user._id
+ * Ambulance CRUD + per-ambulance document/photo upload — Phase 1 of
+ * the driver-auth redesign, extended in Phase 2 (Add Ambulance) with
+ * serviceType/year/photos. Every operation is scoped to req.user._id
  * (the authenticated Owner). `assignedDriver` may reference an existing
  * `User` (driver) document by id — read-only reference, User untouched.
  * ============================================================
@@ -12,8 +13,25 @@
 const Ambulance = require('../models/Ambulance');
 const Fleet     = require('../models/Fleet');
 const { uploadToCloudinary } = require('../utils/cloudinary');
+const { byServiceType } = require('../utils/ambulanceServiceTypes');
 
 const DOC_TYPES = ['rc', 'insurance', 'fitness', 'permit', 'pollution'];
+
+// No Fleet-management UI exists yet (deliberately out of scope — Fleet
+// stays an invisible implementation detail for now). If the owner didn't
+// pass a fleetId, reuse their one auto-provisioned default Fleet, or
+// create it on first use.
+async function resolveFleet(ownerId, fleetId) {
+  if (fleetId) {
+    const fleet = await Fleet.findOne({ _id: fleetId, owner: ownerId });
+    return fleet || null;
+  }
+  let fleet = await Fleet.findOne({ owner: ownerId, isActive: true }).sort({ createdAt: 1 });
+  if (!fleet) {
+    fleet = await Fleet.create({ owner: ownerId, name: 'My Fleet' });
+  }
+  return fleet;
+}
 
 // ============================================================
 // @route   POST /api/ambulances
@@ -21,19 +39,31 @@ const DOC_TYPES = ['rc', 'insurance', 'fitness', 'permit', 'pollution'];
 // ============================================================
 exports.createAmbulance = async (req, res, next) => {
   try {
-    const { fleetId, registrationNumber, deviceId, assignedDriverId } = req.body;
+    const { fleetId, registrationNumber, serviceType, year, deviceId, assignedDriverId } = req.body;
 
-    if (!fleetId || !registrationNumber) {
-      return res.status(400).json({ success: false, message: 'fleetId and registrationNumber are required.' });
+    if (!registrationNumber || !serviceType) {
+      return res.status(400).json({ success: false, message: 'registrationNumber and serviceType are required.' });
     }
 
-    const fleet = await Fleet.findOne({ _id: fleetId, owner: req.user._id });
+    const typeInfo = byServiceType[serviceType];
+    if (!typeInfo) {
+      return res.status(400).json({
+        success: false,
+        message: `serviceType must be one of: ${Object.keys(byServiceType).join(', ')}`,
+      });
+    }
+
+    const fleet = await resolveFleet(req.user._id, fleetId);
     if (!fleet) return res.status(404).json({ success: false, message: 'Fleet not found for this owner.' });
 
     const ambulance = await Ambulance.create({
       owner : req.user._id,
       fleet : fleet._id,
       registrationNumber,
+      serviceType,
+      serviceTypeLabel: typeInfo.label,
+      vehicleModel    : typeInfo.vehicleModel,
+      year: year || undefined,
       deviceId,
       assignedDriver: assignedDriverId || undefined,
     });
@@ -88,7 +118,7 @@ exports.getAmbulanceById = async (req, res, next) => {
 // ============================================================
 exports.updateAmbulance = async (req, res, next) => {
   try {
-    const { registrationNumber, deviceId, assignedDriverId, status, fleetId } = req.body;
+    const { registrationNumber, serviceType, year, deviceId, assignedDriverId, status, fleetId } = req.body;
 
     const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
     if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
@@ -99,6 +129,19 @@ exports.updateAmbulance = async (req, res, next) => {
       ambulance.fleet = fleet._id;
     }
     if (registrationNumber)             ambulance.registrationNumber = registrationNumber;
+    if (serviceType) {
+      const typeInfo = byServiceType[serviceType];
+      if (!typeInfo) {
+        return res.status(400).json({
+          success: false,
+          message: `serviceType must be one of: ${Object.keys(byServiceType).join(', ')}`,
+        });
+      }
+      ambulance.serviceType      = serviceType;
+      ambulance.serviceTypeLabel = typeInfo.label;
+      ambulance.vehicleModel     = typeInfo.vehicleModel;
+    }
+    if (year !== undefined)             ambulance.year = year;
     if (deviceId !== undefined)         ambulance.deviceId = deviceId;
     if (assignedDriverId !== undefined) ambulance.assignedDriver = assignedDriverId || null;
     if (status)                         ambulance.status = status;
@@ -131,12 +174,12 @@ exports.deleteAmbulance = async (req, res, next) => {
 // ============================================================
 // @route   PUT /api/ambulances/:id/document
 // @desc    Upload/replace one compliance document (rc/insurance/
-//          fitness/permit/pollution) and/or set its expiry date.
+//          fitness/permit/pollution — PUC) and/or set its number/expiry.
 // @access  Private [owner]
 // ============================================================
 exports.updateDocument = async (req, res, next) => {
   try {
-    const { docType, base64, expiryDate } = req.body;
+    const { docType, base64, number, expiryDate } = req.body;
 
     if (!DOC_TYPES.includes(docType)) {
       return res.status(400).json({
@@ -148,20 +191,48 @@ exports.updateDocument = async (req, res, next) => {
     const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
     if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
 
-    let url = ambulance.documents?.[docType]?.url;
+    const existing = ambulance.documents?.[docType] || {};
+    let { url, publicId } = existing;
     if (base64) {
-      const result = await uploadToCloudinary(base64, `owners/${req.user._id}/ambulances/${ambulance._id}`);
-      url = result.secure_url;
+      const result = await uploadToCloudinary(base64, `owners/${req.user._id}/ambulances/${ambulance._id}/documents`);
+      url      = result.secure_url;
+      publicId = result.public_id;
     }
 
     ambulance.documents = ambulance.documents || {};
     ambulance.documents[docType] = {
       url,
-      expiryDate: expiryDate ? new Date(expiryDate) : ambulance.documents[docType]?.expiryDate,
+      publicId,
+      number    : number !== undefined ? number : existing.number,
+      expiryDate: expiryDate ? new Date(expiryDate) : existing.expiryDate,
     };
     await ambulance.save();
 
     return res.json({ success: true, documents: ambulance.documents });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/ambulances/:id/photos
+// @desc    Add one ambulance photo (base64) — called once per photo,
+//          same one-upload-per-call pattern as updateDocument above.
+// @access  Private [owner]
+// ============================================================
+exports.addPhoto = async (req, res, next) => {
+  try {
+    const { base64 } = req.body;
+    if (!base64) return res.status(400).json({ success: false, message: 'base64 is required.' });
+
+    const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+
+    const result = await uploadToCloudinary(base64, `owners/${req.user._id}/ambulances/${ambulance._id}/photos`);
+    ambulance.photos.push({ url: result.secure_url, publicId: result.public_id });
+    await ambulance.save();
+
+    return res.json({ success: true, photos: ambulance.photos });
   } catch (err) {
     next(err);
   }

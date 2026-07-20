@@ -19,34 +19,51 @@ const { User } = require('../models');
 const smsService = require('../utils/smsService');
 
 // ── Token factories ───────────────────────────────────────────
-const signAccessToken = (userId) =>
-  jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRE || '7d' });
+// deviceId is embedded in BOTH tokens (undefined for non-driver logins,
+// which JWT simply omits from the payload) so `protect`/`refresh` can
+// reject a stale token the moment a different device rebinds — see the
+// device-mismatch check in middleware/auth.js.
+const signAccessToken = (userId, deviceId) =>
+  jwt.sign({ id: userId, deviceId }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRE || '7d' });
 
-const signRefreshToken = (userId) =>
-  jwt.sign({ id: userId }, process.env.JWT_REFRESH_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRE || '30d' });
+const signRefreshToken = (userId, deviceId) =>
+  jwt.sign({ id: userId, deviceId }, process.env.JWT_REFRESH_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRE || '30d' });
 
 // ── Standard success response with tokens ────────────────────
-const sendTokenResponse = async (user, statusCode, res) => {
-  const accessToken  = signAccessToken(user._id);
-  const refreshToken = signRefreshToken(user._id);
+const sendTokenResponse = async (user, statusCode, res, deviceId) => {
+  const accessToken  = signAccessToken(user._id, deviceId);
+  const refreshToken = signRefreshToken(user._id, deviceId);
 
   // Persist hashed refresh token in DB for rotation verification
   user.refreshToken = crypto.createHash('sha256').update(refreshToken).digest('hex');
   user.lastLogin    = Date.now();
   await user.save({ validateBeforeSave: false });
 
+  const userPayload = {
+    id          : user._id,
+    name        : user.name,
+    phone       : user.phone,
+    role        : user.role,
+    vehicleId   : user.vehicleId,
+    availability: user.availability,
+  };
+
+  // Driver-onboarding fields the app's post-login gate (device check,
+  // approval-pending screen, ambulance display) needs — only meaningful
+  // for role:'driver', so kept off the response for everyone else.
+  if (user.role === 'driver') {
+    await user.populate('assignedAmbulanceId', 'registrationNumber status');
+    userPayload.approvalStatus      = user.approvalStatus;
+    userPayload.assignedAmbulanceId = user.assignedAmbulanceId;
+    userPayload.driverDocuments     = user.driverDocuments;
+    userPayload.deviceId            = user.deviceId;
+  }
+
   return res.status(statusCode).json({
     success : true,
     accessToken,
     refreshToken,
-    user: {
-      id          : user._id,
-      name        : user.name,
-      phone       : user.phone,
-      role        : user.role,
-      vehicleId   : user.vehicleId,
-      availability: user.availability,
-    },
+    user: userPayload,
   });
 };
 
@@ -124,7 +141,7 @@ exports.sendOtp = async (req, res, next) => {
 // ============================================================
 exports.verifyOtp = async (req, res, next) => {
   try {
-    const { phone, otp } = req.body;
+    const { phone, otp, deviceId } = req.body;
     if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
 
     const user = await User.findOne({ phone }).select('+otp +otpExpiry +refreshToken');
@@ -134,11 +151,26 @@ exports.verifyOtp = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'OTP is invalid or has expired.' });
     }
 
+    // Driver-only hardening — device binding and the approval gate are
+    // meaningless for Owner/Telecaller password-based staff accounts,
+    // so scoped to role:'driver' rather than applied blanket.
+    if (user.role === 'driver') {
+      if (!deviceId) {
+        return res.status(400).json({ success: false, message: 'deviceId is required.' });
+      }
+      if (user.approvalStatus !== 'approved') {
+        return res.status(403).json({ success: false, message: 'Your account is pending approval.' });
+      }
+      // Most recent OTP login always wins — unconditional rebind (unlike
+      // the old PIN flow, which only bound once and then locked to it).
+      user.deviceId = deviceId;
+    }
+
     // Clear OTP after successful verification
     user.otp       = undefined;
     user.otpExpiry = undefined;
 
-    return sendTokenResponse(user, 200, res);
+    return sendTokenResponse(user, 200, res, deviceId);
   } catch (err) {
     next(err);
   }
@@ -199,7 +231,17 @@ exports.refresh = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Refresh token is invalid or has been revoked.' });
     }
 
-    const newAccessToken = signAccessToken(user._id);
+    // A different device has since logged in and rebound deviceId — this
+    // refresh token's device claim is now stale. Same check as protect().
+    if (decoded.deviceId !== user.deviceId) {
+      return res.status(401).json({
+        success: false,
+        code   : 'DEVICE_MISMATCH',
+        message: 'Logged in on another device. Please log in again.',
+      });
+    }
+
+    const newAccessToken = signAccessToken(user._id, user.deviceId);
     return res.json({ success: true, accessToken: newAccessToken });
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
@@ -315,8 +357,12 @@ exports.loginWithPin = async (req, res, next) => {
       user.deviceId = deviceId;
     }
 
-    const accessToken  = signAccessToken(user._id);
-    const refreshToken = signRefreshToken(user._id);
+    // deviceId is now embedded in the token payload too (protect() checks
+    // it) — kept here so a driver still on a pre-OTP-rollout app build
+    // isn't falsely kicked by the new device-mismatch check on their very
+    // next request; this endpoint itself is otherwise unchanged/deprecated.
+    const accessToken  = signAccessToken(user._id, user.deviceId);
+    const refreshToken = signRefreshToken(user._id, user.deviceId);
     user.refreshToken = crypto.createHash('sha256').update(refreshToken).digest('hex');
     user.lastLogin    = Date.now();
     await user.save({ validateBeforeSave: false });

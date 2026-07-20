@@ -70,7 +70,18 @@ const protect = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Account is deactivated. Contact admin.' });
     }
 
-    // 5. Attach user to request for downstream middleware
+    // 5. One-active-device enforcement — a newer login has since rebound
+    //    user.deviceId, making this token's claim stale. Harmless no-op
+    //    for tokens/accounts with no deviceId at all (both sides undefined).
+    if (decoded.deviceId !== user.deviceId) {
+      return res.status(401).json({
+        success: false,
+        code   : 'DEVICE_MISMATCH',
+        message: 'Logged in on another device. Please log in again.',
+      });
+    }
+
+    // 6. Attach user to request for downstream middleware
     req.user = user;
     next();
 

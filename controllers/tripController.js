@@ -15,7 +15,33 @@
 'use strict';
 
 const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead } = require('../models');
+const Ambulance = require('../models/Ambulance');
 const fareCalculator = require('../utils/fareCalculator');
+
+// ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
+// registrationNumber. Both schemas already normalize to uppercase+trim
+// on save, so an exact match covers the common case cheaply; the
+// fallback strips all non-alphanumeric characters before comparing, to
+// catch the same physical plate entered differently in the two systems
+// (e.g. "KA01AB1234" in the CRM vs "KA-01-AB-1234" in Add Ambulance).
+// Never throws, never returns anything but a doc or null — a miss must
+// not block dispatch.
+const normalizePlate = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+async function findMatchingAmbulance(registrationNumber) {
+  try {
+    const exact = await Ambulance.findOne({ registrationNumber });
+    if (exact) return exact;
+
+    const target = normalizePlate(registrationNumber);
+    if (!target) return null;
+    const candidates = await Ambulance.find({}, 'registrationNumber');
+    const fuzzy = candidates.find(a => normalizePlate(a.registrationNumber) === target);
+    return fuzzy || null;
+  } catch (err) {
+    return null;
+  }
+}
 
 // 5% GST on medical transport — not a Pricing-collection field, applied uniformly
 // here rather than as a silent Mongoose schema default.
@@ -151,6 +177,7 @@ const autoAssign = async (trip) => {
 // ── Helper: assign trip to a specific vehicle ─────────────────
 const assignTripToVehicle = async (trip, vehicle) => {
   trip.vehicle     = vehicle._id;
+  trip.ambulance   = (await findMatchingAmbulance(vehicle.registrationNumber))?._id || undefined;
   trip.driver      = vehicle.assignedDriver;
   trip.status      = 'dispatched';
   trip.dispatchedAt = new Date();

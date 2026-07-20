@@ -16,6 +16,7 @@
 const Assignment = require('../models/Assignment');
 const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
+const { Trip }    = require('../models');
 
 function toLocation(lat, lng) {
   return (lat != null && lng != null) ? { lat, lng } : undefined;
@@ -318,7 +319,7 @@ exports.getFleetShiftStatus = async (req, res, next) => {
 
     const ambulances = await Ambulance.find({ owner: ownerId, isActive: true })
       .populate('fleet', 'name')
-      .populate('assignedDriver', 'name phone employeeId');
+      .populate('assignedDriver', 'name phone employeeId availability');
 
     const fleet = await Promise.all(ambulances.map(async (amb) => {
       const assignment = amb.status === 'assigned'
@@ -328,16 +329,65 @@ exports.getFleetShiftStatus = async (req, res, next) => {
         ? await Shift.findOne({ driver: assignment.driver, status: { $in: ['active', 'break'] } })
         : null;
 
+      // Owner-facing display status — a single available/on_trip/off/
+      // maintenance value derived from Ambulance.status (is anyone on
+      // duty at all) combined with that driver's own live
+      // availability.status (idle vs mid-trip), the field Phase 6A made
+      // trustworthy. 'off' means the ambulance itself is unclaimed right
+      // now, not necessarily broken.
+      let displayStatus = 'off';
+      if (amb.status === 'maintenance') {
+        displayStatus = 'maintenance';
+      } else if (amb.status === 'assigned') {
+        displayStatus = amb.assignedDriver?.availability?.status === 'on_trip' ? 'on_trip' : 'available';
+      }
+
+      // Phase 6B bridge — only meaningful while the ambulance is actually
+      // claimed; an unclaimed ambulance can't have a live trip on it.
+      let activeTrip = null;
+      if (amb.status === 'assigned') {
+        const trip = await Trip.findOne({ ambulance: amb._id, status: { $in: ['dispatched', 'en_route'] } })
+          .populate('dropHospital', 'name address');
+        if (trip) {
+          activeTrip = {
+            id           : trip._id,
+            tripNumber   : trip.tripNumber,
+            status       : trip.status,
+            patientName  : trip.patientName,
+            patientPhone : trip.patientPhone,
+            pickup       : trip.pickup,
+            dropHospital : trip.dropHospital,
+            dropAddress  : trip.dropAddress,
+            emergencyType: trip.emergencyType,
+            distanceKm   : trip.distanceKm,
+            createdAt    : trip.createdAt,
+          };
+        }
+      }
+
       return {
         ambulance: {
           id                : amb._id,
           registrationNumber: amb.registrationNumber,
+          serviceType       : amb.serviceType,
+          serviceTypeLabel  : amb.serviceTypeLabel,
           status            : amb.status,
+          displayStatus,
           fleet             : amb.fleet,
-          assignedDriver    : amb.assignedDriver,
+          assignedDriver    : amb.assignedDriver ? {
+            id      : amb.assignedDriver._id,
+            name    : amb.assignedDriver.name,
+            phone   : amb.assignedDriver.phone,
+            location: amb.assignedDriver.availability?.lat != null ? {
+              lat      : amb.assignedDriver.availability.lat,
+              lng      : amb.assignedDriver.availability.lng,
+              updatedAt: amb.assignedDriver.availability.updatedAt,
+            } : null,
+          } : null,
         },
         assignment,
         shift,
+        activeTrip,
       };
     }));
 

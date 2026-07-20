@@ -438,6 +438,16 @@ const tripSchema = new Schema(
 
     // â”€â”€ Assignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     vehicle       : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
+    // Phase 6 light bridge — best-effort link to the Phase 1 Ambulance
+    // model, auto-populated at dispatch by matching registrationNumber
+    // against the assigned Vehicle (see assignTripToVehicle in
+    // tripController.js). Optional/nullable by design: dispatch must
+    // succeed identically whether or not a match is found. This is
+    // deliberately NOT a full Trip/Vehicle -> Ambulance migration — the
+    // existing Vehicle-based dispatch is untouched; this field only
+    // exists so an owner's live dashboard can find "this booking is on
+    // one of my ambulances" without the two systems merging.
+    ambulance     : { type: Schema.Types.ObjectId, ref: 'Ambulance' },
     driver        : { type: Schema.Types.ObjectId, ref: 'User' },
     bookedBy      : { type: Schema.Types.ObjectId, ref: 'User' }, // Telecaller
     leadId        : { type: Schema.Types.ObjectId, ref: 'Lead' }, // If originated from ad lead

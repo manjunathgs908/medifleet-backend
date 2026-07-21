@@ -77,7 +77,7 @@ exports.sendBookingOtp = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
     }
 
-    const otp       = String(Math.floor(100000 + Math.random() * 900000));
+    const otp       = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit, website booking OTP only
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
 
     await BookingOtp.findOneAndUpdate(
@@ -103,8 +103,9 @@ exports.sendBookingOtp = async (req, res, next) => {
       });
     }
 
-    // In development, return OTP in response for testing — same
-    // convention as driver/owner login OTP.
+    // In development, return OTP in response for testing — same dev-echo
+    // convention as driver/owner login OTP (length differs: 4 digits here
+    // to match the website's MSG91 widget setting, 6 for app login).
     const devPayload = process.env.NODE_ENV === 'development' ? { otp } : {};
 
     return res.json({ success: true, message: `OTP sent to ${phone}.`, msg91: smsResult, ...devPayload });

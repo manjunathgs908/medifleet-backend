@@ -4,6 +4,8 @@ const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
 const { protect, authorize } = require('../middleware/auth');
 
+router.post('/send-otp',   tripCtrl.sendBookingOtp);
+router.post('/verify-otp', tripCtrl.verifyBookingOtp);
 router.post('/', tripCtrl.createTrip);
 router.get('/:id/track', tripCtrl.trackTrip);
 router.get('/live', protect, authorize('owner','telecaller','driver'), tripCtrl.getLiveBoard);

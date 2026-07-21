@@ -97,6 +97,7 @@ const sendOtp = async (phone, otp) => {
       template_id: process.env.MSG91_TEMPLATE_ID,
       mobile      : `91${phone}`,
       authkey     : process.env.MSG91_AUTH_KEY,
+      sender      : process.env.MSG91_SENDER_ID, // was missing — DLT requires the approved sender tied to this template
       otp,
     },
     { headers: { 'Content-Type': 'application/json' } }

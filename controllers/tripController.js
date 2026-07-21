@@ -16,7 +16,9 @@
 
 const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead } = require('../models');
 const Ambulance = require('../models/Ambulance');
+const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
+const smsService = require('../utils/smsService');
 
 // ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
 // registrationNumber. Both schemas already normalize to uppercase+trim
@@ -56,6 +58,85 @@ const haversineKm = (lat1, lng1, lat2, lng2) => {
     Math.sin(dLat / 2) ** 2 +
     Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+
+// ============================================================
+// @route   POST /api/trips/send-otp
+// @desc    Phone verification for the website booking form — real MSG91
+//          SMS for every number (no test-OTP whitelist; that mechanism
+//          is only for app login testing, see utils/testOtp.js). Not
+//          gated on any account — a website visitor isn't a User/Owner.
+// @access  Public
+// ============================================================
+exports.sendBookingOtp = async (req, res, next) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
+    if (!/^[6-9]\d{9}$/.test(phone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
+    }
+
+    const otp       = String(Math.floor(100000 + Math.random() * 900000));
+    const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    await BookingOtp.findOneAndUpdate(
+      { phone },
+      { otp, otpExpiry },
+      { upsert: true, new: true }
+    );
+
+    const smsResult = await smsService.sendOtp(phone, otp);
+
+    // MSG91 can return HTTP 200 with a payload-level failure (bad/missing
+    // authkey, unapproved template, etc.) — axios won't throw on that, so
+    // without this check a broken credential would silently report
+    // "OTP sent" while no SMS ever went out.
+    if (smsResult?.type === 'error') {
+      return res.status(502).json({
+        success: false,
+        message: smsResult.message || 'Could not send OTP right now. Please try again.',
+      });
+    }
+
+    // In development, return OTP in response for testing — same
+    // convention as driver/owner login OTP.
+    const devPayload = process.env.NODE_ENV === 'development' ? { otp } : {};
+
+    return res.json({ success: true, message: `OTP sent to ${phone}.`, ...devPayload });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/trips/verify-otp
+// @desc    Verify the website booking form's phone OTP. One-time use —
+//          deleted on success. Does NOT issue a token or mark anything
+//          for POST /api/trips to check; the website itself only calls
+//          the booking endpoint from this call's success callback,
+//          exactly like the widget flow it replaces. Keeps this
+//          decoupled from CRM/telecaller and customer-app bookings,
+//          neither of which go through phone verification.
+// @access  Public
+// ============================================================
+exports.verifyBookingOtp = async (req, res, next) => {
+  try {
+    const { phone, otp } = req.body;
+    if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
+
+    const record = await BookingOtp.findOne({ phone });
+    if (!record || !record.isOtpValid(otp)) {
+      return res.status(400).json({ success: false, message: 'OTP is invalid or has expired.' });
+    }
+
+    await BookingOtp.deleteOne({ _id: record._id });
+
+    return res.json({ success: true, message: 'Phone verified.' });
+  } catch (err) {
+    next(err);
+  }
 };
 
 

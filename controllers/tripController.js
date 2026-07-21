@@ -87,15 +87,19 @@ exports.sendBookingOtp = async (req, res, next) => {
     );
 
     const smsResult = await smsService.sendOtp(phone, otp);
+    console.log('[sendBookingOtp] MSG91 response for', phone, ':', JSON.stringify(smsResult));
 
     // MSG91 can return HTTP 200 with a payload-level failure (bad/missing
     // authkey, unapproved template, etc.) — axios won't throw on that, so
     // without this check a broken credential would silently report
-    // "OTP sent" while no SMS ever went out.
+    // "OTP sent" while no SMS ever went out. Echoing the raw MSG91 response
+    // back (msg91: smsResult) is a temporary debugging aid while confirming
+    // real delivery — safe to strip later, it holds no secrets.
     if (smsResult?.type === 'error') {
       return res.status(502).json({
         success: false,
         message: smsResult.message || 'Could not send OTP right now. Please try again.',
+        msg91: smsResult,
       });
     }
 
@@ -103,7 +107,7 @@ exports.sendBookingOtp = async (req, res, next) => {
     // convention as driver/owner login OTP.
     const devPayload = process.env.NODE_ENV === 'development' ? { otp } : {};
 
-    return res.json({ success: true, message: `OTP sent to ${phone}.`, ...devPayload });
+    return res.json({ success: true, message: `OTP sent to ${phone}.`, msg91: smsResult, ...devPayload });
   } catch (err) {
     next(err);
   }

@@ -91,17 +91,24 @@ const sendOtp = async (phone, otp) => {
     console.log(`[SMS Mock] OTP for ${phone}: ${otp}`);
     return { success: true, mock: true };
   }
+  // MSG91's v5 OTP endpoint reads its params from the query string, not a
+  // JSON body — sending them as a JSON body (as this used to) means MSG91
+  // never sees mobile/otp/template_id, which is a silent-failure mode this
+  // endpoint doesn't clearly error on.
   const response = await axios.post(
     'https://api.msg91.com/api/v5/otp',
+    {},
     {
-      template_id: process.env.MSG91_TEMPLATE_ID,
-      mobile      : `91${phone}`,
-      authkey     : process.env.MSG91_AUTH_KEY,
-      sender      : process.env.MSG91_SENDER_ID, // was missing — DLT requires the approved sender tied to this template
-      otp,
-    },
-    { headers: { 'Content-Type': 'application/json' } }
+      params: {
+        template_id: process.env.MSG91_TEMPLATE_ID,
+        mobile     : `91${phone}`,
+        authkey    : process.env.MSG91_AUTH_KEY,
+        sender     : process.env.MSG91_SENDER_ID,
+        otp,
+      },
+    }
   );
+  console.log('[smsService.sendOtp] MSG91 raw response:', JSON.stringify(response.data));
   return response.data;
 };
 

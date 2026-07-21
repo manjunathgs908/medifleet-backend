@@ -79,6 +79,10 @@ const sendTokenResponse = async (user, statusCode, res, deviceId) => {
     userPayload.assignedAmbulanceId = user.assignedAmbulanceId;
     userPayload.driverDocuments     = user.driverDocuments;
     userPayload.deviceId            = user.deviceId;
+    // Owner-acting-as-driver marker (see ownerController.actAsDriver) — lets
+    // the app know to restore the owner session on end-duty instead of
+    // staying in the normal driver flow.
+    userPayload.isOwnerSelf         = !!user.isOwnerSelf;
   }
 
   return res.status(statusCode).json({
@@ -88,6 +92,13 @@ const sendTokenResponse = async (user, statusCode, res, deviceId) => {
     user: userPayload,
   });
 };
+
+// Reused by ownerController.actAsDriver to mint a normal driver token for
+// an owner's own shadow driver identity — same token shape, same response
+// shape, so every existing driver-flow endpoint needs zero changes.
+exports.signAccessToken  = signAccessToken;
+exports.signRefreshToken = signRefreshToken;
+exports.sendTokenResponse = sendTokenResponse;
 
 
 // ============================================================

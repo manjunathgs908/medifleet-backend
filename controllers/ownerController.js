@@ -6,11 +6,12 @@
  *   - OTP registration/login (reuses utils/smsService.sendOtp — same
  *     MSG91 integration the driver OTP flow uses)
  *   - KYC document upload (reuses utils/cloudinary.uploadToCloudinary)
- *
- * Deliberately self-contained: does not import or modify authController.js
- * or the User model. Token shape mirrors authController's pattern but
- * carries role:'owner' so middleware/auth.js's protectOwner + the existing
- * authorize('owner') gate can be reused unchanged.
+ *   - actAsDriver: mints a driver token for the owner's own shadow
+ *     driver identity, so a small owner-operator can drive their own
+ *     fleet through the completely unmodified driver flow (start-duty,
+ *     trips, location, logout-safety) — the one deliberate exception to
+ *     "self-contained", since it needs the User model + authController's
+ *     token-signing to produce a real driver session.
  * ============================================================
  */
 'use strict';
@@ -18,6 +19,8 @@
 const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
 const Owner  = require('../models/Owner');
+const { User } = require('../models');
+const { sendTokenResponse: sendDriverTokenResponse } = require('./authController');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE AFTER DLT APPROVAL
@@ -184,6 +187,63 @@ exports.uploadKycDocument = async (req, res, next) => {
       kycDocuments: owner.kycDocuments,
       kycStatus   : owner.kycStatus,
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/owners/act-as-driver
+// @desc    Mints a normal driver token for this owner's own shadow
+//          driver identity (role:'driver', isOwnerSelf:true,
+//          approvalStatus:'approved' from creation — never goes through
+//          the pending-approval gate). Find-or-create, then delegates
+//          entirely to authController.sendTokenResponse — same token
+//          shape a real driver login produces, so every existing
+//          driver-flow endpoint (start-duty, trips, location,
+//          logout-safety) needs zero changes to work for an owner
+//          driving their own fleet.
+// @access  Private [owner]
+// ============================================================
+exports.actAsDriver = async (req, res, next) => {
+  try {
+    const { deviceId } = req.body;
+    if (!deviceId) {
+      return res.status(400).json({ success: false, message: 'deviceId is required.' });
+    }
+
+    let shadowDriver = await User.findOne({ owner: req.user._id, isOwnerSelf: true, role: 'driver' });
+
+    if (!shadowDriver) {
+      try {
+        shadowDriver = await User.create({
+          name          : req.user.name,
+          phone         : req.user.phone,
+          role          : 'driver',
+          approvalStatus: 'approved', // implicitly approved to drive their own fleet — never pending
+          owner         : req.user._id,
+          isOwnerSelf   : true,
+        });
+      } catch (createErr) {
+        if (createErr.code === 11000) {
+          return res.status(409).json({
+            success: false,
+            message: 'A driver account already exists with your phone number. Contact support to link it.',
+          });
+        }
+        throw createErr;
+      }
+    } else {
+      // Keep the shadow record's name in sync if the owner's profile name changed.
+      shadowDriver.name = req.user.name;
+    }
+
+    // Most recent "drive as myself" tap always wins — same unconditional
+    // rebind rule real driver OTP login uses.
+    shadowDriver.deviceId = deviceId;
+
+    return sendDriverTokenResponse(shadowDriver, 200, res, deviceId);
   } catch (err) {
     next(err);
   }

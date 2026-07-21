@@ -9,7 +9,8 @@ router.post('/send-otp',   ownerCtrl.sendOtp);
 router.post('/verify-otp', ownerCtrl.verifyOtp);
 
 // Private [owner]
-router.get ('/me',         protectOwner, authorize('owner'), ownerCtrl.getMe);
-router.post('/kyc/upload', protectOwner, authorize('owner'), ownerCtrl.uploadKycDocument);
+router.get ('/me',            protectOwner, authorize('owner'), ownerCtrl.getMe);
+router.post('/kyc/upload',    protectOwner, authorize('owner'), ownerCtrl.uploadKycDocument);
+router.post('/act-as-driver', protectOwner, authorize('owner'), ownerCtrl.actAsDriver);
 
 module.exports = router;

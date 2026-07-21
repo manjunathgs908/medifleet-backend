@@ -128,6 +128,15 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // platform-wide when this is unset, rather than showing nothing.
     owner: { type: Schema.Types.ObjectId, ref: 'Owner' },
 
+    // Marks this driver User as the auto-created shadow identity an Owner
+    // uses to drive their own fleet (ownerController.actAsDriver) — a
+    // small operator who is both owner and driver, without a separate
+    // employee account. Pure descriptive/audit flag: no existing
+    // driver-flow gate (approval, start-duty, logout-safety, location)
+    // checks it — it's approved at creation time instead, so every
+    // existing endpoint treats it as a completely normal driver.
+    isOwnerSelf: { type: Boolean, default: false },
+
     driverDocuments: {
       dl     : { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },
       aadhaar: { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },

@@ -225,30 +225,42 @@ exports.actAsDriver = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'deviceId is required.' });
     }
 
-    let shadowDriver = await User.findOne({ owner: req.user._id, isOwnerSelf: true, role: 'driver' });
+    // Look up by phone, not just owner+isOwnerSelf: `phone` is the actual
+    // real-world link between this Owner and any pre-existing driver User
+    // sharing that number — whether that's the shadow we minted last time,
+    // a regular employee record the owner happens to share a phone with,
+    // or a driver User that was self-registered before this Owner account
+    // ever existed (phone comes first, Owner second — the reverse order).
+    // Only a driver already claimed by a genuinely different Owner is a
+    // real conflict; phone uniqueness means every other case is provably
+    // the same real person.
+    let shadowDriver = await User.findOne({ phone: req.user.phone, role: 'driver' });
+
+    if (shadowDriver && shadowDriver.owner && shadowDriver.owner.toString() !== req.user._id.toString()) {
+      return res.status(409).json({
+        success: false,
+        message: 'This phone number is linked to a driver account under a different fleet owner. Contact support to resolve.',
+      });
+    }
 
     if (!shadowDriver) {
-      try {
-        shadowDriver = await User.create({
-          name          : req.user.name,
-          phone         : req.user.phone,
-          role          : 'driver',
-          approvalStatus: 'approved', // implicitly approved to drive their own fleet — never pending
-          owner         : req.user._id,
-          isOwnerSelf   : true,
-        });
-      } catch (createErr) {
-        if (createErr.code === 11000) {
-          return res.status(409).json({
-            success: false,
-            message: 'A driver account already exists with your phone number. Contact support to link it.',
-          });
-        }
-        throw createErr;
-      }
+      shadowDriver = await User.create({
+        name          : req.user.name,
+        phone         : req.user.phone,
+        role          : 'driver',
+        approvalStatus: 'approved', // implicitly approved to drive their own fleet — never pending
+        owner         : req.user._id,
+        isOwnerSelf   : true,
+      });
     } else {
-      // Keep the shadow record's name in sync if the owner's profile name changed.
-      shadowDriver.name = req.user.name;
+      // Link it as this owner's shadow identity instead of erroring —
+      // backfills `owner` for the no-owner-yet case, and force-approves
+      // it the same way a freshly created shadow would be, since it's
+      // now provably the owner driving themselves.
+      shadowDriver.name           = req.user.name;
+      shadowDriver.owner          = req.user._id;
+      shadowDriver.isOwnerSelf    = true;
+      shadowDriver.approvalStatus = 'approved';
     }
 
     // Most recent "drive as myself" tap always wins — same unconditional

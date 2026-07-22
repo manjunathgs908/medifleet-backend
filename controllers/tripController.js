@@ -1144,6 +1144,7 @@ const ASSUMED_KMPH = 30;
 exports.trackTrip = async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.id)
+      .select('+pickupOtp')
       .populate('vehicle', 'registrationNumber type')
       .populate('ambulance', 'registrationNumber serviceType serviceTypeLabel vehicleModel year')
       .populate('driver', 'name phone availability ratingSum ratingCount completedTripsCount')
@@ -1234,6 +1235,10 @@ exports.trackTrip = async (req, res, next) => {
       trip: {
         status        : awaitingDriverAccept ? 'booked' : trip.status,
         pickupVerified: trip.pickupVerified,
+        // Withheld once verified — no reason to keep displaying a
+        // used/stale code (schema's own select:false intent: only the
+        // customer ever sees this, and only while it's still needed).
+        pickupOtp     : !trip.pickupVerified ? trip.pickupOtp : undefined,
         paymentPreference: trip.paymentPreference,
         driver        : showDriver ? {
           name               : trip.driver.name,

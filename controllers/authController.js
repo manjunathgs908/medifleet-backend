@@ -520,29 +520,44 @@ exports.listDrivers = async (req, res, next) => {
 
 // ============================================================
 // @route   POST /api/driver-auth/register
-// @desc    Owner creates a new driver account for Employee ID + PIN
-//          login. Starts as approvalStatus:'pending', pinChangeRequired:true.
+// @desc    Owner adds a new driver by name + phone, linked via owner:
+//          req.user._id (the actual point of this endpoint — an owner
+//          has no other way to create a driver record tied to their
+//          fleet). employeeId is a legacy identifier from the old
+//          Employee-ID + PIN login era; driver login is phone+OTP now,
+//          so it's no longer meaningful to collect from the owner —
+//          auto-generated here (DRV-001, DRV-002, ...) purely so
+//          existing driver records that display/reference it keep
+//          working. No PIN is set; PIN login isn't used by the app.
 // @access  Private [owner] (protectOwner)
 // ============================================================
 exports.createDriverAccount = async (req, res, next) => {
   try {
-    const { employeeId, name, phone, tempPin, assignedAmbulanceId } = req.body;
-    if (!employeeId || !name || !phone || !tempPin) {
-      return res.status(400).json({ success: false, message: 'employeeId, name, phone and tempPin are required.' });
+    const { name, phone, assignedAmbulanceId } = req.body;
+    if (!name || !phone) {
+      return res.status(400).json({ success: false, message: 'name and phone are required.' });
+    }
+    if (!/^[6-9]\d{9}$/.test(phone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
     }
 
-    const existing = await User.findOne({ $or: [{ employeeId }, { phone }] });
+    const existing = await User.findOne({ phone });
     if (existing) {
-      return res.status(409).json({ success: false, message: 'A user with this employeeId or phone already exists.' });
+      return res.status(409).json({ success: false, message: 'A driver with this phone number already exists.' });
     }
+
+    const existingIds = await User.find({ employeeId: /^DRV-\d+$/ }).select('employeeId').lean();
+    const maxNum = existingIds.reduce((max, d) => {
+      const n = parseInt(d.employeeId.split('-')[1], 10);
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0);
+    const employeeId = `DRV-${String(maxNum + 1).padStart(3, '0')}`;
 
     const user = await User.create({
       employeeId,
       name,
       phone,
       role               : 'driver',
-      pin                : tempPin,
-      pinChangeRequired  : true,
       approvalStatus     : 'pending',
       owner              : req.user._id, // links this driver to the Owner creating them (Phase 4 ambulance-picker scoping)
       assignedAmbulanceId: assignedAmbulanceId || undefined,
@@ -550,7 +565,7 @@ exports.createDriverAccount = async (req, res, next) => {
 
     return res.status(201).json({
       success: true,
-      message: 'Driver account created. Pending approval.',
+      message: 'Driver added. They can now log in with their phone number and complete onboarding.',
       driver : {
         id            : user._id,
         employeeId    : user.employeeId,

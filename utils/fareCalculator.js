@@ -149,11 +149,12 @@ const uploadToCloudinary = (base64String, folder = 'uploads') => {
 };
 
 // ಎಲ್ಲಾ ಸರ್ವಿಸ್‌ಗಳನ್ನು ಒಟ್ಟಿಗೆ ಎಕ್ಸ್‌ಪೋರ್ಟ್ ಮಾಡಲಾಗುತ್ತಿದೆ
-module.exports = { 
-  compute: exports.compute, 
-  estimateFare: exports.estimateFare, 
-  sendOtp, 
-  sendAlert, 
-  cloudinary, 
-  uploadToCloudinary 
+module.exports = {
+  compute: exports.compute,
+  estimateFare: exports.estimateFare,
+  findPricingDoc,
+  sendOtp,
+  sendAlert,
+  cloudinary,
+  uploadToCloudinary
 };

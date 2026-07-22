@@ -57,6 +57,12 @@ const sendTokenResponse = async (owner, statusCode, res) => {
   });
 };
 
+// Exported so controllers/unifiedAuthController.js can issue a real owner
+// session without reimplementing owner token-signing — same function,
+// just also reachable from outside this file (mirrors how this file
+// already imports authController's own sendTokenResponse for actAsDriver).
+exports.issueOwnerSession = sendTokenResponse;
+
 
 // ============================================================
 // @route   POST /api/owners/send-otp

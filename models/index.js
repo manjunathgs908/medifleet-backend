@@ -886,6 +886,25 @@ const notificationSchema = new Schema(
 const Notification = mongoose.model('Notification', notificationSchema);
 
 // ============================================================
+// 14b. CHAT MESSAGE MODEL — in-trip customer/driver chat, polling-based
+// (see controllers/tripController.js's getCustomerMessages/
+// getDriverMessages — no WebSocket/Socket.io/Firebase anywhere in this
+// codebase, and this stays consistent with that). One collection shared
+// by both the public customer-facing endpoints and the protect-gated
+// driver endpoints — `sender` is what distinguishes them, always set
+// server-side from which route was hit, never trusted from the client.
+// ============================================================
+const chatMessageSchema = new Schema(
+  {
+    trip  : { type: Schema.Types.ObjectId, ref: 'Trip', required: true, index: true },
+    sender: { type: String, enum: ['customer', 'driver'], required: true },
+    text  : { type: String, required: true, trim: true, maxlength: 500 },
+  },
+  { timestamps: true }
+);
+const ChatMessage = mongoose.model('ChatMessage', chatMessageSchema);
+
+// ============================================================
 // 15. ADVANCE MODEL
 // ============================================================
 const advanceSchema = new Schema(
@@ -956,5 +975,6 @@ module.exports = {
   Notification,
   Advance,
   Pricing,
+  ChatMessage,
 };
 

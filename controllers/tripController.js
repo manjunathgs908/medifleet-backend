@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead } = require('../models');
+const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMessage } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const BookingOtp = require('../models/BookingOtp');
@@ -841,6 +841,96 @@ exports.rateTrip = async (req, res, next) => {
       message: 'Thanks for your feedback!',
       trip: { rating: trip.rating, feedback: trip.feedback, ratedAt: trip.ratedAt },
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// In-trip chat — polling-based (see chatMessageSchema's comment in
+// models/index.js for why: this codebase has zero WebSocket/Socket.io/
+// Firebase infra anywhere, and every other "live" need already works via
+// polling at 5-15s intervals). Customer side is public/tripId-keyed, same
+// trust model as trackTrip/customer-cancel/rate; driver side is
+// protect-gated and restricted to the trip's own assigned driver, same
+// guard shape as completeTrip's "you can only complete your own trips."
+// `sender` is always set server-side from which pair of routes was hit —
+// never accepted from the request body.
+// ============================================================
+
+const MAX_MESSAGES_PER_POLL = 200;
+
+// @route   GET /api/trips/:id/customer-messages
+// @access  Public
+exports.getCustomerMessages = async (req, res, next) => {
+  try {
+    const filter = { trip: req.params.id };
+    if (req.query.since) filter.createdAt = { $gt: new Date(req.query.since) };
+    const messages = await ChatMessage.find(filter).sort({ createdAt: 1 }).limit(MAX_MESSAGES_PER_POLL);
+    return res.json({ success: true, messages });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// @route   POST /api/trips/:id/customer-messages
+// @access  Public
+exports.postCustomerMessage = async (req, res, next) => {
+  try {
+    const text = req.body?.text ? String(req.body.text).trim().slice(0, 500) : '';
+    if (!text) return res.status(400).json({ success: false, message: 'text is required.' });
+
+    const trip = await Trip.findById(req.params.id).select('status');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (trip.status === 'completed' || trip.status === 'cancelled') {
+      return res.status(400).json({ success: false, message: `Cannot send messages on a ${trip.status} trip.` });
+    }
+
+    const message = await ChatMessage.create({ trip: trip._id, sender: 'customer', text });
+    return res.status(201).json({ success: true, message });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// @route   GET /api/trips/:id/messages
+// @access  Private [driver] — own trips only
+exports.getDriverMessages = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id).select('driver');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You can only view messages on your own trips.' });
+    }
+
+    const filter = { trip: req.params.id };
+    if (req.query.since) filter.createdAt = { $gt: new Date(req.query.since) };
+    const messages = await ChatMessage.find(filter).sort({ createdAt: 1 }).limit(MAX_MESSAGES_PER_POLL);
+    return res.json({ success: true, messages });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// @route   POST /api/trips/:id/messages
+// @access  Private [driver] — own trips only
+exports.postDriverMessage = async (req, res, next) => {
+  try {
+    const text = req.body?.text ? String(req.body.text).trim().slice(0, 500) : '';
+    if (!text) return res.status(400).json({ success: false, message: 'text is required.' });
+
+    const trip = await Trip.findById(req.params.id).select('status driver');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'You can only send messages on your own trips.' });
+    }
+    if (trip.status === 'completed' || trip.status === 'cancelled') {
+      return res.status(400).json({ success: false, message: `Cannot send messages on a ${trip.status} trip.` });
+    }
+
+    const message = await ChatMessage.create({ trip: trip._id, sender: 'driver', text });
+    return res.status(201).json({ success: true, message });
   } catch (err) {
     next(err);
   }

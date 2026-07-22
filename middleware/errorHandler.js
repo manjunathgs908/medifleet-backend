@@ -15,8 +15,14 @@
 'use strict';
 
 const errorHandler = (err, req, res, next) => {
-  let statusCode = err.statusCode || 500;
+  let statusCode = err.statusCode || err.status || 500;
   let message    = err.message    || 'Internal Server Error';
+
+  // ── Body too large (base64 photo/document uploads) ────────
+  if (err.type === 'entity.too.large') {
+    statusCode = 413;
+    message    = 'File is too large. Please use a smaller photo or document.';
+  }
 
   // ── Mongoose: Invalid ObjectId ────────────────────────────
   if (err.name === 'CastError') {

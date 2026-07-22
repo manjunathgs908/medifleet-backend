@@ -14,8 +14,12 @@ const app = express();
 // (used by routes/places.js) buckets every client behind the proxy as one IP.
 app.set('trust proxy', 1);
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Default 100kb limit rejects any real base64 photo/document upload
+// (ambulance photos, KYC/driver documents) with a 413 that our own
+// catch-all below was reporting as a generic 500 — raised to cover a
+// compressed phone photo with headroom.
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cors({
   origin: [
     'https://crm.savelife.health',
@@ -81,10 +85,7 @@ app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });
 });
 
-app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ message: 'Internal Server Error', error: err.message });
-});
+app.use(require('./middleware/errorHandler'));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {

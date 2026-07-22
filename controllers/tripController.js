@@ -746,6 +746,58 @@ exports.cancelTrip = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/customer-cancel
+// @desc    Customer-initiated cancel from the tracking screen. No auth
+//          exists for the customer app — identity is just possession of
+//          the tripId, same trust model as trackTrip/pickupOtp. Shares
+//          cancelTrip's release logic but is deliberately more
+//          restrictive: blocked once pickupVerified is true (the patient
+//          may already be onboard — cancelling mid-transport is a
+//          different, riskier action than cancelling before pickup, and
+//          should go through the helpline/ops instead of a public
+//          endpoint with no human in the loop).
+// @access  Public
+// ============================================================
+exports.customerCancelTrip = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (trip.status === 'completed' || trip.status === 'cancelled') {
+      return res.status(400).json({ success: false, message: `Trip is already ${trip.status}.` });
+    }
+    if (trip.pickupVerified) {
+      return res.status(400).json({
+        success: false,
+        message: 'This trip is already in progress and can\'t be cancelled here. Please call the helpline.',
+      });
+    }
+
+    trip.status             = 'cancelled';
+    trip.cancelledAt        = new Date();
+    trip.cancellationReason = reason || 'Cancelled by customer';
+    await trip.save();
+
+    if (trip.vehicle) {
+      await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
+    }
+    if (trip.driver) {
+      await User.findByIdAndUpdate(trip.driver, { 'availability.status': 'available' });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Trip cancelled.',
+      trip: { status: trip.status, cancelledAt: trip.cancelledAt },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   GET /api/trips
 // @desc    Get all trips with filters (status, date range, vehicle, driver)
 //          Drivers see ONLY their own trips.

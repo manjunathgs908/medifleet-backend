@@ -544,6 +544,14 @@ const tripSchema = new Schema(
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
 
+    // ── Payment preference — captured at booking, purely informational
+    // (never gates booking/dispatch/completion). 'cash'/'upi' mean the
+    // driver collects in person exactly as before; 'card' signals intent
+    // to pay online via the gateway once the bill exists post-completion
+    // (see controllers/paymentController.js). Defaults to 'cash' so old
+    // app versions omitting this field behave identically to today.
+    paymentPreference: { type: String, enum: ['cash', 'upi', 'card'], default: 'cash' },
+
     // ── Customer rating — exactly one per trip, submitted once via
     // PUT /:id/rate (tripController.rateTrip), only after completion.
     // Feeds User.ratingSum/ratingCount (see userSchema above) so the
@@ -592,9 +600,20 @@ const billSchema = new Schema(
       enum   : ['pending', 'paid', 'partial', 'waived'],
       default: 'pending',
     },
-    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'insurance', 'hospital_credit'] },
+    // 'online' = paid via the Razorpay gateway (see controllers/
+    // paymentController.js) — distinct from 'upi'/'card', which remain
+    // manual/CRM-recorded collection exactly as before. Razorpay itself
+    // may have used any underlying method (card/UPI/netbanking/wallet);
+    // 'online' just means "the gateway verified it," not which one.
+    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'online', 'insurance', 'hospital_credit'] },
     paidAmount  : { type: Number, default: 0 },
     paidAt      : { type: Date },
+
+    // ── Razorpay gateway references — set by paymentController.
+    // createOrder/verifyPayment. Only populated for the 'online' path;
+    // stay undefined for cash/manual-UPI bills. ──
+    razorpayOrderId  : { type: String },
+    razorpayPaymentId: { type: String },
 
     // â”€â”€ Hospital Invoice Reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     invoiceId   : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },

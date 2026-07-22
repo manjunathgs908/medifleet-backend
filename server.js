@@ -18,7 +18,14 @@ app.set('trust proxy', 1);
 // (ambulance photos, KYC/driver documents) with a 413 that our own
 // catch-all below was reporting as a generic 500 — raised to cover a
 // compressed phone photo with headroom.
-app.use(express.json({ limit: '15mb' }));
+// verify callback stashes the exact raw bytes on req.rawBody — needed by
+// paymentWebhookController's Razorpay signature check, which must HMAC
+// the original request body, not a re-serialized copy of the parsed
+// object. Harmless no-op for every other route; nothing else reads it.
+app.use(express.json({
+  limit : '15mb',
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cors({
   origin: [
@@ -60,6 +67,7 @@ const ambulanceRoutes = require('./routes/ambulances');
 const driverAuthRoutes = require('./routes/driverAuth');
 const assignmentRoutes = require('./routes/assignments');
 const placesRoutes = require('./routes/places');
+const paymentRoutes = require('./routes/payments');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -80,6 +88,7 @@ app.use('/api/ambulances', ambulanceRoutes);
 app.use('/api/driver-auth', driverAuthRoutes);
 app.use('/api/assignments', assignmentRoutes);
 app.use('/api/places',    placesRoutes);
+app.use('/api/payments',  paymentRoutes);
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

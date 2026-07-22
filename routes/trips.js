@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
+const paymentCtrl = require('../controllers/paymentController');
 const { protect, authorize } = require('../middleware/auth');
 
 router.post('/send-otp',   tripCtrl.sendBookingOtp);
@@ -14,6 +15,8 @@ router.get('/:id/customer-messages',  tripCtrl.getCustomerMessages);
 router.post('/:id/customer-messages', tripCtrl.postCustomerMessage);
 router.get('/:id/messages',  protect, authorize('driver'), tripCtrl.getDriverMessages);
 router.post('/:id/messages', protect, authorize('driver'), tripCtrl.postDriverMessage);
+router.post('/:id/payment/order',  paymentCtrl.createOrder);
+router.post('/:id/payment/verify', paymentCtrl.verifyPayment);
 router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
 router.get('/', protect, tripCtrl.getTrips);
 router.get('/:id', protect, tripCtrl.getTripById);

@@ -179,7 +179,13 @@ exports.createTrip = async (req, res, next) => {
       pickupLabel, dropLabel, dist, effectiveDist,
       scheduleType, scheduleDate, selectedType,
       tripType, returnAddress, acEnabled,
+      paymentPreference,
     } = req.body;
+
+    // Never let a bad/missing value block booking — falls back to the
+    // schema default ('cash') exactly as if the field were omitted.
+    const PAYMENT_PREFS = ['cash', 'upi', 'card'];
+    const validPaymentPreference = PAYMENT_PREFS.includes(paymentPreference) ? paymentPreference : undefined;
 
     // Authoritative distance for billing: the round-trip-aware effectiveDist
     // computed by the client, falling back to the one-way dist.
@@ -222,6 +228,7 @@ exports.createTrip = async (req, res, next) => {
       estimatedFare      : fare.grandTotal,
       bookedBy      : req.user?._id || undefined,
       leadId,
+      paymentPreference: validPaymentPreference,
       status        : 'booked',
     };
 
@@ -1093,7 +1100,8 @@ exports.trackTrip = async (req, res, next) => {
     const trip = await Trip.findById(req.params.id)
       .populate('vehicle', 'registrationNumber type')
       .populate('ambulance', 'registrationNumber serviceType serviceTypeLabel vehicleModel year')
-      .populate('driver', 'name phone availability ratingSum ratingCount completedTripsCount');
+      .populate('driver', 'name phone availability ratingSum ratingCount completedTripsCount')
+      .populate('billId');
 
     if (!trip) {
       return res.status(404).json({ success: false, message: 'Trip not found.' });
@@ -1153,11 +1161,34 @@ exports.trackTrip = async (req, res, next) => {
 
     const ratingCount = trip.driver?.ratingCount || 0;
 
+    // Full bill breakdown — only once completed, and only the fields
+    // that are actually real: dropWaitMinutes/trafficWaitMinutes are
+    // schema fields that are never computed anywhere today (no "arrived
+    // at drop" driver action exists to bracket drop-wait against), so
+    // they're deliberately omitted here rather than shown as a fake ₹0
+    // line. pickupWaitMinutes/waitCharge ARE real (computed in
+    // completeTrip) and included.
+    let bill = null;
+    if (trip.status === 'completed' && trip.billId) {
+      bill = {
+        baseFare         : trip.billId.baseFare,
+        distanceKm       : trip.billId.distanceKm,
+        pickupWaitMinutes: trip.pickupWaitMinutes,
+        waitCharge       : trip.billId.waitCharge,
+        additionalCharges: trip.billId.additionalCharges,
+        gstAmount        : trip.billId.gstAmount,
+        grandTotal       : trip.billId.grandTotal,
+        paymentStatus    : trip.billId.paymentStatus,
+        paymentMode      : trip.billId.paymentMode,
+      };
+    }
+
     return res.json({
       success: true,
       trip: {
         status        : awaitingDriverAccept ? 'booked' : trip.status,
         pickupVerified: trip.pickupVerified,
+        paymentPreference: trip.paymentPreference,
         driver        : showDriver ? {
           name               : trip.driver.name,
           phone              : trip.driver.phone,
@@ -1173,6 +1204,7 @@ exports.trackTrip = async (req, res, next) => {
         etaMinutes,
         estimatedDistanceKm: trip.estimatedDistanceKm,
         estimatedFare      : trip.estimatedFare,
+        bill,
       },
     });
   } catch (err) {

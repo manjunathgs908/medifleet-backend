@@ -176,7 +176,15 @@ exports.uploadKycDocument = async (req, res, next) => {
 
     owner.kycDocuments = owner.kycDocuments || {};
     owner.kycDocuments[docType] = { url: result.secure_url, uploadedAt: new Date() };
-    if (owner.kycStatus === 'pending') owner.kycStatus = 'submitted';
+
+    // pending (no docs yet) -> submitted (awaiting review) on first upload;
+    // rejected -> submitted (same "awaiting review" state) on any re-upload
+    // after a rejection, same auto-resubmit pattern as
+    // authController.uploadDriverDocument's approvalStatus flip.
+    if (owner.kycStatus === 'pending' || owner.kycStatus === 'rejected') {
+      owner.kycStatus = 'submitted';
+      owner.kycRejectionReason = undefined;
+    }
     await owner.save();
 
     return res.json({
@@ -242,6 +250,80 @@ exports.actAsDriver = async (req, res, next) => {
     shadowDriver.deviceId = deviceId;
 
     return sendDriverTokenResponse(shadowDriver, 200, res, deviceId);
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// CRM ADMIN — Owner KYC review (medifleet-frontend, the platform admin's
+// CRM, NOT the owner's own app). Distinct actor/session from everything
+// above: these are gated by `protect, authorize('owner')` against the
+// CRM's own User-model 'owner' role, not `protectOwner` — a completely
+// separate login from the fleet-Owner OTP session used everywhere else
+// in this file. One level up from authController's listDrivers/
+// approveDriver/rejectDriver, which this deliberately mirrors.
+// ============================================================
+
+// ============================================================
+// @route   GET /api/owners
+// @desc    Every fleet Owner, for the CRM's Owners review page.
+// @access  Private [CRM owner/admin]
+// ============================================================
+exports.listOwners = async (req, res, next) => {
+  try {
+    const owners = await Owner.find({})
+      .select('name phone kycStatus kycDocuments kycRejectionReason createdAt')
+      .sort({ createdAt: -1 });
+    return res.json({ success: true, owners });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   PUT /api/owners/:id/approve
+// @access  Private [CRM owner/admin]
+// ============================================================
+exports.approveOwner = async (req, res, next) => {
+  try {
+    const owner = await Owner.findByIdAndUpdate(
+      req.params.id,
+      { kycStatus: 'approved', $unset: { kycRejectionReason: '' } },
+      { new: true }
+    );
+    if (!owner) return res.status(404).json({ success: false, message: 'Owner not found.' });
+
+    return res.json({
+      success: true,
+      message: 'Owner approved.',
+      owner  : { id: owner._id, name: owner.name, phone: owner.phone, kycStatus: owner.kycStatus },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   PUT /api/owners/:id/reject
+// @access  Private [CRM owner/admin]
+// ============================================================
+exports.rejectOwner = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    const owner = await Owner.findByIdAndUpdate(
+      req.params.id,
+      { kycStatus: 'rejected', kycRejectionReason: reason || undefined },
+      { new: true }
+    );
+    if (!owner) return res.status(404).json({ success: false, message: 'Owner not found.' });
+
+    return res.json({
+      success: true,
+      message: 'Owner rejected.',
+      owner  : { id: owner._id, name: owner.name, phone: owner.phone, kycStatus: owner.kycStatus, kycRejectionReason: owner.kycRejectionReason },
+    });
   } catch (err) {
     next(err);
   }

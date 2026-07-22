@@ -10,7 +10,7 @@
 const express  = require('express');
 const router   = express.Router();
 const authCtrl = require('../controllers/authController');
-const { protect, protectOwner, authorize } = require('../middleware/auth');
+const { protect, protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
 
 // Public — driver login
 router.post('/login', authCtrl.loginWithPin);
@@ -25,10 +25,10 @@ router.put('/documents', protect, authorize('driver'), authCtrl.uploadDriverDocu
 router.put ('/location', protect, authCtrl.updateLocation);
 
 // Private [owner] — driver onboarding/approval/device management
-router.get ('/',                   protectOwner, authorize('owner'), authCtrl.listDrivers);
-router.post('/register',           protectOwner, authorize('owner'), authCtrl.createDriverAccount);
-router.put ('/:id/approve',        protectOwner, authorize('owner'), authCtrl.approveDriver);
-router.put ('/:id/reject',         protectOwner, authorize('owner'), authCtrl.rejectDriver);
-router.put ('/:id/unbind-device',  protectOwner, authorize('owner'), authCtrl.unbindDevice);
+router.get ('/',                   protectOwner, authorize('owner'), requireKycApproved, authCtrl.listDrivers);
+router.post('/register',           protectOwner, authorize('owner'), requireKycApproved, authCtrl.createDriverAccount);
+router.put ('/:id/approve',        protectOwner, authorize('owner'), requireKycApproved, authCtrl.approveDriver);
+router.put ('/:id/reject',         protectOwner, authorize('owner'), requireKycApproved, authCtrl.rejectDriver);
+router.put ('/:id/unbind-device',  protectOwner, authorize('owner'), requireKycApproved, authCtrl.unbindDevice);
 
 module.exports = router;

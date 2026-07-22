@@ -2,9 +2,9 @@
 const express   = require('express');
 const router    = express.Router();
 const fleetCtrl = require('../controllers/fleetController');
-const { protectOwner, authorize } = require('../middleware/auth');
+const { protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
 
-router.use(protectOwner, authorize('owner'));
+router.use(protectOwner, authorize('owner'), requireKycApproved);
 
 router.post  ('/',     fleetCtrl.createFleet);
 router.get   ('/',     fleetCtrl.getFleets);

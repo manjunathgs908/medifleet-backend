@@ -194,4 +194,28 @@ const driverSelfOnly = (req, res, next) => {
 };
 
 
-module.exports = { protect, protectOwner, authorize, driverSelfOnly };
+/**
+ * requireKycApproved
+ * Gates the actual privileged fleet-management actions (create ambulance,
+ * register/approve/reject driver, fleet-status, etc.) on the Owner's KYC
+ * being approved — mirrors the driver flow's split exactly: login,
+ * status-check (getMe), and document upload/re-upload all stay ungated
+ * (protectOwner alone) so a pending/rejected owner can still see their own
+ * status and resubmit; this middleware only sits in front of the routes
+ * that actually use the platform.
+ *
+ * Usage: router.use(protectOwner, authorize('owner'), requireKycApproved);
+ */
+const requireKycApproved = (req, res, next) => {
+  if (req.user.kycStatus !== 'approved') {
+    return res.status(403).json({
+      success: false,
+      message: 'Your account is pending approval. Please complete KYC and wait for approval.',
+      kycStatus: req.user.kycStatus,
+    });
+  }
+  next();
+};
+
+
+module.exports = { protect, protectOwner, authorize, driverSelfOnly, requireKycApproved };

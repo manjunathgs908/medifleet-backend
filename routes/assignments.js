@@ -10,7 +10,7 @@
 const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../controllers/assignmentController');
-const { protect, protectOwner, authorize } = require('../middleware/auth');
+const { protect, protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
 
 // Private [driver]
 router.get ('/available-ambulances', protect, authorize('driver'), ctrl.getAvailableAmbulances);
@@ -22,6 +22,6 @@ router.get ('/my-active',  protect, authorize('driver'), ctrl.getMyActiveShift);
 router.get ('/my-history', protect, authorize('driver'), ctrl.getAssignmentHistory);
 
 // Private [owner]
-router.get ('/fleet-status', protectOwner, authorize('owner'), ctrl.getFleetShiftStatus);
+router.get ('/fleet-status', protectOwner, authorize('owner'), requireKycApproved, ctrl.getFleetShiftStatus);
 
 module.exports = router;

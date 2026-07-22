@@ -41,7 +41,7 @@ const ownerSchema = new Schema(
     // ── KYC ────────────────────────────────────────────────────
     kycStatus: {
       type   : String,
-      enum   : ['pending', 'submitted', 'verified', 'rejected'],
+      enum   : ['pending', 'submitted', 'approved', 'rejected'],
       default: 'pending',
     },
     kycDocuments: {

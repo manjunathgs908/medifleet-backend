@@ -2,9 +2,9 @@
 const express       = require('express');
 const router        = express.Router();
 const ambulanceCtrl = require('../controllers/ambulanceController');
-const { protectOwner, authorize } = require('../middleware/auth');
+const { protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
 
-router.use(protectOwner, authorize('owner'));
+router.use(protectOwner, authorize('owner'), requireKycApproved);
 
 router.post  ('/',             ambulanceCtrl.createAmbulance);
 router.get   ('/',              ambulanceCtrl.getAmbulances);

@@ -4,7 +4,8 @@
  * Central export of ALL Mongoose schemas and models.
  *
  * Models defined here:
- *   1. User          â€” Staff (Owner / Telecaller / Driver)
+ *   1. User          â€” Staff (Owner / Driver) — telecaller role removed
+ *                       for now, planned to come back later
  *   2. Vehicle       â€” Fleet asset with compliance documents
  *   3. Attendance    â€” Driver punch-in/out + shift record
  *   4. Hospital      â€” Tie-up hospital master + contract terms
@@ -29,7 +30,7 @@ const bcrypt   = require('bcryptjs');
 const { Schema } = mongoose;
 
 // ============================================================
-// 1. USER MODEL  (Owner | Telecaller | Driver)
+// 1. USER MODEL  (Owner | Driver)
 // ============================================================
 const userSchema = new Schema(
   {
@@ -60,7 +61,12 @@ const userSchema = new Schema(
     // â”€â”€ RBAC Role â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     role: {
       type    : String,
-      enum    : ['owner', 'telecaller', 'driver'],
+      // telecaller removed for now — planned to come back later. An
+      // existing User document with role:'telecaller' isn't touched by
+      // this enum change (Mongoose only validates enum on save, not on
+      // read), it just can't be re-saved with that value until it's
+      // re-added.
+      enum    : ['owner', 'driver'],
       default : 'driver',
     },
 
@@ -389,7 +395,7 @@ const leadSchema = new Schema(
       enum   : ['new', 'contacted', 'converted', 'lost', 'spam'],
       default: 'new',
     },
-    assignedTo  : { type: Schema.Types.ObjectId, ref: 'User' }, // Telecaller
+    assignedTo  : { type: Schema.Types.ObjectId, ref: 'User' }, // CRM staff
     notes       : { type: String },
     convertedTrip: { type: Schema.Types.ObjectId, ref: 'Trip' }, // If lead became a trip
 
@@ -458,7 +464,7 @@ const tripSchema = new Schema(
     // one of my ambulances" without the two systems merging.
     ambulance     : { type: Schema.Types.ObjectId, ref: 'Ambulance' },
     driver        : { type: Schema.Types.ObjectId, ref: 'User' },
-    bookedBy      : { type: Schema.Types.ObjectId, ref: 'User' }, // Telecaller
+    bookedBy      : { type: Schema.Types.ObjectId, ref: 'User' }, // CRM staff
     leadId        : { type: Schema.Types.ObjectId, ref: 'Lead' }, // If originated from ad lead
 
     // â”€â”€ Fare Computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

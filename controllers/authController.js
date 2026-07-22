@@ -3,7 +3,7 @@
  * ============================================================
  * Handles all authentication flows:
  *   - Phone OTP login (primary — no password needed for drivers)
- *   - Password login (for Owner / Telecaller admin panel)
+ *   - Password login (for Owner admin panel)
  *   - JWT access token + refresh token issuance
  *   - Token refresh endpoint
  *   - Logout
@@ -197,7 +197,7 @@ exports.verifyOtp = async (req, res, next) => {
     }
 
     // Driver-only hardening — device binding is meaningless for
-    // Owner/Telecaller password-based staff accounts, so scoped to
+    // Owner password-based staff accounts, so scoped to
     // role:'driver' rather than applied blanket. Deliberately does NOT
     // block login on approvalStatus (Phase 1 did — corrected here): a
     // pending/rejected driver must still be able to log in to complete
@@ -226,7 +226,7 @@ exports.verifyOtp = async (req, res, next) => {
 
 // ============================================================
 // @route   POST /api/auth/login
-// @desc    Password login for Owner / Telecaller
+// @desc    Password login for Owner
 // @access  Public
 // ============================================================
 exports.loginPassword = async (req, res, next) => {
@@ -303,7 +303,7 @@ exports.refresh = async (req, res, next) => {
 // @route   POST /api/auth/logout
 // @desc    Invalidate refresh token (server-side logout). Blocked for a
 //          driver who is on duty or has an active trip — ambulance
-//          safety rule, not applicable to Owner/Telecaller sessions.
+//          safety rule, not applicable to Owner sessions.
 // @access  Private
 // ============================================================
 exports.logout = async (req, res, next) => {
@@ -342,8 +342,8 @@ exports.getMe = async (req, res) => {
 
 // ============================================================
 // @route   PUT /api/auth/update-password
-// @desc    Change own password (Owner / Telecaller)
-// @access  Private [owner, telecaller]
+// @desc    Change own password (Owner)
+// @access  Private [owner]
 // ============================================================
 exports.updatePassword = async (req, res, next) => {
   try {

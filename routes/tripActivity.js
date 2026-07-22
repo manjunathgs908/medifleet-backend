@@ -5,6 +5,6 @@ const { logActivity, getActivities } = require('../controllers/tripActivityContr
 const { protect, authorize } = require('../middleware/auth');
 
 router.post('/log', protect, authorize('driver'), logActivity);
-router.get('/', protect, authorize('owner', 'telecaller'), getActivities);
+router.get('/', protect, authorize('owner'), getActivities);
 
 module.exports = router;

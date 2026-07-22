@@ -11,7 +11,7 @@
  * Verification itself is enforced client-side in BookForm.js (the
  * "Book" call only fires from the OTP-verify success callback) — this
  * intentionally does NOT gate Trip creation server-side, since
- * POST /api/trips is also used by the CRM/telecaller flow and the
+ * POST /api/trips is also used by the CRM flow and the
  * customer app, neither of which go through phone-OTP verification.
  * ============================================================
  */

@@ -2,8 +2,8 @@
  * controllers/tripController.js
  * ============================================================
  * Handles the complete trip lifecycle:
- *   - Create booking (Telecaller)
- *   - Auto / manual ambulance assignment (Telecaller / Owner)
+ *   - Create booking (Owner)
+ *   - Auto / manual ambulance assignment (Owner)
  *   - Driver accept / decline with timeout fallback
  *   - Status transitions (en_route → completed → bill generation)
  *   - Trip cancellation
@@ -137,7 +137,7 @@ exports.sendBookingOtp = async (req, res, next) => {
 //          for POST /api/trips to check; the website itself only calls
 //          the booking endpoint from this call's success callback,
 //          exactly like the widget flow it replaces. Keeps this
-//          decoupled from CRM/telecaller and customer-app bookings,
+//          decoupled from CRM and customer-app bookings,
 //          neither of which go through phone verification.
 // @access  Public
 // ============================================================
@@ -162,13 +162,13 @@ exports.verifyBookingOtp = async (req, res, next) => {
 
 // ============================================================
 // @route   POST /api/trips
-// @desc    Create a new booking (Telecaller / Owner)
-// @access  Private [owner, telecaller]
+// @desc    Create a new booking (Owner)
+// @access  Private [owner]
 // ============================================================
 exports.createTrip = async (req, res, next) => {
   try {
     const {
-      // Internal (telecaller/owner) fields
+      // Internal (owner/CRM) fields
       patientName, patientPhone, emergencyType,
       pickupAddress, pickupLat, pickupLng,
       dropHospitalId, dropAddress,
@@ -312,7 +312,7 @@ const assignTripToVehicle = async (trip, vehicle) => {
 // ============================================================
 // @route   PUT /api/trips/:id/assign
 // @desc    Manually assign / reassign a vehicle to a trip
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.assignVehicle = async (req, res, next) => {
   try {
@@ -467,7 +467,7 @@ exports.verifyPickupOtp = async (req, res, next) => {
 //          2. Auto-generate Bill document
 //          3. Auto-create Income ledger entry
 //          4. Release vehicle back to 'available'
-// @access  Private [driver, telecaller, owner]
+// @access  Private [driver, owner]
 // ============================================================
 exports.completeTrip = async (req, res, next) => {
   try {
@@ -512,7 +512,7 @@ exports.completeTrip = async (req, res, next) => {
 
     // ── 2b. Pickup wait charge — bracketed by arrivedAtPickupAt (driver's
     //      "Reached Pickup" tap) and pickupVerifiedAt (OTP verify). Both
-    //      are optional (older trips / telecaller-completed trips won't
+    //      are optional (older trips / CRM-completed trips won't
     //      have them), so wait stays 0 unless the full bracket exists.
     //      Rate/free-minutes always come from Pricing — never hardcoded. ──
     let pickupWaitMinutes = 0;
@@ -629,9 +629,9 @@ exports.confirmTrip = async (req, res, next) => {
 // ============================================================
 // @route   PUT /api/trips/:id/decline
 // @desc    Driver declines a trip that was just dispatched to them.
-//          Unlike /cancel (owner/telecaller-only, ends the trip), this
-//          returns the trip to the unassigned pool ('booked') so a
-//          telecaller/owner can reassign it to a different vehicle/driver.
+//          Unlike /cancel (owner-only, ends the trip), this
+//          returns the trip to the unassigned pool ('booked') so an
+//          owner can reassign it to a different vehicle/driver.
 //          Additive — does not touch cancelTrip below.
 // @access  Private [driver] — only the currently-assigned driver
 // ============================================================
@@ -677,7 +677,7 @@ exports.declineTrip = async (req, res, next) => {
 // ============================================================
 // @route   PUT /api/trips/:id/cancel
 // @desc    Cancel a trip and release the vehicle
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.cancelTrip = async (req, res, next) => {
   try {
@@ -762,7 +762,7 @@ exports.getTrips = async (req, res, next) => {
 // ============================================================
 // @route   GET /api/trips/live
 // @desc    Live dispatch board — active trips only (booked, dispatched, en_route)
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getLiveBoard = async (req, res, next) => {
   try {

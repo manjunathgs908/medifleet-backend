@@ -25,7 +25,7 @@ const fareCalculator = require('../utils/fareCalculator');
 // ============================================================
 // @route   GET /api/billing/bills
 // @desc    List all trip bills with filters
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getBills = async (req, res, next) => {
   try {
@@ -68,7 +68,7 @@ exports.getBills = async (req, res, next) => {
 // ============================================================
 // @route   GET /api/billing/bills/:id
 // @desc    Get single bill with full breakdown
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getBillById = async (req, res, next) => {
   try {
@@ -87,7 +87,7 @@ exports.getBillById = async (req, res, next) => {
 // ============================================================
 // @route   PUT /api/billing/bills/:id/payment
 // @desc    Record payment against a bill
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.recordPayment = async (req, res, next) => {
   try {

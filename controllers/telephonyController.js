@@ -412,7 +412,7 @@ exports.googleLeadWebhook = async (req, res, next) => {
 // ============================================================
 // @route   GET /api/leads
 // @desc    Get all CRM leads (newest first, filterable)
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getLeads = async (req, res, next) => {
   try {
@@ -428,13 +428,10 @@ exports.getLeads = async (req, res, next) => {
       if (to)   filter.receivedAt.$lte = new Date(to);
     }
 
-    // Telecallers see their own assigned leads + unassigned leads
-    if (req.user.role === 'telecaller') {
-      filter.$or = [
-        { assignedTo: req.user._id },
-        { assignedTo: { $exists: false } },
-      ];
-    }
+    // A per-telecaller "my assigned + unassigned leads" filter used to
+    // apply here — dormant now that this route is owner-only (telecaller
+    // removed for now, planned to come back later); an owner has always
+    // seen every lead unfiltered, so removing it changes nothing today.
 
     const skip  = (Number(page) - 1) * Number(limit);
     const total = await Lead.countDocuments(filter);
@@ -454,8 +451,8 @@ exports.getLeads = async (req, res, next) => {
 
 // ============================================================
 // @route   PUT /api/leads/:id
-// @desc    Update lead status, assign to telecaller, add notes
-// @access  Private [owner, telecaller]
+// @desc    Update lead status, add notes
+// @access  Private [owner]
 // ============================================================
 exports.updateLead = async (req, res, next) => {
   try {

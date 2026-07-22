@@ -12,19 +12,21 @@
  *     — Must come AFTER protect() in the middleware chain.
  *     — Usage:  router.get('/report', protect, authorize('owner'), handler)
  *
- * Access Matrix:
- * ┌────────────────────────────┬───────┬────────────┬────────┐
- * │ Resource                   │ owner │ telecaller │ driver │
- * ├────────────────────────────┼───────┼────────────┼────────┤
- * │ All routes                 │  ✓    │            │        │
- * │ Book / view all trips      │  ✓    │     ✓      │        │
- * │ View fleet                 │  ✓    │     ✓      │        │
- * │ Own trip list              │  ✓    │            │   ✓    │
- * │ Own salary info            │  ✓    │            │   ✓    │
- * │ Financial reports          │  ✓    │            │        │
- * │ HR & salary management     │  ✓    │            │        │
- * │ Compliance & documents     │  ✓    │            │        │
- * └────────────────────────────┴───────┴────────────┴────────┘
+ * Access Matrix (telecaller role removed for now — every route below is
+ * owner-only until it comes back; nothing here is currently gated to a
+ * telecaller-only allowance):
+ * ┌────────────────────────────┬───────┬────────┐
+ * │ Resource                   │ owner │ driver │
+ * ├────────────────────────────┼───────┼────────┤
+ * │ All routes                 │  ✓    │        │
+ * │ Book / view all trips      │  ✓    │        │
+ * │ View fleet                 │  ✓    │        │
+ * │ Own trip list              │  ✓    │   ✓    │
+ * │ Own salary info             │  ✓    │   ✓    │
+ * │ Financial reports          │  ✓    │        │
+ * │ HR & salary management     │  ✓    │        │
+ * │ Compliance & documents     │  ✓    │        │
+ * └────────────────────────────┴───────┴────────┘
  * ============================================================
  */
 
@@ -189,7 +191,8 @@ const driverSelfOnly = (req, res, next) => {
     return next();
   }
 
-  // Telecallers have no access to salary/driver records
+  // Any role besides owner/driver (none exist right now — telecaller
+  // removed) has no access to salary/driver records.
   return res.status(403).json({ success: false, message: 'Access denied.' });
 };
 

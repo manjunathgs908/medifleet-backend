@@ -90,9 +90,9 @@ http://localhost:5000/api
 | Method | Route                               | Access            |
 |--------|-------------------------------------|-------------------|
 | POST   | /api/vehicles                        | Owner             |
-| GET    | /api/vehicles                        | Owner, Telecaller |
+| GET    | /api/vehicles                        | Owner |
 | GET    | /api/vehicles/compliance-dashboard   | Owner             |
-| GET    | /api/vehicles/:id                    | Owner, Telecaller |
+| GET    | /api/vehicles/:id                    | Owner |
 | PUT    | /api/vehicles/:id/document           | Owner             |
 | PUT    | /api/vehicles/:id/gps                | Driver            |
 | POST   | /api/vehicles/:id/service-log        | Owner             |
@@ -100,17 +100,17 @@ http://localhost:5000/api
 ### Trips
 | Method | Route                        | Access            |
 |--------|------------------------------|-------------------|
-| POST   | /api/trips                   | Owner, Telecaller |
-| GET    | /api/trips/live              | Owner, Telecaller |
+| POST   | /api/trips                   | Owner |
+| GET    | /api/trips/live              | Owner |
 | GET    | /api/trips                   | All (drivers: own)|
 | PUT    | /api/trips/:id/complete      | All               |
-| PUT    | /api/trips/:id/cancel        | Owner, Telecaller |
+| PUT    | /api/trips/:id/cancel        | Owner |
 
 ### Billing
 | Method | Route                                      | Access |
 |--------|--------------------------------------------|--------|
 | GET    | /api/billing/dashboard                     | Owner  |
-| GET    | /api/billing/bills                         | Owner, Telecaller |
+| GET    | /api/billing/bills                         | Owner |
 | PUT    | /api/billing/bills/:id/payment             | Owner  |
 | POST   | /api/billing/hospital-invoice/generate     | Owner  |
 | GET    | /api/billing/hospital-invoices             | Owner  |
@@ -136,12 +136,15 @@ http://localhost:5000/api
 
 ## Role Access Matrix
 
-| Feature                    | Owner | Telecaller | Driver   |
-|----------------------------|-------|------------|----------|
-| Book trips                 | ✓     | ✓          |          |
-| View all trips             | ✓     | ✓          | own only |
-| View fleet                 | ✓     | ✓          |          |
-| Complete/cancel trips      | ✓     | ✓          | own only |
+Telecaller role removed for now — planned to come back later; every
+route it used to share with Owner is Owner-only until then.
+
+| Feature                    | Owner | Driver   |
+|----------------------------|-------|----------|
+| Book trips                 | ✓     |          |
+| View all trips             | ✓     | own only |
+| View fleet                 | ✓     |          |
+| Complete/cancel trips      | ✓     | own only |
 | Financial reports          | ✓     |            |          |
 | Add expenses/income        | ✓     |            |          |
 | Salary management          | ✓     |            |          |

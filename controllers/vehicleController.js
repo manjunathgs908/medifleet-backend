@@ -36,7 +36,7 @@ exports.createVehicle = async (req, res, next) => {
 // ============================================================
 // @route   GET /api/vehicles
 // @desc    Get all active fleet vehicles
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getVehicles = async (req, res, next) => {
   try {
@@ -67,7 +67,7 @@ exports.getVehicles = async (req, res, next) => {
 // ============================================================
 // @route   GET /api/vehicles/:id
 // @desc    Get single vehicle with full details
-// @access  Private [owner, telecaller]
+// @access  Private [owner]
 // ============================================================
 exports.getVehicleById = async (req, res, next) => {
   try {

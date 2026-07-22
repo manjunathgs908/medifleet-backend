@@ -9,7 +9,7 @@ router.put('/:id/stage', protect, authorize('driver'), ctrl.updateStage);
 router.put('/:id/approve-cancel', protect, authorize('owner'), ctrl.approveCancel);
 router.put('/:id/reopen', protect, authorize('owner'), ctrl.reopenTrip);
 router.get('/my', protect, authorize('driver'), ctrl.myTrips);
-router.get('/', protect, authorize('owner', 'telecaller'), ctrl.getAllTrips);
+router.get('/', protect, authorize('owner'), ctrl.getAllTrips);
 router.get('/:id', protect, ctrl.getTrip);
 
 module.exports = router;

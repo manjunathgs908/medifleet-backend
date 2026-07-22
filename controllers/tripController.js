@@ -19,6 +19,7 @@ const Ambulance = require('../models/Ambulance');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
+const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 
 // ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
 // registrationNumber. Both schemas already normalize to uppercase+trim
@@ -77,8 +78,22 @@ exports.sendBookingOtp = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
     }
 
-    const otp       = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit, website booking OTP only
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
+    // utils/testOtp.js. Every number gets the same fixed OTP, no real SMS
+    // attempt — testOtp is echoed back so the site can show/auto-fill it.
+    if (isTestOtpEnabled()) {
+      const testOtp = getTestOtpCode();
+      await BookingOtp.findOneAndUpdate(
+        { phone },
+        { otp: testOtp, otpExpiry },
+        { upsert: true, new: true }
+      );
+      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
+    }
+
+    const otp = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit, website booking OTP only
 
     await BookingOtp.findOneAndUpdate(
       { phone },

@@ -19,7 +19,7 @@ const { User, Trip } = require('../models');
 const Shift = require('../models/Shift');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
-const { isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE AFTER DLT APPROVAL
+const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -135,7 +135,7 @@ exports.register = async (req, res, next) => {
 
 // ============================================================
 // @route   POST /api/auth/send-otp
-// @desc    Generate & send 6-digit OTP via SMS (for driver login)
+// @desc    Generate & send 4-digit OTP via SMS (for driver login)
 // @access  Public
 // ============================================================
 exports.sendOtp = async (req, res, next) => {
@@ -148,12 +148,10 @@ exports.sendOtp = async (req, res, next) => {
 
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    // TEMPORARY — REMOVE AFTER DLT APPROVAL. See utils/testOtp.js.
-    // Whitelisted test numbers get a fixed OTP, no real SMS attempt.
-    // testOtp is echoed back so the app can show/auto-fill it — safe
-    // because this whole branch only runs for numbers already on the
-    // whitelist, never a general echo of every OTP sent.
-    if (isTestOtpNumber(phone)) {
+    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
+    // utils/testOtp.js. Every number gets the same fixed OTP, no real SMS
+    // attempt — testOtp is echoed back so the app can show/auto-fill it.
+    if (isTestOtpEnabled()) {
       const testOtp = getTestOtpCode();
       user.otp       = testOtp;
       user.otpExpiry = otpExpiry;
@@ -161,8 +159,8 @@ exports.sendOtp = async (req, res, next) => {
       return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
     }
 
-    // Generate 6-digit OTP
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    // Generate 4-digit OTP
+    const otp = String(Math.floor(1000 + Math.random() * 9000));
 
     user.otp       = otp;
     user.otpExpiry = otpExpiry;

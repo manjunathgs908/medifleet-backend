@@ -23,7 +23,7 @@ const { User } = require('../models');
 const { sendTokenResponse: sendDriverTokenResponse } = require('./authController');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
-const { isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE AFTER DLT APPROVAL
+const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 
 const ALLOWED_KYC_DOCS = ['aadhaar', 'pan', 'addressProof', 'photo'];
 
@@ -80,12 +80,10 @@ exports.sendOtp = async (req, res, next) => {
 
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    // TEMPORARY — REMOVE AFTER DLT APPROVAL. See utils/testOtp.js.
-    // Whitelisted test numbers get a fixed OTP, no real SMS attempt.
-    // testOtp is echoed back so the app can show/auto-fill it — safe
-    // because this whole branch only runs for numbers already on the
-    // whitelist, never a general echo of every OTP sent.
-    if (isTestOtpNumber(phone)) {
+    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
+    // utils/testOtp.js. Every number gets the same fixed OTP, no real SMS
+    // attempt — testOtp is echoed back so the app can show/auto-fill it.
+    if (isTestOtpEnabled()) {
       const testOtp = getTestOtpCode();
       owner.otp       = testOtp;
       owner.otpExpiry = otpExpiry;
@@ -93,8 +91,8 @@ exports.sendOtp = async (req, res, next) => {
       return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
     }
 
-    // Generate 6-digit OTP
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    // Generate 4-digit OTP
+    const otp = String(Math.floor(1000 + Math.random() * 9000));
 
     owner.otp       = otp;
     owner.otpExpiry = otpExpiry;

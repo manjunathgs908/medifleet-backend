@@ -2,7 +2,14 @@
 const express       = require('express');
 const router        = express.Router();
 const ambulanceCtrl = require('../controllers/ambulanceController');
-const { protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
+const { protect, protectOwner, authorize, requireKycApproved } = require('../middleware/auth');
+
+// Private [CRM owner/admin] — the platform admin's CRM session
+// (protect, the User-model 'owner' role), NOT the fleet-Owner's own
+// app session below. Registered before the router.use() block so it
+// never touches protectOwner/requireKycApproved. Mirrors routes/
+// owners.js's public+protectOwner+separate-protect-admin-block shape.
+router.get('/admin', protect, authorize('owner'), ambulanceCtrl.listAmbulancesAdmin);
 
 router.use(protectOwner, authorize('owner'), requireKycApproved);
 

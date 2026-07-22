@@ -17,6 +17,21 @@ const { byServiceType } = require('../utils/ambulanceServiceTypes');
 
 const DOC_TYPES = ['rc', 'insurance', 'fitness', 'permit', 'pollution'];
 
+// Shared by the owner's own live dashboard (assignmentController.
+// getFleetShiftStatus) and the CRM-admin ambulance list below — a
+// single available/on_trip/off/maintenance value derived from
+// Ambulance.status (is anyone on duty at all) combined with that
+// driver's own live availability.status (idle vs mid-trip). 'off'
+// means the ambulance itself is unclaimed right now, not necessarily
+// broken.
+exports.computeAmbulanceDisplayStatus = (amb) => {
+  if (amb.status === 'maintenance') return 'maintenance';
+  if (amb.status === 'assigned') {
+    return amb.assignedDriver?.availability?.status === 'on_trip' ? 'on_trip' : 'available';
+  }
+  return 'off';
+};
+
 // No Fleet-management UI exists yet (deliberately out of scope — Fleet
 // stays an invisible implementation detail for now). If the owner didn't
 // pass a fleetId, reuse their one auto-provisioned default Fleet, or
@@ -233,6 +248,47 @@ exports.addPhoto = async (req, res, next) => {
     await ambulance.save();
 
     return res.json({ success: true, photos: ambulance.photos });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/ambulances/admin
+// @desc    CRM-facing view of every Ambulance (any status), so the
+//          legacy Vehicle-only Fleet/Dispatch pages can show an owner
+//          (or any driver) on duty via the newer Ambulance/Assignment/
+//          Shift system alongside legacy Vehicle records. No owner
+//          scoping — matches Vehicle's/User-listing's existing
+//          unscoped, single-tenant CRM behavior.
+// @access  Private [CRM owner/admin] (protect, NOT protectOwner —
+//          this is the CRM's own User-model session, same actor as
+//          ownerController's admin listOwners/approveOwner/rejectOwner)
+// ============================================================
+exports.listAmbulancesAdmin = async (req, res, next) => {
+  try {
+    const ambulances = await Ambulance.find({ isActive: true })
+      .populate('fleet', 'name')
+      .populate('assignedDriver', 'name phone availability')
+      .sort({ createdAt: -1 });
+
+    const shaped = ambulances.map((amb) => ({
+      _id               : amb._id,
+      registrationNumber: amb.registrationNumber,
+      serviceType       : amb.serviceType,
+      serviceTypeLabel  : amb.serviceTypeLabel,
+      status            : amb.status,
+      displayStatus     : exports.computeAmbulanceDisplayStatus(amb),
+      source            : 'ambulance',
+      assignedDriver    : amb.assignedDriver ? {
+        _id  : amb.assignedDriver._id,
+        name : amb.assignedDriver.name,
+        phone: amb.assignedDriver.phone,
+      } : null,
+    }));
+
+    return res.json({ success: true, ambulances: shaped });
   } catch (err) {
     next(err);
   }

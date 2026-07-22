@@ -16,6 +16,7 @@
 
 const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead } = require('../models');
 const Ambulance = require('../models/Ambulance');
+const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
@@ -275,37 +276,54 @@ const autoAssign = async (trip) => {
 };
 
 
-// ── Helper: assign trip to a specific vehicle ─────────────────
-const assignTripToVehicle = async (trip, vehicle) => {
-  trip.vehicle     = vehicle._id;
-  trip.ambulance   = (await findMatchingAmbulance(vehicle.registrationNumber))?._id || undefined;
-  trip.driver      = vehicle.assignedDriver;
+// ── Shared tail: notify the driver + flip their availability to
+//    'on_trip'. Called from both the legacy Vehicle-sourced assignment
+//    path and the Ambulance-sourced one below — Trip.driver is a plain
+//    User ref either way, so this needs no per-source branching at all. ──
+const dispatchTripToDriver = async (trip, driverId) => {
   trip.status      = 'dispatched';
   trip.dispatchedAt = new Date();
   trip.driverConfirmed = false; // (re)assignment always re-prompts the driver
+  trip.driver = driverId;
   await trip.save();
 
-  // Update vehicle and driver status
-  await Vehicle.findByIdAndUpdate(vehicle._id, { status: 'on_trip' });
-  if (vehicle.assignedDriver) {
-    await User.findByIdAndUpdate(vehicle.assignedDriver, {
-      'availability.status'   : 'on_trip',
-      'availability.updatedAt': new Date(),
-    });
-  }
+  if (!driverId) return;
 
-  // Notify driver (real-time via socket or push — simplified here)
-  if (vehicle.assignedDriver) {
-    await Notification.create({
-      type        : 'trip_assigned',
-      title       : '🚑 New Trip Assigned',
-      message     : `You have a new trip: ${trip.patientName} — ${trip.pickup.address}`,
-      severity    : 'info',
-      trip        : trip._id,
-      targetUserId: vehicle.assignedDriver,
-      targetRole  : 'driver',
-    });
-  }
+  await User.findByIdAndUpdate(driverId, {
+    'availability.status'   : 'on_trip',
+    'availability.updatedAt': new Date(),
+  });
+
+  await Notification.create({
+    type        : 'trip_assigned',
+    title       : '🚑 New Trip Assigned',
+    message     : `You have a new trip: ${trip.patientName} — ${trip.pickup.address}`,
+    severity    : 'info',
+    trip        : trip._id,
+    targetUserId: driverId,
+    targetRole  : 'driver',
+  });
+};
+
+// ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
+//    path) ──────────────────────────────────────────────────────────
+const assignTripToVehicle = async (trip, vehicle) => {
+  trip.vehicle   = vehicle._id;
+  trip.ambulance = (await findMatchingAmbulance(vehicle.registrationNumber))?._id || undefined;
+  await Vehicle.findByIdAndUpdate(vehicle._id, { status: 'on_trip' });
+  await dispatchTripToDriver(trip, vehicle.assignedDriver);
+};
+
+// ── Helper: assign trip to an on-duty Ambulance operator (owner or
+//    driver — same "someone is on shift on this Ambulance" shape either
+//    way). No Ambulance.status change needed: 'assigned' already covers
+//    the whole duty shift regardless of individual trips, and the
+//    per-trip busy/available signal lives entirely on the driver's own
+//    User.availability.status, exactly like the Vehicle path. ──
+const assignTripToAmbulance = async (trip, ambulance) => {
+  trip.ambulance = ambulance._id;
+  trip.vehicle   = undefined;
+  await dispatchTripToDriver(trip, ambulance.assignedDriver?._id || ambulance.assignedDriver);
 };
 
 
@@ -316,26 +334,42 @@ const assignTripToVehicle = async (trip, vehicle) => {
 // ============================================================
 exports.assignVehicle = async (req, res, next) => {
   try {
-    const { vehicleId } = req.body;
+    const { vehicleId, ambulanceId } = req.body;
+    if (!vehicleId && !ambulanceId) {
+      return res.status(400).json({ success: false, message: 'vehicleId or ambulanceId is required.' });
+    }
+
     const trip = await Trip.findById(req.params.id);
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
     if (trip.status === 'completed' || trip.status === 'cancelled') {
       return res.status(400).json({ success: false, message: `Cannot reassign a ${trip.status} trip.` });
     }
 
-    // Release previous vehicle if any
+    // Release previous vehicle if any — no equivalent release needed on
+    // the Ambulance side even when reassigning away from one: Ambulance.
+    // status stays 'assigned' for the whole duty shift regardless of
+    // individual trips (see assignTripToAmbulance's comment).
     if (trip.vehicle) {
       await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
     }
 
-    const vehicle = await Vehicle.findById(vehicleId);
-    if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found.' });
-    if (vehicle.status !== 'available') {
-      return res.status(400).json({ success: false, message: 'Selected vehicle is not available.' });
+    if (ambulanceId) {
+      const ambulance = await Ambulance.findById(ambulanceId).populate('assignedDriver', 'availability');
+      if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+      if (computeAmbulanceDisplayStatus(ambulance) !== 'available') {
+        return res.status(400).json({ success: false, message: 'Selected ambulance is not available.' });
+      }
+      await assignTripToAmbulance(trip, ambulance);
+    } else {
+      const vehicle = await Vehicle.findById(vehicleId);
+      if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found.' });
+      if (vehicle.status !== 'available') {
+        return res.status(400).json({ success: false, message: 'Selected vehicle is not available.' });
+      }
+      await assignTripToVehicle(trip, vehicle);
     }
 
-    await assignTripToVehicle(trip, vehicle);
-    await trip.populate(['vehicle', 'driver', 'dropHospital']);
+    await trip.populate(['vehicle', 'ambulance', 'driver', 'dropHospital']);
 
     return res.json({ success: true, trip });
   } catch (err) {
@@ -772,8 +806,32 @@ exports.getLiveBoard = async (req, res, next) => {
       .populate('dropHospital', 'name address')
       .sort({ createdAt: 1 });
 
-    const availableVehicles = await Vehicle.find({ status: 'available' })
+    const vehicles = await Vehicle.find({ status: 'available' })
       .populate('assignedDriver', 'name phone');
+    const vehicleEntries = vehicles.map(v => ({
+      _id               : v._id,
+      registrationNumber: v.registrationNumber,
+      assignedDriver    : v.assignedDriver,
+      source            : 'vehicle',
+    }));
+
+    // Merge in on-duty, not-currently-mid-trip Ambulances — the same
+    // "someone I can dispatch to" concept the legacy Vehicle list
+    // already represents, just sourced from the newer Ambulance/
+    // Assignment/Shift system (see ambulanceController.
+    // listAmbulancesAdmin for the CRM's own read of this same data).
+    const ambulances = await Ambulance.find({ status: 'assigned', isActive: true })
+      .populate('assignedDriver', 'name phone availability');
+    const ambulanceEntries = ambulances
+      .filter(a => computeAmbulanceDisplayStatus(a) === 'available')
+      .map(a => ({
+        _id               : a._id,
+        registrationNumber: a.registrationNumber,
+        assignedDriver    : a.assignedDriver ? { name: a.assignedDriver.name, phone: a.assignedDriver.phone } : null,
+        source            : 'ambulance',
+      }));
+
+    const availableVehicles = [...vehicleEntries, ...ambulanceEntries];
 
     return res.json({
       success: true,

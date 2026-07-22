@@ -17,6 +17,7 @@ const Assignment = require('../models/Assignment');
 const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
 const { Trip }    = require('../models');
+const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 
 function toLocation(lat, lng) {
   return (lat != null && lng != null) ? { lat, lng } : undefined;
@@ -342,18 +343,10 @@ exports.getFleetShiftStatus = async (req, res, next) => {
         ? await Shift.findOne({ driver: assignment.driver, status: { $in: ['active', 'break'] } })
         : null;
 
-      // Owner-facing display status — a single available/on_trip/off/
-      // maintenance value derived from Ambulance.status (is anyone on
-      // duty at all) combined with that driver's own live
-      // availability.status (idle vs mid-trip), the field Phase 6A made
-      // trustworthy. 'off' means the ambulance itself is unclaimed right
-      // now, not necessarily broken.
-      let displayStatus = 'off';
-      if (amb.status === 'maintenance') {
-        displayStatus = 'maintenance';
-      } else if (amb.status === 'assigned') {
-        displayStatus = amb.assignedDriver?.availability?.status === 'on_trip' ? 'on_trip' : 'available';
-      }
+      // Shared with the CRM-admin ambulance list (ambulanceController.
+      // listAmbulancesAdmin) — see computeAmbulanceDisplayStatus's own
+      // comment for what this derives and why.
+      const displayStatus = computeAmbulanceDisplayStatus(amb);
 
       // Phase 6B bridge — only meaningful while the ambulance is actually
       // claimed; an unclaimed ambulance can't have a live trip on it.

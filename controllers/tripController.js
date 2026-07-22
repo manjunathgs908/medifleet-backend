@@ -17,6 +17,7 @@
 const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMessage } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
+const { sendPush } = require('../utils/pushService');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
@@ -310,6 +311,9 @@ const dispatchTripToDriver = async (trip, driverId) => {
     targetUserId: driverId,
     targetRole  : 'driver',
   });
+
+  const driverUser = await User.findById(driverId).select('pushToken');
+  sendPush(driverUser?.pushToken, '🚑 New Trip Assigned', `${trip.patientName} — ${trip.pickup.address}`, { tripId: trip._id.toString() });
 };
 
 // ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
@@ -419,6 +423,14 @@ exports.updateStatus = async (req, res, next) => {
     if (status === 'cancelled')  trip.cancelledAt  = new Date();
     await trip.save();
 
+    // Only reachable from 'dispatched' per validTransitions above — this
+    // is the driver heading toward pickup, not toward the hospital (that
+    // moment is verifyPickupOtp below, once the patient is actually
+    // onboard).
+    if (status === 'en_route') {
+      sendPush(trip.customerPushToken, '🚑 Ambulance On The Way', 'Your ambulance is on the way.', { tripId: trip._id.toString() });
+    }
+
     return res.json({ success: true, trip });
   } catch (err) {
     next(err);
@@ -451,6 +463,7 @@ exports.arrivePickup = async (req, res, next) => {
     if (!trip.arrivedAtPickupAt) {
       trip.arrivedAtPickupAt = new Date();
       await trip.save();
+      sendPush(trip.customerPushToken, '📍 Ambulance Arrived', 'Your ambulance has arrived at the pickup location.', { tripId: trip._id.toString() });
     }
 
     return res.json({ success: true, message: 'Pickup arrival recorded.', arrivedAtPickupAt: trip.arrivedAtPickupAt });
@@ -493,6 +506,12 @@ exports.verifyPickupOtp = async (req, res, next) => {
     trip.pickupVerified = true;
     trip.pickupVerifiedAt = new Date();
     await trip.save();
+
+    // The real "trip started" moment from the customer's point of view —
+    // patient actually onboard, heading to hospital (not the earlier
+    // 'en_route' status flip above, which is the driver heading toward
+    // pickup).
+    sendPush(trip.customerPushToken, '✅ Trip Started', 'Your trip is now underway.', { tripId: trip._id.toString() });
 
     return res.json({ success: true, message: 'Pickup verified successfully.' });
   } catch (err) {
@@ -624,6 +643,8 @@ exports.completeTrip = async (req, res, next) => {
 
     await bill.populate(['trip', 'hospital']);
 
+    sendPush(trip.customerPushToken, '🎉 Trip Completed', 'Your trip is complete. View your bill in the app.', { tripId: trip._id.toString() });
+
     return res.json({
       success : true,
       message : 'Trip completed. Bill auto-generated.',
@@ -662,6 +683,8 @@ exports.confirmTrip = async (req, res, next) => {
     trip.driverConfirmed = true;
     await trip.save();
     await trip.populate(['vehicle', 'driver', 'dropHospital']);
+
+    sendPush(trip.customerPushToken, '🚑 Driver Assigned', `${req.user.name} has been assigned to your trip.`, { tripId: trip._id.toString() });
 
     return res.json({ success: true, trip });
   } catch (err) {
@@ -938,6 +961,29 @@ exports.postDriverMessage = async (req, res, next) => {
 
     const message = await ChatMessage.create({ trip: trip._id, sender: 'driver', text });
     return res.status(201).json({ success: true, message });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/trips/:id/push-token
+// @desc    Customer app registers/updates its Expo push token for this
+//          trip. Public/tripId-keyed, same trust model as trackTrip —
+//          there's no persistent customer identity to attach a token to
+//          instead, so it's scoped to the trip's own lifetime.
+// @access  Public
+// ============================================================
+exports.registerCustomerPushToken = async (req, res, next) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'token is required.' });
+
+    const trip = await Trip.findByIdAndUpdate(req.params.id, { customerPushToken: token }, { new: true }).select('_id');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    return res.json({ success: true });
   } catch (err) {
     next(err);
   }

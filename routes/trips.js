@@ -17,6 +17,7 @@ router.get('/:id/messages',  protect, authorize('driver'), tripCtrl.getDriverMes
 router.post('/:id/messages', protect, authorize('driver'), tripCtrl.postDriverMessage);
 router.post('/:id/payment/order',  paymentCtrl.createOrder);
 router.post('/:id/payment/verify', paymentCtrl.verifyPayment);
+router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
 router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
 router.get('/', protect, tripCtrl.getTrips);
 router.get('/:id', protect, tripCtrl.getTripById);

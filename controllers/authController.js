@@ -727,7 +727,7 @@ exports.uploadDriverDocument = async (req, res, next) => {
 // ============================================================
 exports.updateLocation = async (req, res, next) => {
   try {
-    const { lat, lng, status } = req.body;
+    const { lat, lng, status, pushToken } = req.body;
 
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       return res.status(400).json({ success: false, message: 'lat and lng (numbers) are required.' });
@@ -742,6 +742,13 @@ exports.updateLocation = async (req, res, next) => {
     // status is optional — only update it if the driver app sent one
     if (status && ['available', 'on_trip', 'offline'].includes(status)) {
       update['availability.status'] = status;
+    }
+
+    // Piggybacked rather than a separate registration endpoint — this
+    // call already fires every ~10s while on duty, so the token stays
+    // fresh with zero extra requests from the driver app.
+    if (pushToken) {
+      update.pushToken = pushToken;
     }
 
     const user = await User.findByIdAndUpdate(req.user._id, update, { new: true });

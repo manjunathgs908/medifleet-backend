@@ -162,6 +162,11 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // Completed-trip counter, independent of ratingCount — a driver can
     // complete a trip nobody rated. Incremented in completeTrip.
     completedTripsCount: { type: Number, default: 0 },
+
+    // Expo push token — piggybacked onto the existing PUT /driver-auth/
+    // location call (already fires every ~10s while on duty) rather
+    // than a separate registration endpoint. See utils/pushService.js.
+    pushToken: { type: String },
   },
   { timestamps: true }
 );
@@ -559,6 +564,13 @@ const tripSchema = new Schema(
     rating  : { type: Number, min: 1, max: 5 },
     feedback: { type: String, trim: true, maxlength: 500 },
     ratedAt : { type: Date },
+
+    // Expo push token for THIS trip only — there's no persistent
+    // customer identity/session to attach it to (see trackTrip's own
+    // public/tripId-keyed trust model), so it's scoped to the trip's
+    // lifetime via a small public register endpoint. Naturally
+    // irrelevant once the trip is completed/cancelled.
+    customerPushToken: { type: String },
   },
   { timestamps: true }
 );

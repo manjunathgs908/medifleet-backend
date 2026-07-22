@@ -802,6 +802,7 @@ exports.getLiveBoard = async (req, res, next) => {
   try {
     const activeTrips = await Trip.find({ status: { $in: ['booked', 'dispatched', 'en_route'] } })
       .populate('vehicle',      'registrationNumber model gps status')
+      .populate('ambulance',    'registrationNumber')
       .populate('driver',       'name phone availability')
       .populate('dropHospital', 'name address')
       .sort({ createdAt: 1 });

@@ -148,6 +148,20 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
       aadhaar: { url: String, publicId: String, number: String, expiryDate: Date, uploadedAt: Date },
       photo  : { url: String, publicId: String, uploadedAt: Date },
     },
+
+    // ── Customer-facing rating (driver-scoped) ──────────────────
+    // Denormalized running totals rather than a separate Rating
+    // collection — there is exactly one rating per trip, submitted via
+    // Trip.rating (see tripSchema below), and this is the only place an
+    // average needs to be read from. $inc'd atomically on submission
+    // (tripController.rateTrip) so trackTrip's public/polled response
+    // never needs an aggregation query. ratingAvg = ratingSum/ratingCount,
+    // computed at read time, not stored.
+    ratingSum  : { type: Number, default: 0 },
+    ratingCount: { type: Number, default: 0 },
+    // Completed-trip counter, independent of ratingCount — a driver can
+    // complete a trip nobody rated. Incremented in completeTrip.
+    completedTripsCount: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

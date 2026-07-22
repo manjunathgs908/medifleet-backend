@@ -607,8 +607,11 @@ exports.completeTrip = async (req, res, next) => {
     }
     if (trip.driver) {
       await User.findByIdAndUpdate(trip.driver, {
-        'availability.status'   : 'available',
-        'availability.updatedAt': new Date(),
+        $set: {
+          'availability.status'   : 'available',
+          'availability.updatedAt': new Date(),
+        },
+        $inc: { completedTripsCount: 1 },
       });
     }
 
@@ -886,11 +889,19 @@ exports.getTripById = async (req, res, next) => {
 //          OTP, internal notes, bookedBy, etc).
 // @access  Public
 // ============================================================
+// Rough straight-line ETA assumption for ambulance urban traffic — not
+// routed (no Directions-API call from the backend, to avoid burning quota
+// on every 5s poll from every active trip). Good enough for a "~6 min
+// away" indicator; the app can layer a real routed polyline on top using
+// its own existing Directions helper without needing this to be exact.
+const ASSUMED_KMPH = 30;
+
 exports.trackTrip = async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.id)
       .populate('vehicle', 'registrationNumber type')
-      .populate('driver', 'name phone');
+      .populate('ambulance', 'registrationNumber serviceType serviceTypeLabel vehicleModel year')
+      .populate('driver', 'name phone availability ratingSum ratingCount completedTripsCount');
 
     if (!trip) {
       return res.status(404).json({ success: false, message: 'Trip not found.' });
@@ -902,16 +913,74 @@ exports.trackTrip = async (req, res, next) => {
     // details rather than showing "en route" prematurely. Does not touch
     // trip.status itself or the dispatched -> en_route lifecycle.
     const awaitingDriverAccept = trip.status === 'dispatched' && !trip.driverConfirmed;
+    const showDriver = !awaitingDriverAccept && trip.driver;
+
+    // Ambulance-sourced trips (an owner/driver on duty via the mobile
+    // app's Ambulance/Assignment system — see ownerController.actAsDriver)
+    // never set trip.vehicle at all, only trip.ambulance. Prefer it when
+    // present so those trips don't show "Vehicle details pending" forever.
+    let vehicleInfo = null;
+    if (!awaitingDriverAccept) {
+      if (trip.ambulance) {
+        vehicleInfo = {
+          registrationNumber: trip.ambulance.registrationNumber,
+          type               : trip.ambulance.serviceType,
+          typeLabel          : trip.ambulance.serviceTypeLabel,
+          model              : trip.ambulance.vehicleModel,
+        };
+      } else if (trip.vehicle) {
+        vehicleInfo = {
+          registrationNumber: trip.vehicle.registrationNumber,
+          type               : trip.vehicle.type,
+        };
+      }
+    }
+
+    // Live driver position + a rough distance/ETA to the pickup point —
+    // only meaningful pre-pickup (booked/dispatched/en_route-to-pickup);
+    // there's no drop-side lat/lng anywhere in the schema today (Hospital
+    // has only a free-text address, dropAddress likewise), so a live ETA
+    // to the drop point isn't computable yet — deliberately omitted
+    // rather than faked.
+    let driverLocation = null;
+    let distanceToPickupKm = null;
+    let etaMinutes = null;
+    if (showDriver && trip.driver.availability?.lat != null && trip.driver.availability?.lng != null) {
+      driverLocation = {
+        lat      : trip.driver.availability.lat,
+        lng      : trip.driver.availability.lng,
+        updatedAt: trip.driver.availability.updatedAt,
+      };
+      if (!trip.pickupVerified && trip.pickup?.lat != null && trip.pickup?.lng != null) {
+        distanceToPickupKm = Math.round(
+          haversineKm(driverLocation.lat, driverLocation.lng, trip.pickup.lat, trip.pickup.lng) * 10
+        ) / 10;
+        etaMinutes = Math.max(1, Math.round((distanceToPickupKm / ASSUMED_KMPH) * 60));
+      }
+    }
+
+    const ratingCount = trip.driver?.ratingCount || 0;
 
     return res.json({
       success: true,
       trip: {
         status        : awaitingDriverAccept ? 'booked' : trip.status,
         pickupVerified: trip.pickupVerified,
-        driver        : !awaitingDriverAccept && trip.driver ? { name: trip.driver.name, phone: trip.driver.phone } : null,
-        vehicle       : !awaitingDriverAccept && trip.vehicle ? { registrationNumber: trip.vehicle.registrationNumber, type: trip.vehicle.type } : null,
+        driver        : showDriver ? {
+          name               : trip.driver.name,
+          phone              : trip.driver.phone,
+          ratingAvg          : ratingCount > 0 ? Math.round((trip.driver.ratingSum / ratingCount) * 10) / 10 : null,
+          ratingCount,
+          completedTripsCount: trip.driver.completedTripsCount || 0,
+        } : null,
+        vehicle       : vehicleInfo,
         pickup        : trip.pickup,
         dropAddress   : trip.dropAddress,
+        driverLocation,
+        distanceToPickupKm,
+        etaMinutes,
+        estimatedDistanceKm: trip.estimatedDistanceKm,
+        estimatedFare      : trip.estimatedFare,
       },
     });
   } catch (err) {

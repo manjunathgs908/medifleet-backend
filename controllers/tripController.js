@@ -798,6 +798,56 @@ exports.customerCancelTrip = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/rate
+// @desc    Customer rates the driver after completion — 1-5 stars +
+//          optional feedback. Public/tripId-keyed, same trust model as
+//          trackTrip/customer-cancel. One rating per trip, no edits:
+//          rejects if trip.rating is already set. On success, atomically
+//          $inc's the driver's User.ratingSum/ratingCount (single write,
+//          no read-then-write race) — that's what powers the ratingAvg
+//          trackTrip already exposes.
+// @access  Public
+// ============================================================
+exports.rateTrip = async (req, res, next) => {
+  try {
+    const { rating, feedback } = req.body;
+    const ratingNum = Number(rating);
+    if (!Number.isInteger(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ success: false, message: 'rating must be an integer from 1 to 5.' });
+    }
+
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (trip.status !== 'completed') {
+      return res.status(400).json({ success: false, message: 'Only completed trips can be rated.' });
+    }
+    if (trip.rating != null) {
+      return res.status(400).json({ success: false, message: 'This trip has already been rated.' });
+    }
+
+    trip.rating   = ratingNum;
+    trip.feedback = feedback ? String(feedback).slice(0, 500) : undefined;
+    trip.ratedAt  = new Date();
+    await trip.save();
+
+    if (trip.driver) {
+      await User.findByIdAndUpdate(trip.driver, {
+        $inc: { ratingSum: ratingNum, ratingCount: 1 },
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Thanks for your feedback!',
+      trip: { rating: trip.rating, feedback: trip.feedback, ratedAt: trip.ratedAt },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   GET /api/trips
 // @desc    Get all trips with filters (status, date range, vehicle, driver)
 //          Drivers see ONLY their own trips.

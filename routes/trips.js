@@ -9,6 +9,7 @@ router.post('/verify-otp', tripCtrl.verifyBookingOtp);
 router.post('/', tripCtrl.createTrip);
 router.get('/:id/track', tripCtrl.trackTrip);
 router.put('/:id/customer-cancel', tripCtrl.customerCancelTrip);
+router.put('/:id/rate', tripCtrl.rateTrip);
 router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
 router.get('/', protect, tripCtrl.getTrips);
 router.get('/:id', protect, tripCtrl.getTripById);

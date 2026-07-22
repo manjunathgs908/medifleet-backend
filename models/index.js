@@ -543,6 +543,14 @@ const tripSchema = new Schema(
     // â”€â”€ Billing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
+
+    // ── Customer rating — exactly one per trip, submitted once via
+    // PUT /:id/rate (tripController.rateTrip), only after completion.
+    // Feeds User.ratingSum/ratingCount (see userSchema above) so the
+    // driver's average is a cheap denormalized read, not an aggregation.
+    rating  : { type: Number, min: 1, max: 5 },
+    feedback: { type: String, trim: true, maxlength: 500 },
+    ratedAt : { type: Date },
   },
   { timestamps: true }
 );

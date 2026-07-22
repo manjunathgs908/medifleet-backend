@@ -505,7 +505,7 @@ exports.changePin = async (req, res, next) => {
 exports.listDrivers = async (req, res, next) => {
   try {
     const { approvalStatus } = req.query;
-    const filter = { role: 'driver' };
+    const filter = { role: 'driver', owner: req.user._id };
     if (approvalStatus) filter.approvalStatus = approvalStatus;
 
     const drivers = await User.find(filter)
@@ -572,7 +572,7 @@ exports.createDriverAccount = async (req, res, next) => {
 exports.approveDriver = async (req, res, next) => {
   try {
     const user = await User.findOneAndUpdate(
-      { _id: req.params.id, role: 'driver' },
+      { _id: req.params.id, role: 'driver', owner: req.user._id },
       { approvalStatus: 'approved', $unset: { rejectionReason: '' } },
       { new: true }
     );
@@ -597,7 +597,7 @@ exports.rejectDriver = async (req, res, next) => {
   try {
     const { reason } = req.body;
     const user = await User.findOneAndUpdate(
-      { _id: req.params.id, role: 'driver' },
+      { _id: req.params.id, role: 'driver', owner: req.user._id },
       { approvalStatus: 'rejected', rejectionReason: reason || undefined },
       { new: true }
     );
@@ -621,7 +621,7 @@ exports.rejectDriver = async (req, res, next) => {
 // ============================================================
 exports.unbindDevice = async (req, res, next) => {
   try {
-    const driver = await User.findOne({ _id: req.params.id, role: 'driver' });
+    const driver = await User.findOne({ _id: req.params.id, role: 'driver', owner: req.user._id });
     if (!driver) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
     // Same ambulance-safety rule as voluntary logout — an owner can't

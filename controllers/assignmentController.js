@@ -43,6 +43,10 @@ exports.startDuty = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'ambulanceId is required.' });
     }
 
+    if (!req.user.owner) {
+      return res.status(403).json({ success: false, message: 'Your account is not linked to a fleet owner. Contact your Owner/Admin.' });
+    }
+
     // Fast pre-check for a clear, specific error on the common case — NOT
     // the actual concurrency guarantee (see below). A findOne-then-create
     // here would race: two concurrent start-duty calls could both pass
@@ -58,14 +62,19 @@ exports.startDuty = async (req, res, next) => {
     // Atomic claim — the {status:'available'} filter means only ONE of
     // two concurrent requests for the same ambulance can ever get a
     // non-null result back; the loser sees this as a normal "unavailable"
-    // outcome, not a race it has to detect itself.
+    // outcome, not a race it has to detect itself. owner:req.user.owner
+    // is the actual cross-tenant guard — without it, a driver could POST
+    // any ambulanceId directly (bypassing available-ambulances' listing
+    // entirely) and start duty on another owner's ambulance.
     const ambulance = await Ambulance.findOneAndUpdate(
-      { _id: ambulanceId, status: 'available' },
+      { _id: ambulanceId, status: 'available', owner: req.user.owner },
       { status: 'assigned', assignedDriver: driverId },
       { new: true }
     );
     if (!ambulance) {
-      const exists = await Ambulance.exists({ _id: ambulanceId });
+      // Scoped by owner too, so a foreign ambulance reports "not found"
+      // rather than confirming it exists under someone else's fleet.
+      const exists = await Ambulance.exists({ _id: ambulanceId, owner: req.user.owner });
       return res.status(409).json({
         success: false,
         message: exists
@@ -117,18 +126,22 @@ exports.startDuty = async (req, res, next) => {
 
 // ============================================================
 // @route   GET /api/assignments/available-ambulances
-// @desc    Ambulances a driver can pick at start-duty — scoped to the
-//          driver's owner if linked (see User.owner), else platform-wide
-//          (today's pre-Phase-4 single-tenant reality: drivers created
-//          before this field existed).
+// @desc    Ambulances a driver can pick at start-duty — scoped strictly
+//          to the driver's owner (see User.owner). A driver with no
+//          owner link sees nothing rather than every owner's fleet —
+//          the old platform-wide fallback (for pre-Phase-4 drivers
+//          created before this field existed) was a cross-tenant leak;
+//          any such driver should be linked via an owner, not served by
+//          a permissive default. See scripts/link-drv001-to-owner.js.
 // @access  Private [driver]
 // ============================================================
 exports.getAvailableAmbulances = async (req, res, next) => {
   try {
-    const filter = { status: 'available', isActive: true };
-    if (req.user.owner) filter.owner = req.user.owner;
+    if (!req.user.owner) {
+      return res.status(403).json({ success: false, message: 'Your account is not linked to a fleet owner. Contact your Owner/Admin.' });
+    }
 
-    const ambulances = await Ambulance.find(filter)
+    const ambulances = await Ambulance.find({ status: 'available', isActive: true, owner: req.user.owner })
       .select('registrationNumber serviceType serviceTypeLabel vehicleModel status year')
       .sort({ registrationNumber: 1 });
 

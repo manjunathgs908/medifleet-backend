@@ -546,6 +546,10 @@ const tripSchema = new Schema(
     // once that logic is built.
     pickupWaitMinutes : { type: Number, default: 0 },
     dropWaitMinutes   : { type: Number, default: 0 },
+    // Deliberately never populated — traffic wait charging was decided
+    // against (too hard to justify to a customer mid-trip, high dispute
+    // risk), not left unbuilt. Field stays for schema stability;
+    // Pricing.trafficWaitPerMin is likewise unused by design.
     trafficWaitMinutes: { type: Number, default: 0 },
     waitCharge        : { type: Number, default: 0 },
     // Set true when a round trip completed with reachedHospitalAt but no

@@ -62,6 +62,13 @@ A change here affects all four. Treat it that way.
 | Drop wait — one-way | 10 min | ₹10/min |
 | Drop wait — return trip | 10 min | ₹5/min for next 120 min, then ₹10/min |
 
+**Traffic wait will not be implemented — this is a product decision, not a missing
+feature.** It's too hard to explain to a customer mid-trip ("you were charged
+because of traffic") and creates billing disputes. `trafficWaitPerMin` stays in
+the `Pricing` schema and the table above for reference, but nothing reads it —
+no code opens a traffic wait segment or bills against it. Don't build this
+without an explicit reversal of the decision.
+
 Rules:
 - All wait time computed **server-side from the event log**. Clients display only.
 - Cap total wait charges at **150% of base fare**.

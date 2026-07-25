@@ -440,6 +440,32 @@ const Lead = mongoose.model('Lead', leadSchema);
 // ============================================================
 // 6. TRIP MODEL
 // ============================================================
+const tripEventSchema = new Schema(
+  {
+    type    : { type: String, required: true }, // e.g. 'PICKUP_ARRIVED', 'PICKUP_WAIT_ENDED'
+    at      : { type: Date, required: true },    // server time only, never client-supplied
+    by      : { type: Schema.Types.ObjectId, ref: 'User' },
+    location: { lat: Number, lng: Number },
+    meta    : { type: Schema.Types.Mixed },
+  },
+  { _id: true }
+);
+
+const waitSegmentSchema = new Schema(
+  {
+    segmentType: { type: String, enum: ['pickup', 'traffic', 'drop_oneway', 'drop_return'], required: true },
+    startedAt  : { type: Date, required: true },
+    endedAt    : { type: Date },
+    // Captured from Pricing at segment-open — stays fixed for this
+    // segment even if Pricing changes mid-wait.
+    ratePerMin : { type: Number, required: true },
+    freeSeconds: { type: Number, required: true, default: 0 },
+    // Set only when the segment closes.
+    amount     : { type: Number },
+  },
+  { _id: true }
+);
+
 const tripSchema = new Schema(
   {
     tripNumber: { type: String, unique: true }, // Auto-generated: TRP-YYYYMMDD-001
@@ -516,6 +542,19 @@ const tripSchema = new Schema(
     trafficWaitMinutes: { type: Number, default: 0 },
     waitCharge        : { type: Number, default: 0 },
 
+    // ── Append-only event log — immutable audit trail for trip moments
+    // that need more than a bare timestamp (who, where, why). Never
+    // update/delete an entry; corrections are new entries.
+    events: { type: [tripEventSchema], default: [] },
+
+    // ── Discrete wait-time segments — one open record per active wait
+    // clock, closed with endedAt/amount when the wait ends. Recording-only
+    // for now: completeTrip's billed waitCharge still comes from the
+    // existing arrivedAtPickupAt/pickupVerifiedAt bracket below,
+    // independent of this array, until the two are verified to agree on
+    // real trips.
+    waitSegments: { type: [waitSegmentSchema], default: [] },
+
     // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status: {
       type   : String,
@@ -583,6 +622,78 @@ tripSchema.pre('save', function (next) {
   this.pickupOtp = String(Math.floor(1000 + Math.random() * 9000));
   next();
 });
+
+// Shared by getLiveWaitState (live, still-open segment) and
+// closeWaitSegment/closeAllOpenWaitSegments (final, closed segment) so the
+// live number a customer sees is computed identically to completeTrip's
+// billed number. Matches completeTrip's exact rounding: round the raw
+// elapsed time to whole minutes first, THEN subtract free minutes, THEN
+// multiply by rate — not a smooth per-second calc. No cap here; completeTrip
+// doesn't cap yet either, so the two must not diverge (a cap is a separate
+// follow-up that touches both at once).
+function computeSegmentAmount(segment, elapsedMs) {
+  const freeMinutes = Math.round((segment.freeSeconds || 0) / 60);
+  const rawMinutes = Math.max(0, Math.round(elapsedMs / 60000));
+  const billableMinutes = Math.max(0, rawMinutes - freeMinutes);
+  return billableMinutes * (segment.ratePerMin || 0);
+}
+
+// Live wait-clock state for whichever segment (if any) is still open —
+// used by getTripById/trackTrip so driver and customer apps show the same
+// timer. elapsedSeconds/freeSecondsRemaining are smooth per-second values
+// for a live countdown display; accruedAmount is deliberately NOT smooth —
+// it uses computeSegmentAmount's whole-minute rounding so it previews
+// exactly what completeTrip will bill.
+tripSchema.methods.getLiveWaitState = function () {
+  const empty = { activeSegmentType: null, elapsedSeconds: 0, freeSecondsRemaining: 0, accruedAmount: 0, ratePerMin: 0 };
+
+  // A finished trip has no live clock — without this, a completed/
+  // cancelled trip with an unclosed segment (shouldn't happen once
+  // completeTrip/cancel paths close it below, but a defensive floor
+  // regardless) would show a wait charge climbing against Date.now()
+  // forever.
+  if (this.status === 'completed' || this.status === 'cancelled') return empty;
+
+  const openSegment = (this.waitSegments || []).find(s => !s.endedAt);
+  if (!openSegment) return empty;
+
+  const elapsedMs = Math.max(0, Date.now() - openSegment.startedAt.getTime());
+  const elapsedSeconds = Math.floor(elapsedMs / 1000);
+  const freeSecondsRemaining = Math.max(0, (openSegment.freeSeconds || 0) - elapsedSeconds);
+  const accruedAmount = computeSegmentAmount(openSegment, elapsedMs);
+
+  return {
+    activeSegmentType: openSegment.segmentType.toUpperCase(),
+    elapsedSeconds,
+    freeSecondsRemaining,
+    accruedAmount,
+    ratePerMin: openSegment.ratePerMin || 0,
+  };
+};
+
+// Close the open segment of `segmentType` at `endedAt` — a server-derived
+// terminal timestamp (pickupVerifiedAt here), never Date.now() directly.
+// No-ops cleanly (returns null) if there's no open segment of that type:
+// driver skipped "Reached Pickup", or the trip predates this feature.
+tripSchema.methods.closeWaitSegment = function (segmentType, endedAt) {
+  const segment = (this.waitSegments || []).find(s => s.segmentType === segmentType && !s.endedAt);
+  if (!segment) return null;
+  const elapsedMs = Math.max(0, endedAt.getTime() - segment.startedAt.getTime());
+  segment.endedAt = endedAt;
+  segment.amount  = computeSegmentAmount(segment, elapsedMs);
+  return segment;
+};
+
+// Trip is ending entirely (completed/cancelled) — stop every still-open
+// wait clock, whatever type it is, rather than leaving it open forever.
+tripSchema.methods.closeAllOpenWaitSegments = function (endedAt) {
+  (this.waitSegments || []).filter(s => !s.endedAt).forEach(s => {
+    const elapsedMs = Math.max(0, endedAt.getTime() - s.startedAt.getTime());
+    s.endedAt = endedAt;
+    s.amount  = computeSegmentAmount(s, elapsedMs);
+  });
+};
+
 const Trip = mongoose.model('Trip', tripSchema);
 
 

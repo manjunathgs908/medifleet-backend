@@ -21,7 +21,8 @@ const { sendPush } = require('../utils/pushService');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
-const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { haversineKm } = require('../utils/haversine');
 
 // ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
 // registrationNumber. Both schemas already normalize to uppercase+trim
@@ -52,24 +53,15 @@ async function findMatchingAmbulance(registrationNumber) {
 // here rather than as a silent Mongoose schema default.
 const GST_RATE = 5;
 
-// ── Utility: calculate straight-line distance (Haversine) ────
-const haversineKm = (lat1, lng1, lat2, lng2) => {
-  const R    = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-};
-
 
 // ============================================================
 // @route   POST /api/trips/send-otp
 // @desc    Phone verification for the website booking form — real MSG91
-//          SMS for every number (no test-OTP whitelist; that mechanism
-//          is only for app login testing, see utils/testOtp.js). Not
-//          gated on any account — a website visitor isn't a User/Owner.
+//          SMS for every number, except the TEST_OTP_NUMBERS allowlist
+//          (see utils/testOtp.js), which gets a fixed code with no real
+//          SMS attempt. Driver/owner login never bypass, only this
+//          customer-facing flow does. Not gated on any account — a
+//          website visitor isn't a User/Owner.
 // @access  Public
 // ============================================================
 exports.sendBookingOtp = async (req, res, next) => {
@@ -83,9 +75,10 @@ exports.sendBookingOtp = async (req, res, next) => {
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
 
     // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
-    // utils/testOtp.js. Every number gets the same fixed OTP, no real SMS
-    // attempt — testOtp is echoed back so the site can show/auto-fill it.
-    if (isTestOtpEnabled()) {
+    // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed
+    // OTP with no real SMS attempt — testOtp is echoed back so the site
+    // can show/auto-fill it. Every other number always gets real SMS.
+    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
       const testOtp = getTestOtpCode();
       await BookingOtp.findOneAndUpdate(
         { phone },
@@ -420,7 +413,10 @@ exports.updateStatus = async (req, res, next) => {
 
     trip.status = status;
     if (status === 'en_route')   trip.enRouteAt   = new Date();
-    if (status === 'cancelled')  trip.cancelledAt  = new Date();
+    if (status === 'cancelled') {
+      trip.cancelledAt = new Date();
+      trip.closeAllOpenWaitSegments(trip.cancelledAt);
+    }
     await trip.save();
 
     // Only reachable from 'dispatched' per validTransitions above — this
@@ -438,21 +434,39 @@ exports.updateStatus = async (req, res, next) => {
 };
 
 
+// GPS proximity guard for "Reached Pickup" — CLAUDE.md's 150m rule.
+// Never blocks on missing data (driver app may not send coordinates yet,
+// or the last availability ping may be stale); it only blocks when we
+// actually have a confident position AND it's too far, and even then only
+// once ENFORCE_PICKUP_GPS_GUARD is flipped on.
+const PICKUP_GPS_RADIUS_METERS = 150;
+const GPS_STALENESS_MS = 2 * 60 * 1000; // 2 minutes
+// Log-only until the driver app has an override UI and we've seen the
+// real distance distribution. Flip to true to start returning 400s.
+const ENFORCE_PICKUP_GPS_GUARD = false;
+
 // ============================================================
 // @route   PUT /api/trips/:id/arrive-pickup
 // @desc    Driver taps "Reached Pickup" — marks arrival at the pickup
-//          location. Mirrors verify-otp: a sub-event within 'en_route',
-//          does not change trip.status. Pairs with pickupVerifiedAt
-//          (set by verify-otp below) to bracket pickup wait time,
-//          computed later in completeTrip.
-// @access  Private [driver] — driver can only mark their own trip
+//          location using SERVER time only, GPS-guarded against the
+//          trip's pickup coordinates (150m) when a position is available,
+//          and opens a PICKUP wait segment rated from the Pricing
+//          collection. Mirrors verify-otp: a sub-event within 'en_route',
+//          does not change trip.status. Pairs with pickupVerifiedAt (set
+//          by verify-otp below) — that bracket is still what completeTrip
+//          bills from; waitSegments is recording-only until the two are
+//          verified to agree on real trips.
+// @access  Private [driver, owner] — driver can only mark their own trip;
+//          owner (CRM dispatcher) can force an arrival for any trip.
 // ============================================================
 exports.arrivePickup = async (req, res, next) => {
   try {
-    const trip = await Trip.findById(req.params.id);
+    const { lat, lng, override, reason } = req.body;
+
+    const trip = await Trip.findById(req.params.id).populate('driver', 'availability');
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
 
-    if (req.user.role === 'driver' && trip.driver?.toString() !== req.user._id.toString()) {
+    if (req.user.role === 'driver' && trip.driver?._id?.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'This trip is not assigned to you.' });
     }
 
@@ -460,13 +474,102 @@ exports.arrivePickup = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Trip must be en route to mark pickup arrival.' });
     }
 
-    if (!trip.arrivedAtPickupAt) {
-      trip.arrivedAtPickupAt = new Date();
-      await trip.save();
-      sendPush(trip.customerPushToken, '📍 Ambulance Arrived', 'Your ambulance has arrived at the pickup location.', { tripId: trip._id.toString() });
+    // Already recorded — idempotent no-op, same as before. Don't re-run
+    // the GPS check or open a second wait segment.
+    if (trip.arrivedAtPickupAt) {
+      return res.json({ success: true, message: 'Pickup arrival recorded.', arrivedAtPickupAt: trip.arrivedAtPickupAt });
     }
 
-    return res.json({ success: true, message: 'Pickup arrival recorded.', arrivedAtPickupAt: trip.arrivedAtPickupAt });
+    // ── Resolve a position to check proximity with: prefer the
+    //    freshly-supplied body coordinates, fall back to the driver's
+    //    last known availability ping if it's <= 2 minutes old. ──
+    let gpsSource = 'none';
+    let checkLat, checkLng;
+    if (typeof lat === 'number' && typeof lng === 'number') {
+      gpsSource = 'body';
+      checkLat = lat;
+      checkLng = lng;
+    } else {
+      const avail = trip.driver?.availability;
+      const isFresh = avail?.updatedAt && (Date.now() - new Date(avail.updatedAt).getTime()) <= GPS_STALENESS_MS;
+      if (isFresh && typeof avail.lat === 'number' && typeof avail.lng === 'number') {
+        gpsSource = 'availability';
+        checkLat = avail.lat;
+        checkLng = avail.lng;
+      }
+    }
+
+    let distanceMeters = null;
+    let gpsVerified = false;
+    let autoReason;
+    let overridden = false;
+    let overriddenByRole;
+
+    if (gpsSource === 'none') {
+      autoReason = 'No current GPS position available (no coordinates sent and no fresh driver location on file).';
+    } else if (trip.pickup?.lat == null || trip.pickup?.lng == null) {
+      autoReason = 'Pickup coordinates are not set on this trip.';
+    } else {
+      distanceMeters = Math.round(haversineKm(checkLat, checkLng, trip.pickup.lat, trip.pickup.lng) * 1000);
+      if (distanceMeters <= PICKUP_GPS_RADIUS_METERS) {
+        gpsVerified = true;
+      } else if (override) {
+        if (!reason || !String(reason).trim()) {
+          return res.status(400).json({ success: false, message: 'A reason is required to override the GPS check.' });
+        }
+        overridden = true;
+        overriddenByRole = req.user.role;
+      } else if (ENFORCE_PICKUP_GPS_GUARD) {
+        return res.status(400).json({
+          success: false,
+          message: `You are ${distanceMeters}m from the pickup location — must be within ${PICKUP_GPS_RADIUS_METERS}m. Override with a reason if this is correct.`,
+          distanceMeters,
+          maxAllowedMeters: PICKUP_GPS_RADIUS_METERS,
+        });
+      } else {
+        // Log-only: never block. Record the miss so the real distance
+        // distribution can be reviewed before ENFORCE_PICKUP_GPS_GUARD flips on.
+        autoReason = `Outside ${PICKUP_GPS_RADIUS_METERS}m pickup radius (${distanceMeters}m) — guard is in log-only mode, not enforced.`;
+      }
+    }
+
+    trip.arrivedAtPickupAt = new Date();
+
+    // ── Open the PICKUP wait segment, rated from the Pricing collection —
+    //    never hardcoded. ──
+    const pricingDoc = await fareCalculator.findPricingDoc(trip.selectedType);
+    trip.waitSegments.push({
+      segmentType: 'pickup',
+      startedAt  : trip.arrivedAtPickupAt,
+      ratePerMin : pricingDoc?.pickupWaitPerMin ?? 0,
+      freeSeconds: (pricingDoc?.pickupFreeWaitMinutes ?? 0) * 60,
+    });
+
+    trip.events.push({
+      type    : 'PICKUP_ARRIVED',
+      at      : trip.arrivedAtPickupAt,
+      by      : req.user._id,
+      location: gpsSource !== 'none' ? { lat: checkLat, lng: checkLng } : undefined,
+      meta    : {
+        gpsSource,
+        distanceMeters,
+        gpsVerified,
+        overridden,
+        overriddenByRole,
+        reason: overridden ? reason : autoReason,
+      },
+    });
+
+    await trip.save();
+    sendPush(trip.customerPushToken, '📍 Ambulance Arrived', 'Your ambulance has arrived at the pickup location.', { tripId: trip._id.toString() });
+
+    return res.json({
+      success: true,
+      message: 'Pickup arrival recorded.',
+      arrivedAtPickupAt: trip.arrivedAtPickupAt,
+      distanceMeters,
+      gpsVerified,
+    });
   } catch (err) {
     next(err);
   }
@@ -505,6 +608,7 @@ exports.verifyPickupOtp = async (req, res, next) => {
 
     trip.pickupVerified = true;
     trip.pickupVerifiedAt = new Date();
+    trip.closeWaitSegment('pickup', trip.pickupVerifiedAt);
     await trip.save();
 
     // The real "trip started" moment from the customer's point of view —
@@ -595,6 +699,7 @@ exports.completeTrip = async (req, res, next) => {
     trip.grandTotal   = fare.grandTotal + waitCharge;
     trip.status       = 'completed';
     trip.completedAt  = new Date();
+    trip.closeAllOpenWaitSegments(trip.completedAt);
     await trip.save();
 
     // ── 3. Auto-generate Bill ─────────────────────────────────
@@ -757,6 +862,7 @@ exports.cancelTrip = async (req, res, next) => {
 
     trip.status             = 'cancelled';
     trip.cancelledAt        = new Date();
+    trip.closeAllOpenWaitSegments(trip.cancelledAt);
     trip.cancellationReason = reason;
     await trip.save();
 
@@ -806,6 +912,7 @@ exports.customerCancelTrip = async (req, res, next) => {
 
     trip.status             = 'cancelled';
     trip.cancelledAt        = new Date();
+    trip.closeAllOpenWaitSegments(trip.cancelledAt);
     trip.cancellationReason = reason || 'Cancelled by customer';
     await trip.save();
 
@@ -1118,7 +1225,10 @@ exports.getTripById = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Access denied.' });
     }
 
-    return res.json({ success: true, trip });
+    const tripObj = trip.toObject();
+    tripObj.waitState = trip.getLiveWaitState();
+
+    return res.json({ success: true, trip: tripObj });
   } catch (err) {
     next(err);
   }
@@ -1256,6 +1366,7 @@ exports.trackTrip = async (req, res, next) => {
         estimatedDistanceKm: trip.estimatedDistanceKm,
         estimatedFare      : trip.estimatedFare,
         bill,
+        waitState: trip.getLiveWaitState(),
       },
     });
   } catch (err) {

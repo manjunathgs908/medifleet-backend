@@ -18,7 +18,7 @@
  * reuses their existing token-issuing functions instead of reimplementing
  * them; the send-otp/verify-otp bodies below intentionally mirror
  * authController.sendOtp/verifyOtp and ownerController.sendOtp/verifyOtp
- * almost line-for-line so behavior (test-OTP mode, device-binding,
+ * almost line-for-line so behavior (test-OTP allowlist, device-binding,
  * new-owner registration) stays identical to those two untouched
  * endpoints — only the "which collection" decision is new.
  * ============================================================
@@ -28,7 +28,7 @@
 const { User } = require('../models');
 const Owner = require('../models/Owner');
 const smsService = require('../utils/smsService');
-const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 const { sendTokenResponse: issueDriverSession } = require('./authController');
 const { issueOwnerSession } = require('./ownerController');
 
@@ -38,7 +38,10 @@ const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
 async function sendOtpFor(doc, phone, res) {
   const otpExpiry = Date.now() + OTP_EXPIRY_MS;
 
-  if (isTestOtpEnabled()) {
+  // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
+  // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed OTP
+  // with no real SMS attempt. Every other number always gets real SMS.
+  if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
     const testOtp = getTestOtpCode();
     doc.otp       = testOtp;
     doc.otpExpiry = otpExpiry;

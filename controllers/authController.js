@@ -19,7 +19,7 @@ const { User, Trip } = require('../models');
 const Shift = require('../models/Shift');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
-const { isTestOtpEnabled, getTestOtpCode } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -149,9 +149,10 @@ exports.sendOtp = async (req, res, next) => {
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
 
     // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
-    // utils/testOtp.js. Every number gets the same fixed OTP, no real SMS
-    // attempt — testOtp is echoed back so the app can show/auto-fill it.
-    if (isTestOtpEnabled()) {
+    // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed
+    // OTP with no real SMS attempt — testOtp is echoed back so the app
+    // can show/auto-fill it. Every other number always gets real SMS.
+    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
       const testOtp = getTestOtpCode();
       user.otp       = testOtp;
       user.otpExpiry = otpExpiry;

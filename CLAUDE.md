@@ -87,8 +87,17 @@ push is a production outage. Be careful with migrations and schema changes.
 ---
 
 ## Currently in progress
-**Wait-charge feature.** Pricing and Trip schemas already extended.
-Next step: `POST /api/trips/:id/reached-pickup` — server-time-only, GPS-guarded
-(150m), starts the PICKUP wait segment, rates from the Pricing collection,
-appends an immutable event. Then expose live wait state on the trip read endpoint
-so the driver app and customer app can display the same timer.
+**Wait-charge feature.** Backend done: pickup wait (`PUT /api/trips/:id/arrive-pickup`)
+and drop wait (`PUT /api/trips/:id/reached-hospital`, `PUT /api/trips/:id/start-return`)
+both open/close wait segments, rates come from Pricing, live state is on the
+trip read endpoints (`waitState`), and completeTrip bills pickup + drop
+together. GPS guard is log-only (`ENFORCE_PICKUP_GPS_GUARD = false`) until the
+driver app has an override UI.
+
+**Driver app MUST ship "Reached Hospital" and "Starting Return" in the SAME
+release.** Round-trip drop wait is bracketed `reachedHospitalAt -> returnStartedAt`.
+If the app calls "Reached Hospital" but never calls "Starting Return" (i.e.
+ships the first tap without the second), every round trip hits the
+no-returnStartedAt fallback: drop wait is charged Rs 0 and the trip is flagged
+`dropWaitNeedsReview` for manual billing. Not a silent bug, but it does mean
+zero drop-wait revenue on every round trip until both taps exist client-side.

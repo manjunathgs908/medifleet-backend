@@ -457,9 +457,14 @@ const waitSegmentSchema = new Schema(
     startedAt  : { type: Date, required: true },
     endedAt    : { type: Date },
     // Captured from Pricing at segment-open — stays fixed for this
-    // segment even if Pricing changes mid-wait.
+    // segment even if Pricing changes mid-wait. For 'drop_return' this is
+    // the TIER 1 rate; tier2RatePerMin below is the rate beyond
+    // tier1CapMinutes. Unset tier fields = flat-rate segment (pickup,
+    // drop_oneway).
     ratePerMin : { type: Number, required: true },
     freeSeconds: { type: Number, required: true, default: 0 },
+    tier1CapMinutes: { type: Number }, // drop_return only — returnDropWaitTier1Minutes
+    tier2RatePerMin: { type: Number }, // drop_return only — returnDropWaitTier2PerMin
     // Set only when the segment closes.
     amount     : { type: Number },
   },
@@ -532,6 +537,8 @@ const tripSchema = new Schema(
     // fareCalculator/completeTrip work, tracked separately).
     actualDistanceKm: { type: Number },
     arrivedAtPickupAt: { type: Date }, // driver's "Reached Pickup" tap — pairs with the existing pickupVerifiedAt below to bracket pickup wait time
+    reachedHospitalAt: { type: Date }, // driver's "Reached Hospital" tap — pairs with returnStartedAt (round trip) or completedAt (one-way) to bracket drop wait time
+    returnStartedAt  : { type: Date }, // driver's "Starting Return" tap (round trip only) — closes drop wait BEFORE the return drive, not at completedAt
 
     // ── Wait-time breakdown — computed server-side at completion from
     // Pricing's wait-charge fields (see pricingSchema above). Not written
@@ -541,6 +548,12 @@ const tripSchema = new Schema(
     dropWaitMinutes   : { type: Number, default: 0 },
     trafficWaitMinutes: { type: Number, default: 0 },
     waitCharge        : { type: Number, default: 0 },
+    // Set true when a round trip completed with reachedHospitalAt but no
+    // returnStartedAt — drop wait couldn't be safely bracketed, so it was
+    // charged Rs 0 rather than guessed against completedAt (which would
+    // include the return drive). Ops reviews these manually; see the
+    // DROP_WAIT_FALLBACK_COMPLETEDAT event on the trip for details.
+    dropWaitNeedsReview: { type: Boolean, default: false },
 
     // ── Append-only event log — immutable audit trail for trip moments
     // that need more than a bare timestamp (who, where, why). Never
@@ -631,11 +644,31 @@ tripSchema.pre('save', function (next) {
 // multiply by rate — not a smooth per-second calc. No cap here; completeTrip
 // doesn't cap yet either, so the two must not diverge (a cap is a separate
 // follow-up that touches both at once).
+// The ONE implementation of wait-charge math — used by getLiveWaitState/
+// closeWaitSegment/closeAllOpenWaitSegments below AND by completeTrip's
+// pickup/drop wait calc (tripController.js), via the export at the bottom
+// of this file. Do not reimplement this elsewhere: the whole reason it's
+// exported instead of left private is that a second copy is exactly how
+// the live-vs-billed rounding divergence happened before.
+//
+// `segment` just needs the shape { ratePerMin, freeSeconds, tier1CapMinutes?,
+// tier2RatePerMin? } — callers that aren't touching a real Mongoose
+// subdocument (e.g. completeTrip) can pass a plain object.
 function computeSegmentAmount(segment, elapsedMs) {
   const freeMinutes = Math.round((segment.freeSeconds || 0) / 60);
   const rawMinutes = Math.max(0, Math.round(elapsedMs / 60000));
   const billableMinutes = Math.max(0, rawMinutes - freeMinutes);
-  return billableMinutes * (segment.ratePerMin || 0);
+
+  // Two-tier segment (drop_return): first tier1CapMinutes of billable time
+  // at ratePerMin (tier 1), remainder at tier2RatePerMin.
+  if (segment.tier1CapMinutes != null) {
+    const tier1Minutes = Math.min(billableMinutes, segment.tier1CapMinutes);
+    const tier2Minutes = Math.max(0, billableMinutes - segment.tier1CapMinutes);
+    const amount = tier1Minutes * (segment.ratePerMin || 0) + tier2Minutes * (segment.tier2RatePerMin || 0);
+    return { billableMinutes, amount };
+  }
+
+  return { billableMinutes, amount: billableMinutes * (segment.ratePerMin || 0) };
 }
 
 // Live wait-clock state for whichever segment (if any) is still open —
@@ -660,7 +693,7 @@ tripSchema.methods.getLiveWaitState = function () {
   const elapsedMs = Math.max(0, Date.now() - openSegment.startedAt.getTime());
   const elapsedSeconds = Math.floor(elapsedMs / 1000);
   const freeSecondsRemaining = Math.max(0, (openSegment.freeSeconds || 0) - elapsedSeconds);
-  const accruedAmount = computeSegmentAmount(openSegment, elapsedMs);
+  const { amount: accruedAmount } = computeSegmentAmount(openSegment, elapsedMs);
 
   return {
     activeSegmentType: openSegment.segmentType.toUpperCase(),
@@ -680,7 +713,7 @@ tripSchema.methods.closeWaitSegment = function (segmentType, endedAt) {
   if (!segment) return null;
   const elapsedMs = Math.max(0, endedAt.getTime() - segment.startedAt.getTime());
   segment.endedAt = endedAt;
-  segment.amount  = computeSegmentAmount(segment, elapsedMs);
+  segment.amount  = computeSegmentAmount(segment, elapsedMs).amount;
   return segment;
 };
 
@@ -690,7 +723,7 @@ tripSchema.methods.closeAllOpenWaitSegments = function (endedAt) {
   (this.waitSegments || []).filter(s => !s.endedAt).forEach(s => {
     const elapsedMs = Math.max(0, endedAt.getTime() - s.startedAt.getTime());
     s.endedAt = endedAt;
-    s.amount  = computeSegmentAmount(s, elapsedMs);
+    s.amount  = computeSegmentAmount(s, elapsedMs).amount;
   });
 };
 
@@ -1118,5 +1151,6 @@ module.exports = {
   Advance,
   Pricing,
   ChatMessage,
+  computeSegmentAmount,
 };
 

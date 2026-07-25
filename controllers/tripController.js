@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMessage } = require('../models');
+const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMessage, computeSegmentAmount } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const { sendPush } = require('../utils/pushService');
@@ -577,6 +577,176 @@ exports.arrivePickup = async (req, res, next) => {
 
 
 // ============================================================
+// @route   PUT /api/trips/:id/reached-hospital
+// @desc    Driver taps "Reached Hospital" — marks arrival at the drop
+//          location using SERVER time only, and opens a drop wait segment
+//          rated from the Pricing collection (one-way: flat dropWaitPerMin;
+//          round trip: tiered returnDropWaitTier1/2PerMin). No drop
+//          coordinate exists anywhere in the schema yet (dropAddress/
+//          Hospital.address are both free text), so unlike arrivePickup
+//          this can never actually verify proximity — it still resolves
+//          and records the driver's GPS (gpsSource/location) on the event
+//          purely for later analysis, always non-blocking. Mirrors
+//          arrivePickup: a sub-event within 'en_route', does not change
+//          trip.status. Segment closes in completeTrip (closeAllOpenWaitSegments),
+//          same as pickup's; completeTrip's own drop-wait calc (below) is
+//          what actually bills, independent of the segment.
+// @access  Private [driver, owner] — driver can only mark their own trip;
+//          owner (CRM dispatcher) can force an arrival for any trip.
+// ============================================================
+exports.arriveDrop = async (req, res, next) => {
+  try {
+    const { lat, lng } = req.body;
+
+    const trip = await Trip.findById(req.params.id).populate('driver', 'availability');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (req.user.role === 'driver' && trip.driver?._id?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'This trip is not assigned to you.' });
+    }
+
+    if (trip.status !== 'en_route') {
+      return res.status(400).json({ success: false, message: 'Trip must be en route to mark hospital arrival.' });
+    }
+
+    if (!trip.pickupVerified) {
+      return res.status(400).json({ success: false, message: 'Patient must be picked up (OTP verified) before marking hospital arrival.' });
+    }
+
+    // Already recorded — idempotent no-op, same as arrivePickup. Don't
+    // re-run GPS resolution or open a second wait segment.
+    if (trip.reachedHospitalAt) {
+      return res.json({ success: true, message: 'Hospital arrival recorded.', reachedHospitalAt: trip.reachedHospitalAt });
+    }
+
+    // ── Resolve a position purely for the record — there's no drop
+    //    coordinate to compare it against yet, so this never verifies or
+    //    blocks. Kept in the same shape as arrivePickup so a real guard
+    //    can slot in later once a drop coordinate exists. ──
+    let gpsSource = 'none';
+    let checkLat, checkLng;
+    if (typeof lat === 'number' && typeof lng === 'number') {
+      gpsSource = 'body';
+      checkLat = lat;
+      checkLng = lng;
+    } else {
+      const avail = trip.driver?.availability;
+      const isFresh = avail?.updatedAt && (Date.now() - new Date(avail.updatedAt).getTime()) <= GPS_STALENESS_MS;
+      if (isFresh && typeof avail.lat === 'number' && typeof avail.lng === 'number') {
+        gpsSource = 'availability';
+        checkLat = avail.lat;
+        checkLng = avail.lng;
+      }
+    }
+
+    const autoReason = gpsSource === 'none'
+      ? 'No current GPS position available (no coordinates sent and no fresh driver location on file).'
+      : 'No drop coordinates exist on this trip to verify proximity against.';
+
+    trip.reachedHospitalAt = new Date();
+
+    // ── Open the drop wait segment, rated from the Pricing collection —
+    //    never hardcoded. One-way is flat-rate; round trip is tiered. ──
+    const pricingDoc = await fareCalculator.findPricingDoc(trip.selectedType);
+    const isRoundTrip = trip.tripType === 'round_trip';
+    trip.waitSegments.push({
+      segmentType: isRoundTrip ? 'drop_return' : 'drop_oneway',
+      startedAt  : trip.reachedHospitalAt,
+      ratePerMin : isRoundTrip ? (pricingDoc?.returnDropWaitTier1PerMin ?? 0) : (pricingDoc?.dropWaitPerMin ?? 0),
+      freeSeconds: (isRoundTrip ? (pricingDoc?.returnDropFreeWaitMinutes ?? 0) : (pricingDoc?.dropFreeWaitMinutes ?? 0)) * 60,
+      ...(isRoundTrip ? {
+        tier1CapMinutes: pricingDoc?.returnDropWaitTier1Minutes ?? 0,
+        tier2RatePerMin: pricingDoc?.returnDropWaitTier2PerMin ?? 0,
+      } : {}),
+    });
+
+    trip.events.push({
+      type    : 'DROP_ARRIVED',
+      at      : trip.reachedHospitalAt,
+      by      : req.user._id,
+      location: gpsSource !== 'none' ? { lat: checkLat, lng: checkLng } : undefined,
+      meta    : {
+        gpsSource,
+        distanceMeters: null,
+        gpsVerified: false,
+        overridden: false,
+        overriddenByRole: undefined,
+        reason: autoReason,
+      },
+    });
+
+    await trip.save();
+
+    return res.json({
+      success: true,
+      message: 'Hospital arrival recorded.',
+      reachedHospitalAt: trip.reachedHospitalAt,
+      gpsSource,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/trips/:id/start-return
+// @desc    Driver taps "Starting Return" on a round trip — marks the start
+//          of the return leg using SERVER time only, and closes the open
+//          drop wait segment right here rather than at completion. Without
+//          this, completeTrip would bracket drop wait as reachedHospitalAt
+//          -> completedAt, billing the entire return drive as waiting time.
+//          Conceptually mirrors BookingTrip's RETURN_STARTED stage, but
+//          lives on Trip since it feeds fare/billing, not the duty log.
+// @access  Private [driver, owner] — driver can only mark their own trip;
+//          owner (CRM dispatcher) can force it for any trip.
+// ============================================================
+exports.startReturn = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id);
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    if (req.user.role === 'driver' && trip.driver?.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ success: false, message: 'This trip is not assigned to you.' });
+    }
+
+    if (trip.tripType !== 'round_trip') {
+      return res.status(400).json({ success: false, message: 'Only round trips have a return leg.' });
+    }
+
+    if (trip.status !== 'en_route') {
+      return res.status(400).json({ success: false, message: 'Trip must be en route to start the return leg.' });
+    }
+
+    if (!trip.reachedHospitalAt) {
+      return res.status(400).json({ success: false, message: 'Mark hospital arrival before starting the return leg.' });
+    }
+
+    // Already recorded — idempotent no-op. Don't reclose an already-closed
+    // segment or push a duplicate event.
+    if (trip.returnStartedAt) {
+      return res.json({ success: true, message: 'Return leg already started.', returnStartedAt: trip.returnStartedAt });
+    }
+
+    trip.returnStartedAt = new Date();
+    trip.closeWaitSegment('drop_return', trip.returnStartedAt);
+
+    trip.events.push({
+      type: 'RETURN_STARTED',
+      at  : trip.returnStartedAt,
+      by  : req.user._id,
+    });
+
+    await trip.save();
+
+    return res.json({ success: true, message: 'Return leg started.', returnStartedAt: trip.returnStartedAt });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   PUT /api/trips/:id/verify-otp
 // @desc    Driver enters the 4-digit pickup OTP the customer shares
 //          at the pickup location. On success, marks the trip's
@@ -674,31 +844,94 @@ exports.completeTrip = async (req, res, next) => {
       return res.status(400).json({ success: false, message: fareErr.message });
     }
 
+    // Bracketing timestamp for both wait calcs below and the trip's own
+    // completedAt — one Date instance so nothing drifts between them.
+    const completedAt = new Date();
+
+    // Rate/free-minutes always come from Pricing — never hardcoded. Fetched
+    // once, shared by both the pickup and drop wait calcs below.
+    const pricingDoc = await fareCalculator.findPricingDoc(trip.selectedType);
+
     // ── 2b. Pickup wait charge — bracketed by arrivedAtPickupAt (driver's
     //      "Reached Pickup" tap) and pickupVerifiedAt (OTP verify). Both
-    //      are optional (older trips / CRM-completed trips won't
-    //      have them), so wait stays 0 unless the full bracket exists.
-    //      Rate/free-minutes always come from Pricing — never hardcoded. ──
+    //      are optional (older trips / CRM-completed trips won't have
+    //      them), so wait stays 0 unless the full bracket exists. Uses the
+    //      same computeSegmentAmount as getLiveWaitState/closeWaitSegment
+    //      (models/index.js) — one implementation of the wait-charge math,
+    //      not a second copy that can drift from it. ──
     let pickupWaitMinutes = 0;
-    let waitCharge        = 0;
+    let pickupWaitCharge  = 0;
     if (trip.arrivedAtPickupAt && trip.pickupVerifiedAt) {
-      const pricingDoc = await fareCalculator.findPricingDoc(trip.selectedType);
-      const freeMin = pricingDoc?.pickupFreeWaitMinutes ?? 0;
-      const perMin  = pricingDoc?.pickupWaitPerMin ?? 0;
-      const rawMinutes = Math.max(0, Math.round((trip.pickupVerifiedAt - trip.arrivedAtPickupAt) / 60000));
-      pickupWaitMinutes = Math.max(0, rawMinutes - freeMin);
-      waitCharge = pickupWaitMinutes * perMin;
+      const elapsedMs = trip.pickupVerifiedAt - trip.arrivedAtPickupAt;
+      const result = computeSegmentAmount(
+        { ratePerMin: pricingDoc?.pickupWaitPerMin ?? 0, freeSeconds: (pricingDoc?.pickupFreeWaitMinutes ?? 0) * 60 },
+        elapsedMs
+      );
+      pickupWaitMinutes = result.billableMinutes;
+      pickupWaitCharge  = result.amount;
     }
+
+    // ── 2c. Drop wait charge — bracketed by reachedHospitalAt (driver's
+    //      "Reached Hospital" tap) and, for a round trip, returnStartedAt
+    //      (driver's "Starting Return" tap) — NOT completedAt, otherwise
+    //      the entire return drive gets billed as waiting time. One-way
+    //      has no return leg, so completedAt is the correct end there.
+    //      If a round trip somehow reaches completion with no
+    //      returnStartedAt (driver skipped the tap, or a trip predates
+    //      this feature), there's no safe way to bracket it — charge Rs 0
+    //      rather than guess against completedAt. Under-charging is
+    //      recoverable (ops can bill it manually after review);
+    //      over-charging is a customer complaint and a refund. Log an
+    //      event and flag the trip either way, so it's visible/auditable
+    //      rather than silently wrong or silently free. ──
+    let dropWaitMinutes = 0;
+    let dropWaitCharge  = 0;
+    if (trip.reachedHospitalAt) {
+      const isRoundTrip = trip.tripType === 'round_trip';
+
+      if (isRoundTrip && !trip.returnStartedAt) {
+        trip.dropWaitNeedsReview = true;
+        trip.events.push({
+          type: 'DROP_WAIT_FALLBACK_COMPLETEDAT',
+          at  : completedAt,
+          by  : req.user._id,
+          meta: {
+            reason: 'Round trip completed with no returnStartedAt — drop wait could not be safely bracketed, charged Rs 0 and flagged for manual review.',
+          },
+        });
+      } else {
+        const dropWaitEndedAt = isRoundTrip ? trip.returnStartedAt : completedAt;
+        const elapsedMs = dropWaitEndedAt - trip.reachedHospitalAt;
+        const segmentShape = isRoundTrip
+          ? {
+              ratePerMin     : pricingDoc?.returnDropWaitTier1PerMin ?? 0,
+              freeSeconds    : (pricingDoc?.returnDropFreeWaitMinutes ?? 0) * 60,
+              tier1CapMinutes: pricingDoc?.returnDropWaitTier1Minutes ?? 0,
+              tier2RatePerMin: pricingDoc?.returnDropWaitTier2PerMin ?? 0,
+            }
+          : {
+              ratePerMin : pricingDoc?.dropWaitPerMin ?? 0,
+              freeSeconds: (pricingDoc?.dropFreeWaitMinutes ?? 0) * 60,
+            };
+
+        const result = computeSegmentAmount(segmentShape, elapsedMs);
+        dropWaitMinutes = result.billableMinutes;
+        dropWaitCharge  = result.amount;
+      }
+    }
+
+    const totalWaitCharge = pickupWaitCharge + dropWaitCharge;
     trip.pickupWaitMinutes = pickupWaitMinutes;
-    trip.waitCharge        = waitCharge;
+    trip.dropWaitMinutes   = dropWaitMinutes;
+    trip.waitCharge        = totalWaitCharge;
 
     trip.baseFare     = fare.baseFare;
     trip.additionalCharges = fare.additionalCharges;
     trip.totalFare    = fare.subTotal;
     trip.gstAmount    = fare.gstAmount;
-    trip.grandTotal   = fare.grandTotal + waitCharge;
+    trip.grandTotal   = fare.grandTotal + totalWaitCharge;
     trip.status       = 'completed';
-    trip.completedAt  = new Date();
+    trip.completedAt  = completedAt;
     trip.closeAllOpenWaitSegments(trip.completedAt);
     await trip.save();
 
@@ -1319,11 +1552,10 @@ exports.trackTrip = async (req, res, next) => {
     const ratingCount = trip.driver?.ratingCount || 0;
 
     // Full bill breakdown — only once completed, and only the fields
-    // that are actually real: dropWaitMinutes/trafficWaitMinutes are
-    // schema fields that are never computed anywhere today (no "arrived
-    // at drop" driver action exists to bracket drop-wait against), so
-    // they're deliberately omitted here rather than shown as a fake ₹0
-    // line. pickupWaitMinutes/waitCharge ARE real (computed in
+    // that are actually real: trafficWaitMinutes is a schema field never
+    // computed anywhere today (no traffic-wait driver action exists), so
+    // it's deliberately omitted here rather than shown as a fake ₹0 line.
+    // pickupWaitMinutes/dropWaitMinutes/waitCharge ARE real (computed in
     // completeTrip) and included.
     let bill = null;
     if (trip.status === 'completed' && trip.billId) {
@@ -1331,6 +1563,7 @@ exports.trackTrip = async (req, res, next) => {
         baseFare         : trip.billId.baseFare,
         distanceKm       : trip.billId.distanceKm,
         pickupWaitMinutes: trip.pickupWaitMinutes,
+        dropWaitMinutes  : trip.dropWaitMinutes,
         waitCharge       : trip.billId.waitCharge,
         additionalCharges: trip.billId.additionalCharges,
         gstAmount        : trip.billId.gstAmount,

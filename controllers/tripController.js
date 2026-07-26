@@ -23,6 +23,34 @@ const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
 const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 const { haversineKm } = require('../utils/haversine');
+const axios = require('axios');
+
+const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
+
+// Independently verifies road distance server-side via Google Directions,
+// using the trip's own coordinates — never trusts the client-submitted
+// dist/effectiveDist for billing (a client bug, like the website's old
+// silent Haversine fallback, or outright tampering, could otherwise
+// underprice a trip). Returns null if coordinates are incomplete or the
+// Google call fails, so the caller can fall back safely rather than
+// hard-blocking every booking on a Google outage. Same GOOGLE_MAPS_API_KEY
+// env var placesController.js already uses for /api/places/directions.
+async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
+  if (![originLat, originLng, destLat, destLng].every(Number.isFinite)) return null;
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const { data } = await axios.get(GOOGLE_DIRECTIONS_URL, {
+      params : { origin: `${originLat},${originLng}`, destination: `${destLat},${destLng}`, key: apiKey },
+      timeout: 5000,
+    });
+    const leg = data.routes?.[0]?.legs?.[0];
+    if (!leg) return null;
+    return leg.distance.value / 1000;
+  } catch {
+    return null;
+  }
+}
 
 // ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
 // registrationNumber. Both schemas already normalize to uppercase+trim
@@ -171,6 +199,7 @@ exports.createTrip = async (req, res, next) => {
       leadId,
       // Customer app fields
       pickupLabel, dropLabel, dist, effectiveDist,
+      dropLat, dropLng,
       scheduleType, scheduleDate, selectedType,
       tripType, returnAddress, acEnabled,
       paymentPreference,
@@ -181,9 +210,16 @@ exports.createTrip = async (req, res, next) => {
     const PAYMENT_PREFS = ['cash', 'upi', 'card'];
     const validPaymentPreference = PAYMENT_PREFS.includes(paymentPreference) ? paymentPreference : undefined;
 
-    // Authoritative distance for billing: the round-trip-aware effectiveDist
-    // computed by the client, falling back to the one-way dist.
-    const distanceKm = effectiveDist ?? dist ?? 0;
+    // Authoritative distance for billing — never trust the client-submitted
+    // dist/effectiveDist outright. Independently re-verify the real road
+    // distance via Google Directions from the trip's own coordinates; only
+    // fall back to the client-submitted figure if verification isn't
+    // possible (client not yet sending dropLat/dropLng, or the Google call
+    // itself fails) so a booking never hard-blocks on that.
+    const verifiedOneWayKm = await verifyRoadDistanceKm(pickupLat, pickupLng, dropLat, dropLng);
+    const distanceKm = verifiedOneWayKm != null
+      ? (tripType === 'round_trip' ? verifiedOneWayKm * 2 : verifiedOneWayKm)
+      : (effectiveDist ?? dist ?? 0);
 
     // ── Compute the authoritative fare server-side from MongoDB Pricing —
     //    never trust a client-supplied baseFare/perKmRate/totalFare. ──────

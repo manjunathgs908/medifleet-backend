@@ -451,6 +451,24 @@ const tripEventSchema = new Schema(
   { _id: true }
 );
 
+// Masked driver<->customer calls placed via Exotel Connect (see
+// services/exotelService.js + routes/callRoutes.js). One entry per call
+// leg initiated from either app; POST /api/call/status (the Exotel
+// webhook) fills in status/recordingUrl/durationSec/endedAt once the
+// call finishes.
+const callLogSchema = new Schema(
+  {
+    callSid    : { type: String, required: true },
+    initiator  : { type: String, enum: ['driver', 'customer'], required: true },
+    status     : { type: String }, // Exotel call status, e.g. 'in-progress', 'completed', 'failed', 'busy', 'no-answer'
+    recordingUrl: { type: String },
+    durationSec: { type: Number },
+    startedAt  : { type: Date, required: true },
+    endedAt    : { type: Date },
+  },
+  { _id: true }
+);
+
 const waitSegmentSchema = new Schema(
   {
     segmentType: { type: String, enum: ['pickup', 'traffic', 'drop_oneway', 'drop_return'], required: true },
@@ -571,6 +589,11 @@ const tripSchema = new Schema(
     // independent of this array, until the two are verified to agree on
     // real trips.
     waitSegments: { type: [waitSegmentSchema], default: [] },
+
+    // ── Masked call log — see callLogSchema above. One entry per call
+    // leg placed via POST /api/call/connect, filled in by the Exotel
+    // status webhook once the call ends.
+    callLogs: { type: [callLogSchema], default: [] },
 
     // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     status: {

@@ -10,6 +10,7 @@
 
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const { Trip } = require('../models');
 const { connectCall } = require('../services/exotelService');
 
@@ -39,7 +40,10 @@ router.post('/connect', async (req, res, next) => {
       });
     }
 
-    const trip = await Trip.findById(tripId).populate('driver', 'name phone');
+    const query = mongoose.Types.ObjectId.isValid(tripId)
+      ? { _id: tripId }
+      : { tripNumber: tripId };
+    const trip = await Trip.findOne(query).populate('driver', 'name phone');
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
 
     if (!trip.driver?.phone) {

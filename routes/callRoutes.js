@@ -20,6 +20,21 @@ const { connectCall } = require('../services/exotelService');
 // production, since Exotel can't reach a localhost dev server anyway.
 const STATUS_CALLBACK_URL = 'https://api.savelife.health/api/call/status';
 
+// Same 10-digit Indian mobile pattern already enforced on User.phone
+// (models/index.js) — rejects missing values, the literal 'N/A'
+// placeholder some old trips have, and anything that isn't a real
+// 6-9-leading mobile number once a +91/91/0 prefix is stripped.
+function isValidIndianMobile(raw) {
+  if (!raw) return false;
+  const trimmed = String(raw).trim();
+  if (!trimmed || trimmed === 'N/A') return false;
+  const digits = trimmed.replace(/\D/g, '');
+  let local = digits;
+  if (digits.length === 12 && digits.startsWith('91')) local = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith('0')) local = digits.slice(1);
+  return /^[6-9]\d{9}$/.test(local);
+}
+
 // ============================================================
 // @route   POST /api/call/connect
 // @desc    Places a masked call between the trip's driver and customer.
@@ -46,15 +61,24 @@ router.post('/connect', async (req, res, next) => {
     const trip = await Trip.findOne(query).populate('driver', 'name phone');
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
 
-    if (!trip.driver?.phone) {
-      return res.status(400).json({ success: false, message: 'No driver assigned to this trip yet.' });
-    }
-    if (!trip.patientPhone) {
-      return res.status(400).json({ success: false, message: 'This trip has no customer phone number.' });
+    const driverPhone   = trip.driver?.phone;
+    const customerPhone = trip.patientPhone;
+
+    // Validate BOTH numbers before ever calling Exotel — a masked call is
+    // useless (and a wasted Exotel dial) if either leg can't actually be
+    // reached. Driver checked first so its message wins if both are bad.
+    const invalidDriverPhone   = !isValidIndianMobile(driverPhone);
+    const invalidCustomerPhone = !isValidIndianMobile(customerPhone);
+
+    if (invalidDriverPhone || invalidCustomerPhone) {
+      const side  = invalidDriverPhone ? 'Driver' : 'Customer';
+      const value = (invalidDriverPhone ? driverPhone : customerPhone) || 'missing';
+      return res.status(400).json({
+        success: false,
+        message: `${side} phone number is not valid on this trip (${value}).`,
+      });
     }
 
-    const driverPhone   = trip.driver.phone;
-    const customerPhone = trip.patientPhone;
     const from = initiator === 'driver' ? driverPhone : customerPhone;
     const to   = initiator === 'driver' ? customerPhone : driverPhone;
 

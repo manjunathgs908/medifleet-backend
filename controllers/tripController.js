@@ -1404,12 +1404,18 @@ exports.getTrips = async (req, res, next) => {
       .skip(skip)
       .limit(Number(limit));
 
+    // Drivers get masked calling (POST /api/call/connect) instead of the
+    // customer's raw number — owner/CRM still sees it for support/dispatch.
+    const tripsOut = req.user.role === 'driver'
+      ? trips.map(t => { const o = t.toObject(); delete o.patientPhone; return o; })
+      : trips;
+
     return res.json({
       success: true,
       total,
       pages: Math.ceil(total / limit),
       currentPage: Number(page),
-      trips,
+      trips: tripsOut,
     });
   } catch (err) {
     next(err);
@@ -1458,9 +1464,15 @@ exports.getLiveBoard = async (req, res, next) => {
 
     const availableVehicles = [...vehicleEntries, ...ambulanceEntries];
 
+    // Drivers get masked calling (POST /api/call/connect) instead of the
+    // customer's raw number — owner/CRM still sees it for support/dispatch.
+    const liveTripsOut = req.user.role === 'driver'
+      ? activeTrips.map(t => { const o = t.toObject(); delete o.patientPhone; return o; })
+      : activeTrips;
+
     return res.json({
       success: true,
-      liveTrips       : activeTrips,
+      liveTrips       : liveTripsOut,
       availableVehicles,
       counts: {
         active   : activeTrips.length,
@@ -1497,6 +1509,10 @@ exports.getTripById = async (req, res, next) => {
     const tripObj = trip.toObject();
     tripObj.waitState = trip.getLiveWaitState();
 
+    // Drivers get masked calling (POST /api/call/connect) instead of the
+    // customer's raw number — owner/CRM still sees it for support/dispatch.
+    if (req.user.role === 'driver') delete tripObj.patientPhone;
+
     return res.json({ success: true, trip: tripObj });
   } catch (err) {
     next(err);
@@ -1508,9 +1524,11 @@ exports.getTripById = async (req, res, next) => {
 // @route   GET /api/trips/:id/track
 // @desc    Public, minimal trip info for the customer app's tracking
 //          screen — no login required. Deliberately exposes only
-//          what's needed to show live status (driver name/phone,
+//          what's needed to show live status (driver name,
 //          vehicle number, status) and nothing sensitive (fare,
-//          OTP, internal notes, bookedBy, etc).
+//          OTP, internal notes, bookedBy, etc). Driver's raw phone is
+//          NOT included — masked calling via POST /api/call/connect
+//          is the only way to reach them.
 // @access  Public
 // ============================================================
 // Rough straight-line ETA assumption for ambulance urban traffic — not
@@ -1526,7 +1544,7 @@ exports.trackTrip = async (req, res, next) => {
       .select('+pickupOtp')
       .populate('vehicle', 'registrationNumber type')
       .populate('ambulance', 'registrationNumber serviceType serviceTypeLabel vehicleModel year')
-      .populate('driver', 'name phone availability ratingSum ratingCount completedTripsCount')
+      .populate('driver', 'name availability ratingSum ratingCount completedTripsCount')
       .populate('billId');
 
     if (!trip) {
@@ -1621,7 +1639,6 @@ exports.trackTrip = async (req, res, next) => {
         paymentPreference: trip.paymentPreference,
         driver        : showDriver ? {
           name               : trip.driver.name,
-          phone              : trip.driver.phone,
           ratingAvg          : ratingCount > 0 ? Math.round((trip.driver.ratingSum / ratingCount) * 10) / 10 : null,
           ratingCount,
           completedTripsCount: trip.driver.completedTripsCount || 0,

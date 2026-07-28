@@ -243,6 +243,11 @@ exports.createTrip = async (req, res, next) => {
       pickup        : { address: pickupAddress || pickupLabel, lat: pickupLat, lng: pickupLng },
       dropHospital  : dropHospitalId || undefined,
       dropAddress   : dropAddress   || dropLabel,
+      // Additive — already received above (used transiently for
+      // verifyRoadDistanceKm), just never stored until now. Undefined on
+      // trips from a client that doesn't send them, same as pickupLat/Lng.
+      dropLat       : dropLat,
+      dropLng       : dropLng,
       selectedType,
       tripType      : tripType || 'one_way',
       returnAddress : tripType === 'round_trip' ? returnAddress : undefined,
@@ -1581,11 +1586,14 @@ exports.trackTrip = async (req, res, next) => {
     }
 
     // Live driver position + a rough distance/ETA to the pickup point —
-    // only meaningful pre-pickup (booked/dispatched/en_route-to-pickup);
-    // there's no drop-side lat/lng anywhere in the schema today (Hospital
-    // has only a free-text address, dropAddress likewise), so a live ETA
-    // to the drop point isn't computable yet — deliberately omitted
-    // rather than faked.
+    // only meaningful pre-pickup (booked/dispatched/en_route-to-pickup).
+    // trip.dropLat/dropLng now exist (added alongside the money-loss fix's
+    // server-side distance verification, persisted as of this pass) but
+    // are optional — older trips or a client that hasn't updated won't
+    // have them — so a live ETA to the drop point stays deliberately
+    // unbuilt here rather than assuming they're always present; the
+    // fields themselves are still returned below for callers that can
+    // use them when they exist (see the driver app's proximity gate).
     let driverLocation = null;
     let distanceToPickupKm = null;
     let etaMinutes = null;
@@ -1646,6 +1654,8 @@ exports.trackTrip = async (req, res, next) => {
         vehicle       : vehicleInfo,
         pickup        : trip.pickup,
         dropAddress   : trip.dropAddress,
+        dropLat       : trip.dropLat,
+        dropLng       : trip.dropLng,
         driverLocation,
         distanceToPickupKm,
         etaMinutes,

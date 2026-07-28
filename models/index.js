@@ -510,6 +510,15 @@ const tripSchema = new Schema(
     },
     dropHospital  : { type: Schema.Types.ObjectId, ref: 'Hospital' },
     dropAddress   : { type: String },
+    // Additive — savelife-web/savelife-app already send these (added
+    // alongside the money-loss fix, where createTrip uses them to verify
+    // road distance server-side) but they were never persisted. Optional:
+    // trips booked before this field existed, or from a client that
+    // hasn't updated, simply have neither set — callers must treat a
+    // missing dropLat/dropLng as "no drop coordinate for this trip" and
+    // fall back to dropAddress/dropHospital, never assume they're present.
+    dropLat       : { type: Number },
+    dropLng       : { type: Number },
 
     // â”€â”€ Trip / Schedule details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     selectedType  : { type: String }, // Vehicle/service type id, matched against Pricing.serviceType

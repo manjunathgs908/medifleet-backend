@@ -16,7 +16,7 @@
 const Assignment = require('../models/Assignment');
 const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
-const { Trip }    = require('../models');
+const { Trip, User } = require('../models');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 
 function toLocation(lat, lng) {
@@ -398,6 +398,82 @@ exports.getFleetShiftStatus = async (req, res, next) => {
     }));
 
     return res.json({ success: true, fleet });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   PUT /api/assignments/:driverId/force-end-duty
+// @desc    Owner-triggered escape hatch for a driver whose app session is
+//          gone (device lost/reinstalled/factory-reset) — the normal
+//          end-duty flow needs a driver JWT, and unbind-device refuses
+//          while on duty, so a driver stuck this way otherwise has no way
+//          out short of a one-off DB script. Reuses endDuty's exact close
+//          logic (Shift -> Assignment -> Ambulance), just keyed by
+//          :driverId instead of req.user._id, and with no lat/lng (no
+//          device to report a location from). Keeps the same trip-safety
+//          rule as unbindDevice/logout — refuses if the driver has a live
+//          trip, so an owner can force-close an abandoned duty but can
+//          never force-abandon a trip that's actually in progress.
+// @access  Private [owner] (protectOwner)
+// ============================================================
+exports.forceEndDuty = async (req, res, next) => {
+  try {
+    const { driverId } = req.params;
+
+    // Scoped to this owner's own fleet — same guard as every other
+    // owner-facing driver lookup in this codebase (e.g. approveDriver).
+    const driver = await User.findOne({ _id: driverId, role: 'driver', owner: req.user._id });
+    if (!driver) {
+      return res.status(404).json({ success: false, message: 'Driver not found.' });
+    }
+
+    const activeTrip = await Trip.findOne({ driver: driverId, status: { $in: ['dispatched', 'en_route'] } });
+    if (activeTrip) {
+      return res.status(403).json({ success: false, message: "This driver is on an active trip and can't be force-ended right now." });
+    }
+
+    const shift = await Shift.findOne({ driver: driverId, status: { $in: ['active', 'break'] } });
+    if (!shift) {
+      return res.status(404).json({ success: false, message: 'No active shift found for this driver.' });
+    }
+
+    const assignment = await Assignment.findOne({ driver: driverId, active: true });
+    if (!assignment) {
+      return res.status(404).json({ success: false, message: 'No active assignment found for this driver.' });
+    }
+
+    const now = new Date();
+
+    const openBreak = shift.breaks.find(b => !b.endedAt);
+    if (openBreak) openBreak.endedAt = now;
+
+    const totalBreakMs = shift.breaks.reduce((sum, b) => {
+      const end = b.endedAt || now;
+      return sum + Math.max(0, end - b.startedAt);
+    }, 0);
+
+    const totalShiftMs = now - shift.shiftStart;
+    const workingMs     = Math.max(0, totalShiftMs - totalBreakMs);
+
+    shift.status              = 'ended';
+    shift.shiftEnd            = now;
+    shift.totalWorkingMinutes = Math.round((workingMs / 60000) * 100) / 100;
+    await shift.save();
+
+    assignment.active  = false;
+    assignment.endTime = now;
+    await assignment.save();
+
+    const ambulance = await Ambulance.findById(assignment.ambulance);
+    if (ambulance) {
+      ambulance.status         = 'available';
+      ambulance.assignedDriver = null;
+      await ambulance.save();
+    }
+
+    return res.json({ success: true, message: 'Duty force-ended.', shift, assignment });
   } catch (err) {
     next(err);
   }

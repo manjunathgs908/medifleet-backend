@@ -22,6 +22,9 @@ router.get ('/my-active',  protect, authorize('driver'), ctrl.getMyActiveShift);
 router.get ('/my-history', protect, authorize('driver'), ctrl.getAssignmentHistory);
 
 // Private [owner]
-router.get ('/fleet-status', protectOwner, authorize('owner'), requireKycApproved, ctrl.getFleetShiftStatus);
+router.get('/fleet-status', protectOwner, authorize('owner'), requireKycApproved, ctrl.getFleetShiftStatus);
+// Escape hatch for a driver stuck on duty with no live app session (device
+// lost/reinstalled) — see forceEndDuty's own comment in the controller.
+router.put('/:driverId/force-end-duty', protectOwner, authorize('owner'), requireKycApproved, ctrl.forceEndDuty);
 
 module.exports = router;

@@ -18,6 +18,7 @@ const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMes
 const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const { sendPush } = require('../utils/pushService');
+const { sendFullScreenTrip } = require('../utils/fcmService');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
@@ -346,8 +347,13 @@ const dispatchTripToDriver = async (trip, driverId) => {
     targetRole  : 'driver',
   });
 
-  const driverUser = await User.findById(driverId).select('pushToken');
+  const driverUser = await User.findById(driverId).select('pushToken fcmToken');
   sendPush(driverUser?.pushToken, '🚑 New Trip Assigned', `${trip.patientName} — ${trip.pickup.address}`, { tripId: trip._id.toString() });
+  // Phase 2 — additive, alongside the Expo push above, not instead of it.
+  // Both are fire-and-forget; sendFullScreenTrip's own internal try/catch
+  // (utils/fcmService.js) means a failure here can never affect dispatch or
+  // the Expo push, which stays completely untouched.
+  sendFullScreenTrip(driverUser?.fcmToken, trip);
 };
 
 // ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced

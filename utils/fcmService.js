@@ -45,12 +45,31 @@ try {
 // fcmToken/trip may be missing or incomplete — always no-ops rather than
 // throwing, same fire-and-forget contract as sendPush. FCM data payloads
 // only accept strings, so every field is coerced explicitly.
+//
+// Logs one line per attempt, every branch — not just failures. Render logs
+// otherwise give no way to tell "this was never called", "it was called
+// but skipped (no messaging/token/trip)", and "it was called and actually
+// sent" apart from each other.
 exports.sendFullScreenTrip = async (fcmToken, trip) => {
-  if (!messaging || !fcmToken || !trip) return;
+  const tripId = trip?._id?.toString() || '(no trip)';
+
+  if (!messaging) {
+    console.log(`[fcmService] sendFullScreenTrip skipped for trip ${tripId} — firebase-admin not initialised.`);
+    return;
+  }
+  if (!fcmToken) {
+    console.log(`[fcmService] sendFullScreenTrip skipped for trip ${tripId} — no fcmToken on driver.`);
+    return;
+  }
+  if (!trip) {
+    console.log('[fcmService] sendFullScreenTrip skipped — no trip provided.');
+    return;
+  }
+
   try {
     const fare = (trip.baseFare || 0) + (trip.additionalCharges || 0);
 
-    await messaging.send({
+    const messageId = await messaging.send({
       token: fcmToken,
       // No `notification` field — see file header. Data-only.
       data: {
@@ -67,7 +86,9 @@ exports.sendFullScreenTrip = async (fcmToken, trip) => {
         priority: 'high',
       },
     });
+
+    console.log(`[fcmService] sendFullScreenTrip OK for trip ${tripId} — messageId: ${messageId}`);
   } catch (err) {
-    console.error('Full-screen trip push failed:', err.message);
+    console.error(`[fcmService] sendFullScreenTrip FAILED for trip ${tripId} — ${err.code || ''} ${err.message}`);
   }
 };

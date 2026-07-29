@@ -167,6 +167,13 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // location call (already fires every ~10s while on duty) rather
     // than a separate registration endpoint. See utils/pushService.js.
     pushToken: { type: String },
+
+    // Raw FCM device token — Phase 1 of the full-screen incoming-trip card.
+    // Deliberately separate from pushToken (different delivery pipeline:
+    // direct FCM, for a planned full-screen-intent send path, not Expo's
+    // push relay). Additive only — nothing reads this yet; sendPush/
+    // utils/pushService.js is untouched and still uses pushToken alone.
+    fcmToken: { type: String },
   },
   { timestamps: true }
 );

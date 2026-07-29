@@ -728,7 +728,7 @@ exports.uploadDriverDocument = async (req, res, next) => {
 // ============================================================
 exports.updateLocation = async (req, res, next) => {
   try {
-    const { lat, lng, status, pushToken } = req.body;
+    const { lat, lng, status, pushToken, fcmToken } = req.body;
 
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       return res.status(400).json({ success: false, message: 'lat and lng (numbers) are required.' });
@@ -750,6 +750,14 @@ exports.updateLocation = async (req, res, next) => {
     // fresh with zero extra requests from the driver app.
     if (pushToken) {
       update.pushToken = pushToken;
+    }
+
+    // Raw FCM device token — Phase 1 of the full-screen incoming-trip card.
+    // Same piggyback reasoning as pushToken above, but a fully separate
+    // field; nothing reads it yet (sendPush/pushService.js still only uses
+    // pushToken).
+    if (fcmToken) {
+      update.fcmToken = fcmToken;
     }
 
     const user = await User.findByIdAndUpdate(req.user._id, update, { new: true });

@@ -77,6 +77,19 @@ const userSchema = new Schema(
     shiftType     : { type: String, enum: ['day', 'night', 'flexible'], default: 'day' },
 driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 'shift_driver' },
 
+    // -- Fixed corporate posting (SaveLife's own employed drivers only --
+    // see User.owner) -- static property of the driver, not a schedule:
+    // one shift length, one location, assigned permanently. No default on
+    // shiftHours deliberately -- unset means "not yet configured for this
+    // driver," which the auto-attendance write (endDuty) and the geofence
+    // check both treat as "skip, don't guess," not as a 0-hour shift.
+    // postingLat/postingLng are likewise left unset until an owner fills
+    // them in; the geofence check skips entirely without both.
+    shiftHours  : { type: Number, enum: [8, 12, 24] },
+    postingName : { type: String, trim: true },
+    postingLat  : { type: Number },
+    postingLng  : { type: Number },
+
     // â”€â”€ Salary configuration (used by salary engine) â”€â”€â”€â”€â”€â”€â”€â”€â”€
     baseSalary  : { type: Number, default: 15000 },  // Fixed monthly component
     perTripBonus: { type: Number, default: 100 },    // Bonus per completed trip

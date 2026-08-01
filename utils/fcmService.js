@@ -77,6 +77,8 @@ exports.sendFullScreenTrip = async (fcmToken, trip) => {
         tripNumber   : trip.tripNumber || '',
         patientName  : trip.patientName || '',
         pickupAddress: trip.pickup?.address || '',
+        pickupLat    : String(trip.pickup?.lat ?? ''),
+        pickupLng    : String(trip.pickup?.lng ?? ''),
         dropAddress  : trip.dropAddress || '',
         distanceKm   : String(trip.distanceKm ?? ''),
         fare         : String(fare),

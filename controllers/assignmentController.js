@@ -16,7 +16,7 @@
 const Assignment = require('../models/Assignment');
 const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
-const { Trip, User } = require('../models');
+const { Trip, User, Attendance } = require('../models');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 
 function toLocation(lat, lng) {
@@ -244,6 +244,50 @@ exports.endDuty = async (req, res, next) => {
     shift.totalWorkingMinutes = Math.round((workingMs / 60000) * 100) / 100;
     shift.logoutLocation      = location;
     await shift.save();
+
+    // Auto-attendance — the only place Attendance ever gets written now
+    // (see routes/attendance.js: the old manual clock-in/out stubs never
+    // actually persisted anything). shiftHours is a static per-driver
+    // posting property (see User model), not a schedule; unset means this
+    // driver isn't configured for fixed-posting attendance yet — skip
+    // rather than guess a threshold, but log it so the gap is visible.
+    // Bucketed under shiftStart's calendar date even for an overnight/24h
+    // shift — "which day did he report for duty" is the record, not which
+    // day it happened to end.
+    if (!req.user.shiftHours) {
+      console.log(`[attendance] Skipping auto-attendance for driver ${driverId} — shiftHours not configured.`);
+    } else {
+      try {
+        const attendanceDate = new Date(shift.shiftStart);
+        attendanceDate.setHours(0, 0, 0, 0);
+
+        const requiredMinutes = req.user.shiftHours * 60;
+        const worked = shift.totalWorkingMinutes;
+        const status = worked >= requiredMinutes ? 'present'
+          : worked >= requiredMinutes / 2 ? 'half_day'
+          : 'absent';
+
+        // Attendance.shift only has day/night (no 'flexible', unlike
+        // User.shiftType) — flexible maps to day.
+        const attendanceShift = req.user.shiftType === 'night' ? 'night' : 'day';
+
+        await Attendance.findOneAndUpdate(
+          { driver: driverId, date: attendanceDate },
+          {
+            shift: attendanceShift,
+            clockIn: shift.shiftStart,
+            clockOut: now,
+            durationMinutes: shift.totalWorkingMinutes,
+            status,
+          },
+          { upsert: true, setDefaultsOnInsert: true }
+        );
+      } catch (attendanceErr) {
+        // Never let attendance recording block duty ending itself — the
+        // driver going off duty must always succeed.
+        console.log(`[attendance] Could not write auto-attendance for driver ${driverId}:`, attendanceErr.message);
+      }
+    }
 
     assignment.active      = false;
     assignment.endTime     = now;

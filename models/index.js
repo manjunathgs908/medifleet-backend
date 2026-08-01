@@ -107,6 +107,18 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
       updatedAt: { type: Date,   default: Date.now },
       lat      : { type: Number },
       lng      : { type: Number },
+      accuracy : { type: Number }, // meters -- horizontal accuracy of the last lat/lng fix, from expo-location
+
+      // -- Geofence excursion tracking (see authController.updateLocation) --
+      // outsidePostingSince is set the moment a ping first lands >150m
+      // from postingLat/postingLng, cleared the moment a ping lands back
+      // within it (or the driver goes on_trip -- see updateLocation).
+      // leftPostingEventWritten distinguishes "still within the
+      // 10-minute grace window" from "already recorded a LEFT_POSTING
+      // for this excursion" -- without it, every ping past the
+      // 10-minute mark would write a duplicate event.
+      outsidePostingSince    : { type: Date },
+      leftPostingEventWritten: { type: Boolean, default: false },
     },
 
     profileImage : { type: String }, // Cloudinary URL

@@ -17,6 +17,8 @@ const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
 const { User, Trip } = require('../models');
 const Shift = require('../models/Shift');
+const GeofenceEvent = require('../models/GeofenceEvent');
+const { haversineKm } = require('../utils/haversine');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
@@ -719,6 +721,10 @@ exports.uploadDriverDocument = async (req, res, next) => {
 };
 
 
+const GEOFENCE_RADIUS_METERS       = 150;
+const GEOFENCE_MIN_ACCURACY_METERS = 50;  // a ping worse (larger) than this is ignored entirely
+const GEOFENCE_LEFT_THRESHOLD_MS   = 10 * 60 * 1000; // continuous time outside before LEFT_POSTING fires
+
 // ============================================================
 // @route   PUT /api/driver-auth/location
 // @desc    Driver updates their own current lat/lng + availability
@@ -728,7 +734,7 @@ exports.uploadDriverDocument = async (req, res, next) => {
 // ============================================================
 exports.updateLocation = async (req, res, next) => {
   try {
-    const { lat, lng, status, pushToken, fcmToken } = req.body;
+    const { lat, lng, status, pushToken, fcmToken, accuracy } = req.body;
 
     if (typeof lat !== 'number' || typeof lng !== 'number') {
       return res.status(400).json({ success: false, message: 'lat and lng (numbers) are required.' });
@@ -745,6 +751,10 @@ exports.updateLocation = async (req, res, next) => {
       update['availability.status'] = status;
     }
 
+    if (typeof accuracy === 'number') {
+      update['availability.accuracy'] = accuracy;
+    }
+
     // Piggybacked rather than a separate registration endpoint — this
     // call already fires every ~10s while on duty, so the token stays
     // fresh with zero extra requests from the driver app.
@@ -758,6 +768,73 @@ exports.updateLocation = async (req, res, next) => {
     // pushToken).
     if (fcmToken) {
       update.fcmToken = fcmToken;
+    }
+
+    // — Geofence check (warning/recording only, see GeofenceEvent) —
+    // req.user is this driver's state as fetched at the START of this
+    // request (protect middleware) — i.e. BEFORE this ping's own write
+    // below, exactly the "previous ping" snapshot needed to detect a
+    // transition. Piggybacks onto the SAME findByIdAndUpdate call below
+    // rather than a separate write: the two tracking fields only get
+    // added to `update` on an actual state change, so this costs nothing
+    // extra on the pings where nothing changes.
+    const effectiveStatus  = update['availability.status'] || req.user.availability?.status;
+    const outsideSince     = req.user.availability?.outsidePostingSince || null;
+    const leftEventWritten = !!req.user.availability?.leftPostingEventWritten;
+
+    if (effectiveStatus === 'on_trip') {
+      // A trip ends at a hospital, not at the driver's posting — a frozen
+      // excursion clock would fire a false LEFT_POSTING once he's back to
+      // 'available' and still driving back. Clear on the first on_trip
+      // ping (a no-op on every ping after — nothing left to clear) so the
+      // 10-minute timer always starts fresh after a trip.
+      if (outsideSince || leftEventWritten) {
+        update['availability.outsidePostingSince']     = null;
+        update['availability.leftPostingEventWritten'] = false;
+      }
+    } else {
+      const hasPosting = req.user.postingLat != null && req.user.postingLng != null;
+      const accuracyOk = typeof accuracy === 'number' && accuracy <= GEOFENCE_MIN_ACCURACY_METERS;
+
+      // 'available' is the only status that means "on duty, not on a
+      // trip" — this single check covers both "skip if on_trip" (already
+      // routed to the branch above) and "skip if not on duty" at once.
+      if (accuracyOk && hasPosting && effectiveStatus === 'available') {
+        const distanceMeters = haversineKm(lat, lng, req.user.postingLat, req.user.postingLng) * 1000;
+        const now = new Date();
+
+        if (distanceMeters > GEOFENCE_RADIUS_METERS) {
+          if (!outsideSince) {
+            // Just crossed outside — start tracking, no event yet.
+            update['availability.outsidePostingSince']     = now;
+            update['availability.leftPostingEventWritten'] = false;
+          } else if (!leftEventWritten && (now - outsideSince) >= GEOFENCE_LEFT_THRESHOLD_MS) {
+            // Continuously outside for 10+ minutes — record exactly once.
+            update['availability.leftPostingEventWritten'] = true;
+            GeofenceEvent.create({
+              driverId: req.user._id,
+              type    : 'LEFT_POSTING',
+              meta    : { distanceMeters: Math.round(distanceMeters), accuracy, outsideSince },
+            }).catch((err) => console.log('[geofence] Could not log LEFT_POSTING:', err.message));
+          }
+          // else: still outside, already recorded — no write at all.
+        } else if (outsideSince) {
+          // Back within radius. Only emit RETURNED_TO_POSTING if a
+          // LEFT_POSTING was actually recorded for this excursion — a
+          // driver who wandered out for 3 minutes and came back generates
+          // no event at all, matching "one event per departure."
+          if (leftEventWritten) {
+            GeofenceEvent.create({
+              driverId: req.user._id,
+              type    : 'RETURNED_TO_POSTING',
+              meta    : { distanceMeters: Math.round(distanceMeters), accuracy },
+            }).catch((err) => console.log('[geofence] Could not log RETURNED_TO_POSTING:', err.message));
+          }
+          update['availability.outsidePostingSince']     = null;
+          update['availability.leftPostingEventWritten'] = false;
+        }
+        // else: was already inside, still inside — no-op.
+      }
     }
 
     const user = await User.findByIdAndUpdate(req.user._id, update, { new: true });

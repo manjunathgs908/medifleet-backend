@@ -9,7 +9,7 @@ const { Trip } = require('../models');
 // snapshot, not a historical record: once the trip is confirmed/declined/
 // reassigned it naturally drops out of this list on its own. from/to only
 // filters the persisted event types; it doesn't apply to NO_RESPONSE.
-const NO_RESPONSE_STALE_MS = 2 * 60 * 1000; // 2 min — native call's own 30s ring timeout, plus generous margin for dispatch/delivery latency
+const NO_RESPONSE_STALE_MS = 2 * 60 * 1000; // 2 min — native call's own 60s ring timeout, plus generous margin for dispatch/delivery latency
 
 // Owner-facing query — "did this app actually get this push". Raw event
 // list (persisted events + live NO_RESPONSE snapshot); computing "sent with

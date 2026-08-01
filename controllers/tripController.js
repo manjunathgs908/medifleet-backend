@@ -19,6 +19,7 @@ const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const { sendPush } = require('../utils/pushService');
 const { sendFullScreenTrip } = require('../utils/fcmService');
+const TripCallEvent = require('../models/TripCallEvent');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
@@ -354,6 +355,18 @@ const dispatchTripToDriver = async (trip, driverId) => {
   // (utils/fcmService.js) means a failure here can never affect dispatch or
   // the Expo push, which stays completely untouched.
   sendFullScreenTrip(driverUser?.fcmToken, trip);
+  // Fire-and-forget, same as the pushes above — a logging failure must
+  // never affect dispatch. Logged even if fcmToken is missing (that's
+  // itself useful CRM signal — sendFullScreenTrip no-ops on a missing
+  // token, so PUSH_SENT here means "we attempted it", not "it definitely
+  // reached the device"; meta.hadFcmToken distinguishes the two cases).
+  TripCallEvent.create({
+    tripId  : trip._id,
+    driverId,
+    type    : 'PUSH_SENT',
+    source  : 'backend',
+    meta    : { hadFcmToken: !!driverUser?.fcmToken },
+  }).catch((err) => console.log('[TripCallEvent] Could not log PUSH_SENT:', err.message));
 };
 
 // ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
@@ -1071,6 +1084,13 @@ exports.confirmTrip = async (req, res, next) => {
 
     sendPush(trip.customerPushToken, '🚑 Driver Assigned', `${req.user.name} has been assigned to your trip.`, { tripId: trip._id.toString() });
 
+    TripCallEvent.create({
+      tripId  : trip._id,
+      driverId: req.user._id,
+      type    : 'ACCEPTED',
+      source  : 'backend',
+    }).catch((err) => console.log('[TripCallEvent] Could not log ACCEPTED:', err.message));
+
     return res.json({ success: true, trip });
   } catch (err) {
     next(err);
@@ -1101,6 +1121,13 @@ exports.declineTrip = async (req, res, next) => {
 
     const previousVehicle = trip.vehicle;
     const previousDriver  = trip.driver;
+
+    TripCallEvent.create({
+      tripId  : trip._id,
+      driverId: req.user._id,
+      type    : 'REJECTED',
+      source  : 'backend',
+    }).catch((err) => console.log('[TripCallEvent] Could not log REJECTED:', err.message));
 
     trip.status       = 'booked';
     trip.vehicle       = undefined;

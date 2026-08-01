@@ -366,6 +366,47 @@ exports.getAssignmentHistory = async (req, res, next) => {
 };
 
 // ============================================================
+// @route   GET /api/assignments/my-shifts?from=&to=&limit=
+// @desc    The driver's own ENDED shifts -- the accurate, break-adjusted
+//          duty-hours source (totalWorkingMinutes, computed once in
+//          endDuty and stored, never recomputed here). Deliberately
+//          separate from getAssignmentHistory's Assignment rows above,
+//          which only carry raw startTime/endTime with no break
+//          subtraction -- attendance and salary are both computed from
+//          this same Shift.totalWorkingMinutes (see endDuty's
+//          auto-attendance write), so My Day must read the identical
+//          number rather than a second, disagreeing one. For a shift
+//          still in progress, the app already has
+//          GET /api/assignments/my-active (shiftStart + breaks) to
+//          compute a live elapsed figure client-side -- this endpoint
+//          only needs to cover shifts that have already ended.
+// @access  Private [driver]
+// ============================================================
+exports.getMyShiftHistory = async (req, res, next) => {
+  try {
+    const driverId = req.user._id;
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 200));
+
+    const filter = { driver: driverId, status: 'ended' };
+    if (req.query.from || req.query.to) {
+      filter.shiftStart = {};
+      if (req.query.from) filter.shiftStart.$gte = new Date(req.query.from);
+      if (req.query.to)   filter.shiftStart.$lte = new Date(req.query.to);
+    }
+
+    const shifts = await Shift.find(filter)
+      .select('shiftStart shiftEnd totalWorkingMinutes ambulance')
+      .populate('ambulance', 'registrationNumber')
+      .sort({ shiftStart: -1 })
+      .limit(limit);
+
+    return res.json({ success: true, shifts });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
 // @route   GET /api/assignments/fleet-status
 // @desc    Every one of the owner's ambulances with its current
 //          assignment/shift status — for a live fleet dashboard.

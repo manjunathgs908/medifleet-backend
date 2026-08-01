@@ -20,6 +20,7 @@ router.post('/resume',     protect, authorize('driver'), ctrl.resumeDuty);
 router.post('/end-duty',   protect, authorize('driver'), ctrl.endDuty);
 router.get ('/my-active',  protect, authorize('driver'), ctrl.getMyActiveShift);
 router.get ('/my-history', protect, authorize('driver'), ctrl.getAssignmentHistory);
+router.get ('/my-shifts',  protect, authorize('driver'), ctrl.getMyShiftHistory);
 
 // Private [owner]
 router.get('/fleet-status', protectOwner, authorize('owner'), requireKycApproved, ctrl.getFleetShiftStatus);

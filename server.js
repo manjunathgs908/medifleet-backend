@@ -71,6 +71,7 @@ const assignmentRoutes = require('./routes/assignments');
 const placesRoutes = require('./routes/places');
 const paymentRoutes = require('./routes/payments');
 const sosRoutes = require('./routes/sos');
+const whatsappRoutes = require('./routes/whatsappRoutes');
 app.use('/api/auth',      authRoutes);
 app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
@@ -96,6 +97,7 @@ app.use('/api/places',    placesRoutes);
 app.use('/api/payments',  paymentRoutes);
 app.use('/api/call',      require('./routes/callRoutes'));
 app.use('/api/sos',       sosRoutes);
+app.use('/api/whatsapp',  whatsappRoutes);
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

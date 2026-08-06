@@ -18,6 +18,13 @@ const WhatsAppSessionSchema = new mongoose.Schema({
   phone: { type: String, required: true, index: true },
   step : { type: String, required: true },
 
+  // Picked once, first step of the flow, then every reply for the rest of
+  // this session is composed in this language. Defaults to 'en' only for
+  // schema-level safety (a session should never actually reach the
+  // language field unset in practice) -- not a "assume English" fallback
+  // for an unanswered prompt.
+  language: { type: String, enum: ['en', 'hi', 'kn', 'te'], default: 'en' },
+
   draftBooking: {
     serviceType: { type: String },
     pickup: {

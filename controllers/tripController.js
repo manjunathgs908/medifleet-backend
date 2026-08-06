@@ -53,6 +53,7 @@ async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
     return null;
   }
 }
+exports.verifyRoadDistanceKm = verifyRoadDistanceKm; // reused by whatsappFlow.js for the same Google-Directions-verified billing distance
 
 // ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
 // registrationNumber. Both schemas already normalize to uppercase+trim

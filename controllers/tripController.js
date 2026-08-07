@@ -1439,7 +1439,7 @@ exports.registerCustomerPushToken = async (req, res, next) => {
 // ============================================================
 exports.getTrips = async (req, res, next) => {
   try {
-    const { status, vehicleId, driverId, hospitalId, from, to, page = 1, limit = 20 } = req.query;
+    const { status, vehicleId, driverId, hospitalId, bookingSource, from, to, page = 1, limit = 20 } = req.query;
 
     const filter = {};
 
@@ -1452,7 +1452,8 @@ exports.getTrips = async (req, res, next) => {
       if (hospitalId) filter.dropHospital = hospitalId;
     }
 
-    if (status) filter.status = status;
+    if (status)        filter.status        = status;
+    if (bookingSource) filter.bookingSource  = bookingSource;
     if (from || to) {
       filter.createdAt = {};
       if (from) filter.createdAt.$gte = new Date(from);

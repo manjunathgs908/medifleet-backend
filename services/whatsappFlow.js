@@ -20,6 +20,7 @@
 'use strict';
 
 const WhatsAppSession = require('../models/WhatsAppSession');
+const WhatsAppLead = require('../models/WhatsAppLead');
 const { Trip } = require('../models');
 const { t } = require('./whatsappStrings');
 const catalog = require('./whatsappServiceCatalog');
@@ -167,9 +168,14 @@ function resolveLocationInput(parsed) {
 }
 
 async function logLead(phone, service) {
-  // Plain console.log for now -- CRM alerting for WhatsApp leads is a
-  // separate, not-yet-built piece; this is just the hook point for it.
   console.log(`[whatsappLead] phone=${phone} service=${service}`);
+  try {
+    await WhatsAppLead.create({ phone, service });
+  } catch (err) {
+    // A failed lead write must never break the customer-facing flow --
+    // the console.log above is the fallback record if this ever throws.
+    console.error('[whatsappFlow] WhatsAppLead.create failed:', err.message);
+  }
 }
 
 // ============================================================
@@ -204,7 +210,7 @@ async function handleAwaitingService(session, parsed) {
 
   if (!service.bookable) {
     await whatsapp.sendText(session.phone, t(lang, 'leadCaptured'));
-    await logLead(session.phone, service.id);
+    await logLead(session.phone, service.label.en);
     await endSession(session.phone);
     return;
   }
@@ -240,7 +246,7 @@ async function handleAwaitingSubType(session, parsed) {
       // Valid row, but not bookable (kept for catalog completeness/future
       // pricing) -- lead-capture, not a re-prompt.
       await whatsapp.sendText(session.phone, t(lang, 'leadCaptured'));
-      await logLead(session.phone, `${serviceId}/${subType.id}`);
+      await logLead(session.phone, `${service.label.en} / ${subType.label.en}`);
       await endSession(session.phone);
       return;
     }
@@ -315,7 +321,7 @@ async function handleAwaitingDrop(session, parsed) {
     // of showing a fake/zero fare if it ever does.
     console.error('[whatsappFlow] fareCalculator.compute failed:', err.message);
     await whatsapp.sendText(session.phone, t(lang, 'leadCaptured'));
-    await logLead(session.phone, session.draftBooking.serviceType);
+    await logLead(session.phone, session.serviceLabel || session.draftBooking.serviceType);
     await endSession(session.phone);
     return;
   }

@@ -17,6 +17,17 @@
  * booking is only ever placed against a specific sub-type. Its own
  * `bookable` is true iff at least one of its sub-types is, which is what
  * tells the flow whether to bother showing the sub-type list at all.
+ *
+ * WhatsApp interactive-list row titles have a HARD 24-character limit
+ * (Meta rejects the whole message with error 131009 otherwise, in every
+ * language -- there's no separate per-script allowance). Every label
+ * below MUST stay <= 24 per label.length (UTF-16 units, same as what
+ * Meta counts) in all 4 languages -- verify with a length dump after any
+ * edit here, don't eyeball Kannada/Telugu/Hindi string length. Section
+ * titles (the service label shown atop a sub-type list) share the same
+ * 24-char cap. whatsappService.js's sendList() also hard-truncates as a
+ * second line of defense, but that's a safety net, not a substitute for
+ * getting the source labels right.
  * ============================================================
  */
 'use strict';
@@ -72,7 +83,7 @@ const RAW_CATALOG = [
     subTypes: [
       {
         id: 'sub_body_mini',
-        label: { en: 'Body Shifting Mini (Eeco)', hi: 'Body Shifting Mini (Eeco)', kn: 'Body Shifting Mini (Eeco)', te: 'Body Shifting Mini (Eeco)' },
+        label: { en: 'Body Mini (Eeco)', hi: 'Body Mini (Eeco)', kn: 'Body Mini (Eeco)', te: 'Body Mini (Eeco)' },
         backendCode: 'body_mini',
       },
       {
@@ -163,7 +174,7 @@ const RAW_CATALOG = [
     label: {
       en: 'Standby Ambulance',
       hi: 'स्टैंडबाय एम्बुलेंस',
-      kn: 'ಸ್ಟ್ಯಾಂಡ್‌ಬೈ ಆಂಬ್ಯುಲೆನ್ಸ್',
+      kn: 'ಸ್ಟ್ಯಾಂಡ್‌ಬೈ ಆಂಬುಲೆನ್ಸ್',
       te: 'స్టాండ్‌బై అంబులెన్స్',
     },
     backendCode: null,

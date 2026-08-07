@@ -63,8 +63,35 @@ async function sendButtons(to, bodyText, buttons) {
   });
 }
 
+// WhatsApp interactive-list hard limits (Meta error 131009 rejects the
+// WHOLE message if any of these are exceeded, in any language -- no
+// separate per-script allowance). This is a safety net, not the primary
+// fix -- source labels (services/whatsappServiceCatalog.js) must already
+// fit; this only protects against some future edit there breaking the
+// flow again silently. Truncates on UTF-16 code units (.length), same as
+// what Meta counts.
+const LIST_ROW_TITLE_MAX    = 24;
+const LIST_ROW_DESC_MAX     = 72;
+const LIST_BUTTON_LABEL_MAX = 20;
+const LIST_SECTION_TITLE_MAX = 24;
+
+function truncate(str, max) {
+  if (typeof str !== 'string' || str.length <= max) return str;
+  return str.slice(0, max - 1) + '…';
+}
+
 // sections: [{ title, rows: [{ id, title, description }] }]
 async function sendList(to, bodyText, buttonLabel, sections) {
+  const safeSections = (sections || []).map((section) => ({
+    ...section,
+    title: truncate(section.title, LIST_SECTION_TITLE_MAX),
+    rows: (section.rows || []).map((row) => ({
+      ...row,
+      title: truncate(row.title, LIST_ROW_TITLE_MAX),
+      description: row.description ? truncate(row.description, LIST_ROW_DESC_MAX) : row.description,
+    })),
+  }));
+
   return sendMessage({
     messaging_product: 'whatsapp',
     to,
@@ -73,8 +100,8 @@ async function sendList(to, bodyText, buttonLabel, sections) {
       type: 'list',
       body: { text: bodyText },
       action: {
-        button: buttonLabel,
-        sections: sections || [],
+        button: truncate(buttonLabel, LIST_BUTTON_LABEL_MAX),
+        sections: safeSections,
       },
     },
   });

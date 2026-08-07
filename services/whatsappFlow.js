@@ -75,18 +75,19 @@ const MAX_PLACE_OPTIONS = 10; // WhatsApp interactive list row cap
 // ============================================================
 function parseMessage(message) {
   const from = message.from;
-  let result;
 
   if (message.type === 'text') {
-    // Some WhatsApp clients/flows echo a tapped interactive button back
-    // as a plain quoted TEXT reply (message.context pointing at the
+    // Some WhatsApp clients/flows can echo a tapped interactive button
+    // back as a plain quoted TEXT reply (message.context pointing at the
     // message being replied to) instead of a structured button_reply --
     // this branch alone can't tell the difference from a genuinely typed
     // message, so it just reports what's here; the AWAITING_CONFIRM text
-    // fallback is what actually catches this shape by matching the body
+    // fallback is what actually catches that shape by matching the body
     // against 'confirm'/'cancel'.
-    result = { from, text: message.text?.body?.trim() || '', replyId: null, location: null };
-  } else if (message.type === 'interactive') {
+    return { from, text: message.text?.body?.trim() || '', replyId: null, location: null };
+  }
+
+  if (message.type === 'interactive') {
     const reply = message.interactive?.button_reply || message.interactive?.list_reply;
     if (!reply) {
       // Logged, not guessed -- a live test found a real reply/button tap
@@ -95,19 +96,22 @@ function parseMessage(message) {
       // assumption. Cheap and safe to leave in permanently.
       console.warn('[whatsappFlow] interactive message with neither button_reply nor list_reply:', JSON.stringify(message.interactive));
     }
-    result = { from, text: reply?.title || '', replyId: reply?.id || null, location: null };
-  } else if (message.type === 'button') {
-    // Quick-reply buttons attached to a TEMPLATE message (sendTemplate)
-    // echo back as their own top-level type: 'button', not 'interactive'
-    // -- a documented, separate Meta message shape (message.button =
-    // {text, payload}). Not used by sendButtons' interactive messages
-    // today, but handled here in case a client ever degrades an
-    // interactive reply to this shape, or a template gets used for
-    // confirm/cancel later.
-    result = { from, text: message.button?.text || '', replyId: message.button?.payload || null, location: null };
-  } else if (message.type === 'location') {
+    return { from, text: reply?.title || '', replyId: reply?.id || null, location: null };
+  }
+
+  // Quick-reply buttons attached to a TEMPLATE message (sendTemplate) echo
+  // back as their own top-level type: 'button', not 'interactive' -- a
+  // documented, separate Meta message shape (message.button = {text,
+  // payload}). Not used by sendButtons' interactive messages today, but
+  // handled here in case a client ever degrades an interactive reply to
+  // this shape, or a template gets used for confirm/cancel later.
+  if (message.type === 'button') {
+    return { from, text: message.button?.text || '', replyId: message.button?.payload || null, location: null };
+  }
+
+  if (message.type === 'location') {
     const loc = message.location || {};
-    result = {
+    return {
       from,
       text: '',
       replyId: null,
@@ -117,21 +121,9 @@ function parseMessage(message) {
         address: loc.address || loc.name || null,
       },
     };
-  } else {
-    result = { from, text: '', replyId: null, location: null };
   }
 
-  // TEMPORARY -- remove once the AWAITING_CONFIRM button_reply mismatch
-  // is confirmed fixed live.
-  console.log('[whatsappDebug] parsed:', JSON.stringify({
-    type: message.type,
-    hasContext: !!message.context,
-    textBody: result.text,
-    interactiveId: result.replyId,
-    location: result.location,
-  }));
-
-  return result;
+  return { from, text: '', replyId: null, location: null };
 }
 
 // ============================================================
@@ -611,18 +603,6 @@ async function handleAwaitingConfirm(session, parsed) {
   const normalizedText = parsed.text?.trim().toLowerCase();
   const isConfirm = parsed.replyId === 'confirm_yes' || (!parsed.replyId && normalizedText === 'confirm');
   const isCancel  = parsed.replyId === 'confirm_no'  || (!parsed.replyId && normalizedText === 'cancel');
-
-  // TEMPORARY -- remove once the AWAITING_CONFIRM button_reply mismatch
-  // is confirmed fixed live.
-  console.log('[whatsappDebug] AWAITING_CONFIRM comparing:', JSON.stringify({
-    replyId: parsed.replyId,
-    rawText: parsed.text,
-    normalizedText,
-    expectedIds: ['confirm_yes', 'confirm_no'],
-    expectedFallbackText: ['confirm', 'cancel'],
-    isConfirm,
-    isCancel,
-  }));
 
   if (isCancel) {
     await whatsapp.sendText(session.phone, t(lang, 'cancelled'));

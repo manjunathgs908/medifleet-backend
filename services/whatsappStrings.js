@@ -32,6 +32,9 @@ const STRINGS = {
     invalidInput   : "Sorry, I didn't understand that. Please try again.",
     sessionExpired : "Your session has expired. Please send 'Hi' to start again.",
     cancelled      : 'Your booking has been cancelled.',
+    placeNotFound  : "Sorry, I couldn't find that place. Please share your location using the button below.",
+    placeConfirmed : 'Found: {place}',
+    chooseLocationFromList: 'I found multiple matching places. Please choose the correct one:',
   },
 
   hi: {
@@ -50,6 +53,9 @@ const STRINGS = {
     invalidInput   : 'क्षमा करें, मुझे यह समझ नहीं आया। कृपया फिर से कोशिश करें।',
     sessionExpired : "आपका सेशन समाप्त हो गया है। कृपया 'Hi' भेजकर फिर से शुरू करें।",
     cancelled      : 'आपकी बुकिंग रद्द कर दी गई है।',
+    placeNotFound  : 'क्षमा करें, वह स्थान नहीं मिला। कृपया नीचे दिए गए बटन से अपना स्थान साझा करें।',
+    placeConfirmed : 'मिला: {place}',
+    chooseLocationFromList: 'कई मिलते-जुलते स्थान मिले। कृपया सही वाला चुनें:',
   },
 
   kn: {
@@ -68,6 +74,9 @@ const STRINGS = {
     invalidInput   : 'ಕ್ಷಮಿಸಿ, ಅದು ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.',
     sessionExpired : "ನಿಮ್ಮ ಸೆಷನ್ ಮುಗಿದಿದೆ. ದಯವಿಟ್ಟು 'Hi' ಕಳುಹಿಸಿ ಮತ್ತೆ ಪ್ರಾರಂಭಿಸಿ.",
     cancelled      : 'ನಿಮ್ಮ ಬುಕಿಂಗ್ ಅನ್ನು ರದ್ದುಗೊಳಿಸಲಾಗಿದೆ.',
+    placeNotFound  : 'ಕ್ಷಮಿಸಿ, ಆ ಸ್ಥಳ ಸಿಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಬಟನ್ ಬಳಸಿ ನಿಮ್ಮ ಸ್ಥಳವನ್ನು ಹಂಚಿಕೊಳ್ಳಿ.',
+    placeConfirmed : 'ಸಿಕ್ಕಿದೆ: {place}',
+    chooseLocationFromList: 'ಹಲವಾರು ಹೊಂದಾಣಿಕೆಯ ಸ್ಥಳಗಳು ಸಿಕ್ಕಿವೆ. ದಯವಿಟ್ಟು ಸರಿಯಾದುದನ್ನು ಆಯ್ಕೆಮಾಡಿ:',
   },
 
   te: {
@@ -86,6 +95,9 @@ const STRINGS = {
     invalidInput   : 'క్షమించండి, అది నాకు అర్థం కాలేదు. దయచేసి మళ్ళీ ప్రయత్నించండి.',
     sessionExpired : "మీ సెషన్ ముగిసింది. దయచేసి 'Hi' పంపి మళ్ళీ ప్రారంభించండి.",
     cancelled      : 'మీ బుకింగ్ రద్దు చేయబడింది.',
+    placeNotFound  : 'క్షమించండి, ఆ స్థలం కనుగొనబడలేదు. దయచేసి క్రింది బటన్ ఉపయోగించి మీ లొకేషన్‌ను పంపండి.',
+    placeConfirmed : 'కనుగొనబడింది: {place}',
+    chooseLocationFromList: 'అనేక సరిపోలిన స్థలాలు కనుగొనబడ్డాయి. దయచేసి సరైనదాన్ని ఎంచుకోండి:',
   },
 };
 

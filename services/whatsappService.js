@@ -129,4 +129,21 @@ async function sendDocument(to, link, filename) {
   });
 }
 
-module.exports = { sendText, sendButtons, sendList, sendTemplate, sendDocument };
+// One-tap "Send Location" button -- the customer's reply arrives as a
+// normal type:'location' message (same shape as an ad-hoc shared pin),
+// so no new inbound handling is needed for this, only this new outbound
+// message type.
+async function sendLocationRequest(to, bodyText) {
+  return sendMessage({
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'location_request_message',
+      body: { text: bodyText },
+      action: { name: 'send_location' },
+    },
+  });
+}
+
+module.exports = { sendText, sendButtons, sendList, sendTemplate, sendDocument, sendLocationRequest };

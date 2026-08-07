@@ -10,15 +10,25 @@
  *   services that have sub-types) → AWAITING_PICKUP → AWAITING_DROP →
  *   AWAITING_CONFIRM → (Trip created, session deleted)
  *
+ * AWAITING_PICKUP/AWAITING_DROP each have a side-branch:
+ *   typed text with 2+ Google Places matches -> AWAITING_PICKUP_CHOICE /
+ *   AWAITING_DROP_CHOICE (customer taps one from a list) -> back onto the
+ *   main path. A shared location pin, or typed text with exactly one
+ *   match, skips the side-branch entirely.
+ *
  * Money rule: the fare shown to the customer and saved on the Trip always
  * comes from fareCalculator.compute() against live Pricing, using the
  * same Google-Directions-verified distance createTrip uses
  * (verifyRoadDistanceKm) -- never a client-typed or Haversine distance,
- * never a hardcoded rate.
+ * never a hardcoded rate. Pickup/drop coordinates are likewise never
+ * fabricated -- typed text either resolves through Places to a real
+ * coordinate (single match or a disambiguated choice) or the customer is
+ * re-prompted for a shared pin; nothing is guessed.
  * ============================================================
  */
 'use strict';
 
+const axios = require('axios');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const { Trip } = require('../models');
@@ -41,6 +51,22 @@ const LANGUAGES = [
 ];
 
 const GREETING_RE = /^\s*(hi|hello|hey|start|menu)\s*$/i;
+
+// Same GOOGLE_MAPS_API_KEY env var and OK_STATUSES/timeout convention as
+// controllers/placesController.js -- a direct axios call rather than an
+// internal HTTP round-trip through that controller's own routes, mirroring
+// how tripController.js's verifyRoadDistanceKm calls Directions directly.
+const PLACES_TEXTSEARCH_URL = 'https://maps.googleapis.com/maps/api/place/textsearch/json';
+const PLACES_OK_STATUSES = ['OK', 'ZERO_RESULTS'];
+// Central Bengaluru + a ~50km radius -- every customer-facing booking
+// flow in this codebase is Bengaluru-only today, so this bias (not a
+// hard filter -- Text Search can still return outside it) plus
+// region:'in' is enough to keep "Manipal Hospital"-style ambiguous
+// queries resolving to the right city.
+const BENGALURU_LAT = 12.9716;
+const BENGALURU_LNG = 77.5946;
+const BENGALURU_BIAS_RADIUS_M = 50000;
+const MAX_PLACE_OPTIONS = 10; // WhatsApp interactive list row cap
 
 // ============================================================
 // Inbound message parsing -- WhatsApp's webhook posts one shape per type;
@@ -145,12 +171,17 @@ async function sendSubTypePrompt(phone, lang, service) {
   await whatsapp.sendList(phone, t(lang, 'chooseSubType'), 'Select', [{ title: service.label[lang] || service.label.en, rows }]);
 }
 
+// One-tap "Send Location" button -- askPickup/askDrop's existing copy
+// already covers both options ("send your location, or type the
+// address"), so no new string needed, just a different transport. The
+// customer's tap arrives back as a normal type:'location' message,
+// same as always sharing a pin ad-hoc.
 async function sendPickupPrompt(phone, lang) {
-  await whatsapp.sendText(phone, t(lang, 'askPickup'));
+  await whatsapp.sendLocationRequest(phone, t(lang, 'askPickup'));
 }
 
 async function sendDropPrompt(phone, lang) {
-  await whatsapp.sendText(phone, t(lang, 'askDrop'));
+  await whatsapp.sendLocationRequest(phone, t(lang, 'askDrop'));
 }
 
 async function sendConfirmPrompt(phone, lang, draft) {
@@ -168,20 +199,69 @@ async function sendConfirmPrompt(phone, lang, draft) {
   ]);
 }
 
-// A location step (pickup/drop) accepts either a shared pin (lat/lng, from
-// message.location) or typed text (stored as address only -- no coords).
-// Geocoding free-text addresses isn't built yet (confirmed absent
-// repo-wide), so a text-only location can't get a fare; AWAITING_DROP
-// checks for missing coords and re-prompts for a shared pin instead of
-// guessing coordinates.
-function resolveLocationInput(parsed) {
-  if (parsed.location) {
-    return { address: parsed.location.address, lat: parsed.location.lat, lng: parsed.location.lng };
+// Row id carries the index into draftBooking.placeOptions (place_0,
+// place_1, ...) -- resolved back in handleAwaitingPickupChoice/
+// handleAwaitingDropChoice. sendList already hard-truncates title (24)
+// and description (72) defensively, so no manual truncation needed here.
+async function sendDisambiguationList(phone, lang, places) {
+  const rows = places.map((p, i) => ({ id: `place_${i}`, title: p.name, description: p.address }));
+  await whatsapp.sendList(phone, t(lang, 'chooseLocationFromList'), 'Select', [{ title: 'Places', rows }]);
+}
+
+// Resolves typed free text (pickup/drop) against Google Places Text
+// Search, biased to Bengaluru. Returns:
+//   { status: 'none' }                -- no match; caller must re-prompt
+//                                         for a shared pin, never fabricate
+//                                         coordinates from the raw text.
+//   { status: 'single', place }       -- exactly one match; safe to use
+//                                         directly (place: {name,address,lat,lng}).
+//   { status: 'multiple', places }    -- 2+ matches (e.g. "Manipal
+//                                         Hospital" has 10+ Bengaluru
+//                                         branches) -- caller must show a
+//                                         disambiguation list, NEVER
+//                                         silently pick the first result.
+async function resolvePlaceFromText(query) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) {
+    console.error('[whatsappFlow] GOOGLE_MAPS_API_KEY not set -- cannot resolve a typed address.');
+    return { status: 'none' };
   }
-  if (parsed.text) {
-    return { address: parsed.text, lat: null, lng: null };
+
+  try {
+    const { data } = await axios.get(PLACES_TEXTSEARCH_URL, {
+      params : {
+        query,
+        key     : apiKey,
+        location: `${BENGALURU_LAT},${BENGALURU_LNG}`,
+        radius  : BENGALURU_BIAS_RADIUS_M,
+        region  : 'in',
+      },
+      timeout: 5000,
+    });
+
+    if (!PLACES_OK_STATUSES.includes(data.status)) {
+      console.error('[whatsappFlow] Places Text Search failed:', data.status, data.error_message);
+      return { status: 'none' };
+    }
+
+    const places = (data.results || [])
+      .map((r) => ({
+        name   : r.name,
+        address: r.formatted_address,
+        lat    : r.geometry?.location?.lat,
+        lng    : r.geometry?.location?.lng,
+      }))
+      // A result missing real coordinates is useless here and must never
+      // be offered -- filtered out rather than passed through as-is.
+      .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+
+    if (places.length === 0) return { status: 'none' };
+    if (places.length === 1) return { status: 'single', place: places[0] };
+    return { status: 'multiple', places: places.slice(0, MAX_PLACE_OPTIONS) };
+  } catch (err) {
+    console.error('[whatsappFlow] Places Text Search request error:', err.message);
+    return { status: 'none' };
   }
-  return null;
 }
 
 async function logLead(phone, service) {
@@ -281,38 +361,84 @@ async function handleAwaitingSubType(session, parsed) {
   await sendPickupPrompt(session.phone, lang);
 }
 
-async function handleAwaitingPickup(session, parsed) {
-  const lang = session.language;
-  const pickup = resolveLocationInput(parsed);
-  if (!pickup) {
-    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
-    await sendPickupPrompt(session.phone, lang);
-    return;
-  }
-
-  await saveSession(session, { step: 'AWAITING_DROP', 'draftBooking.pickup': pickup });
+// Shared tail once a pickup location is fully resolved (real coordinates,
+// from a shared pin, a single strong Places match, or a chosen
+// disambiguation result) -- advances to AWAITING_DROP either way.
+async function advanceFromPickup(session, lang, pickup) {
+  await saveSession(session, {
+    step: 'AWAITING_DROP',
+    'draftBooking.pickup': pickup,
+    'draftBooking.placeOptions': [],
+  });
   await sendDropPrompt(session.phone, lang);
 }
 
-async function handleAwaitingDrop(session, parsed) {
+async function handleAwaitingPickup(session, parsed) {
   const lang = session.language;
-  const drop = resolveLocationInput(parsed);
-  if (!drop) {
-    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
-    await sendDropPrompt(session.phone, lang);
+
+  if (parsed.location) {
+    await advanceFromPickup(session, lang, {
+      address: parsed.location.address, lat: parsed.location.lat, lng: parsed.location.lng,
+    });
     return;
   }
 
-  await saveSession(session, { 'draftBooking.drop': drop });
+  if (parsed.text) {
+    const result = await resolvePlaceFromText(parsed.text);
 
+    if (result.status === 'none') {
+      await whatsapp.sendText(session.phone, t(lang, 'placeNotFound'));
+      await sendPickupPrompt(session.phone, lang);
+      return;
+    }
+
+    if (result.status === 'single') {
+      const p = result.place;
+      await whatsapp.sendText(session.phone, t(lang, 'placeConfirmed', { place: `${p.name}, ${p.address}` }));
+      await advanceFromPickup(session, lang, { address: `${p.name}, ${p.address}`, lat: p.lat, lng: p.lng });
+      return;
+    }
+
+    // Multiple matches (e.g. "Manipal Hospital" has 10+ Bengaluru
+    // branches) -- never silently pick one.
+    await saveSession(session, { step: 'AWAITING_PICKUP_CHOICE', 'draftBooking.placeOptions': result.places });
+    await sendDisambiguationList(session.phone, lang, result.places);
+    return;
+  }
+
+  await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+  await sendPickupPrompt(session.phone, lang);
+}
+
+async function handleAwaitingPickupChoice(session, parsed) {
+  const lang = session.language;
+  const options = session.draftBooking?.placeOptions || [];
+  const idx = Number(parsed.replyId?.match(/^place_(\d+)$/)?.[1]);
+  const chosen = Number.isInteger(idx) ? options[idx] : undefined;
+
+  if (!chosen) {
+    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+    await sendDisambiguationList(session.phone, lang, options);
+    return;
+  }
+
+  await advanceFromPickup(session, lang, { address: `${chosen.name}, ${chosen.address}`, lat: chosen.lat, lng: chosen.lng });
+}
+
+// Shared tail once a drop location is fully resolved -- computes the
+// Google-Directions-verified distance and fare, then moves to
+// AWAITING_CONFIRM. Money rule: never fabricate coordinates or a
+// distance -- the hasCoords guard is defensive (every caller already
+// carries real coordinates by construction) but kept rather than assumed.
+async function advanceFromDrop(session, lang, drop) {
   const pickup = session.draftBooking.pickup;
   const hasCoords = Number.isFinite(pickup.lat) && Number.isFinite(pickup.lng)
     && Number.isFinite(drop.lat) && Number.isFinite(drop.lng);
 
   if (!hasCoords) {
-    // Don't fake coordinates or guess a distance -- ask for a shared pin
-    // for whichever location(s) came in as typed text, stay on this step.
-    await whatsapp.sendText(session.phone, t(lang, 'askDrop'));
+    await saveSession(session, { 'draftBooking.drop': drop });
+    await whatsapp.sendText(session.phone, t(lang, 'placeNotFound'));
+    await sendDropPrompt(session.phone, lang);
     return;
   }
 
@@ -320,6 +446,7 @@ async function handleAwaitingDrop(session, parsed) {
   if (distanceKm == null) {
     // Google Directions unreachable/failed -- no Haversine fallback (money
     // rule). Re-prompt rather than silently under/over-charging.
+    await saveSession(session, { 'draftBooking.drop': drop });
     await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
     return;
   }
@@ -345,8 +472,10 @@ async function handleAwaitingDrop(session, parsed) {
 
   const draft = await saveSession(session, {
     step: 'AWAITING_CONFIRM',
+    'draftBooking.drop': drop,
     'draftBooking.distanceKm'  : fare.distanceKm,
     'draftBooking.fareEstimate': fare.grandTotal,
+    'draftBooking.placeOptions': [],
   });
 
   await sendConfirmPrompt(session.phone, lang, {
@@ -356,6 +485,56 @@ async function handleAwaitingDrop(session, parsed) {
     distanceKm  : fare.distanceKm,
     fareEstimate: fare.grandTotal,
   });
+}
+
+async function handleAwaitingDrop(session, parsed) {
+  const lang = session.language;
+
+  if (parsed.location) {
+    await advanceFromDrop(session, lang, {
+      address: parsed.location.address, lat: parsed.location.lat, lng: parsed.location.lng,
+    });
+    return;
+  }
+
+  if (parsed.text) {
+    const result = await resolvePlaceFromText(parsed.text);
+
+    if (result.status === 'none') {
+      await whatsapp.sendText(session.phone, t(lang, 'placeNotFound'));
+      await sendDropPrompt(session.phone, lang);
+      return;
+    }
+
+    if (result.status === 'single') {
+      const p = result.place;
+      await whatsapp.sendText(session.phone, t(lang, 'placeConfirmed', { place: `${p.name}, ${p.address}` }));
+      await advanceFromDrop(session, lang, { address: `${p.name}, ${p.address}`, lat: p.lat, lng: p.lng });
+      return;
+    }
+
+    await saveSession(session, { step: 'AWAITING_DROP_CHOICE', 'draftBooking.placeOptions': result.places });
+    await sendDisambiguationList(session.phone, lang, result.places);
+    return;
+  }
+
+  await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+  await sendDropPrompt(session.phone, lang);
+}
+
+async function handleAwaitingDropChoice(session, parsed) {
+  const lang = session.language;
+  const options = session.draftBooking?.placeOptions || [];
+  const idx = Number(parsed.replyId?.match(/^place_(\d+)$/)?.[1]);
+  const chosen = Number.isInteger(idx) ? options[idx] : undefined;
+
+  if (!chosen) {
+    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+    await sendDisambiguationList(session.phone, lang, options);
+    return;
+  }
+
+  await advanceFromDrop(session, lang, { address: `${chosen.name}, ${chosen.address}`, lat: chosen.lat, lng: chosen.lng });
 }
 
 async function handleAwaitingConfirm(session, parsed) {
@@ -447,7 +626,9 @@ const STEP_HANDLERS = {
   AWAITING_SERVICE : handleAwaitingService,
   AWAITING_SUBTYPE : handleAwaitingSubType,
   AWAITING_PICKUP  : handleAwaitingPickup,
+  AWAITING_PICKUP_CHOICE: handleAwaitingPickupChoice,
   AWAITING_DROP    : handleAwaitingDrop,
+  AWAITING_DROP_CHOICE  : handleAwaitingDropChoice,
   AWAITING_CONFIRM : handleAwaitingConfirm,
 };
 

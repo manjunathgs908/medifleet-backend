@@ -50,6 +50,18 @@ const WhatsAppSessionSchema = new mongoose.Schema({
     },
     fareEstimate: { type: Number },
     distanceKm  : { type: Number },
+
+    // Transient Google Places Text Search results awaiting a customer's
+    // disambiguation pick (AWAITING_PICKUP_CHOICE / AWAITING_DROP_CHOICE)
+    // -- cleared as soon as a choice resolves. Declared here for the same
+    // strict-mode reason as serviceLabel above: an undeclared path is
+    // silently dropped by session.set(), never persisted.
+    placeOptions: [{
+      name   : { type: String },
+      address: { type: String },
+      lat    : { type: Number },
+      lng    : { type: Number },
+    }],
   },
 
   tripId: { type: String, default: null },

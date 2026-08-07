@@ -111,6 +111,12 @@ router.post('/webhook', (req, res) => {
 
       for (const message of messages) {
         if (!message?.id || isDuplicateMessage(message.id)) continue;
+        // TEMPORARY -- remove once the AWAITING_CONFIRM button_reply
+        // mismatch is confirmed fixed live. Dumps the exact raw shape
+        // Meta delivered, uninterpreted, so the real payload can be
+        // compared against what whatsappFlow.parseMessage assumed
+        // instead of guessing again.
+        console.log('[whatsappDebug] raw message:', JSON.stringify(message));
         try {
           await whatsappFlow.handleMessage(message);
         } catch (err) {

@@ -394,6 +394,8 @@ async function handleAwaitingConfirm(session, parsed) {
       estimatedDistanceKm: fare.distanceKm,
       estimatedFare       : fare.grandTotal,
       status      : 'booked',
+      bookingSource    : 'whatsapp',
+      whatsappLanguage : lang,
     });
 
     await whatsapp.sendText(session.phone, t(lang, 'bookingConfirmed', { bookingId: trip.tripNumber || trip._id }));

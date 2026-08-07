@@ -26,6 +26,7 @@ const smsService = require('../utils/smsService');
 const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
+const whatsappNotifications = require('../services/whatsappNotifications');
 
 const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
 
@@ -368,6 +369,13 @@ const dispatchTripToDriver = async (trip, driverId) => {
     source  : 'backend',
     meta    : { hadFcmToken: !!driverUser?.fcmToken },
   }).catch((err) => console.log('[TripCallEvent] Could not log PUSH_SENT:', err.message));
+
+  // Fire-and-forget WhatsApp notification -- no-ops internally for any
+  // trip that isn't bookingSource:'whatsapp'. Covers both dispatch paths
+  // (auto-assign in createTrip and manual assign via assignVehicle),
+  // since both funnel through this shared tail.
+  whatsappNotifications.notifyDriverAssigned(trip)
+    .catch((err) => console.error('[whatsappNotifications] notifyDriverAssigned failed:', err.message));
 };
 
 // ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
@@ -486,6 +494,18 @@ exports.updateStatus = async (req, res, next) => {
     // onboard).
     if (status === 'en_route') {
       sendPush(trip.customerPushToken, '🚑 Ambulance On The Way', 'Your ambulance is on the way.', { tripId: trip._id.toString() });
+
+      // Guarded on bookingSource before the extra query, not just inside
+      // notifyTripStarted -- pickupOtp has {select:false}, so it must be
+      // fetched separately here; doing that unconditionally on every
+      // en_route transition would mean an extra DB read for every non-
+      // WhatsApp trip too. The `trip` object returned in the response
+      // below is never touched, so pickupOtp can't leak to the driver app.
+      if (trip.bookingSource === 'whatsapp') {
+        Trip.findById(trip._id).select('+pickupOtp').lean()
+          .then((withOtp) => whatsappNotifications.notifyTripStarted(trip, withOtp?.pickupOtp))
+          .catch((err) => console.error('[whatsappNotifications] notifyTripStarted failed:', err.message));
+      }
     }
 
     return res.json({ success: true, trip });
@@ -995,6 +1015,12 @@ exports.completeTrip = async (req, res, next) => {
     trip.completedAt  = completedAt;
     trip.closeAllOpenWaitSegments(trip.completedAt);
     await trip.save();
+
+    // Fire-and-forget WhatsApp notification -- no-ops internally for any
+    // trip that isn't bookingSource:'whatsapp'. trip.grandTotal above is
+    // already the final billed amount (fare + wait charges) by this point.
+    whatsappNotifications.notifyTripCompleted(trip)
+      .catch((err) => console.error('[whatsappNotifications] notifyTripCompleted failed:', err.message));
 
     // ── 3. Auto-generate Bill ─────────────────────────────────
     const bill = await Bill.create({

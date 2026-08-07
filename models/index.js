@@ -534,6 +534,18 @@ const tripSchema = new Schema(
       default : 'general',
     },
 
+    // Which channel created this trip -- no such field existed before this.
+    // Drives whether outbound WhatsApp lifecycle notifications fire (see
+    // services/whatsappNotifications.js): only 'whatsapp'-origin trips get
+    // them, since app/CRM customers may not be on WhatsApp at all.
+    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web'], default: 'app' },
+
+    // Set once at booking time from the customer's WhatsAppSession.language
+    // and read back for every notification after -- the session itself is
+    // deleted right after booking (see whatsappFlow.js), so this is the
+    // only place that language survives for the rest of the trip's life.
+    whatsappLanguage: { type: String, enum: ['en', 'hi', 'kn', 'te'] },
+
     // â”€â”€ Locations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pickup: {
       address: { type: String, required: true },

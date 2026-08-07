@@ -55,7 +55,24 @@ function parseMessage(message) {
 
   if (message.type === 'interactive') {
     const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+    if (!reply) {
+      // Logged, not guessed -- a live test found a real reply/button tap
+      // that produced neither button_reply nor list_reply, and diagnosing
+      // it further needs the actual shape Meta sent, not another
+      // assumption. Cheap and safe to leave in permanently.
+      console.warn('[whatsappFlow] interactive message with neither button_reply nor list_reply:', JSON.stringify(message.interactive));
+    }
     return { from, text: reply?.title || '', replyId: reply?.id || null, location: null };
+  }
+
+  // Quick-reply buttons attached to a TEMPLATE message (sendTemplate) echo
+  // back as their own top-level type: 'button', not 'interactive' -- a
+  // documented, separate Meta message shape (message.button = {text,
+  // payload}). Not used by sendButtons' interactive messages today, but
+  // handled here in case a client ever degrades an interactive reply to
+  // this shape, or a template gets used for confirm/cancel later.
+  if (message.type === 'button') {
+    return { from, text: message.button?.text || '', replyId: message.button?.payload || null, location: null };
   }
 
   if (message.type === 'location') {
@@ -344,13 +361,25 @@ async function handleAwaitingDrop(session, parsed) {
 async function handleAwaitingConfirm(session, parsed) {
   const lang = session.language;
 
-  if (parsed.replyId === 'confirm_no') {
+  // Primary path: the button's id, echoed back exactly as sent (see
+  // sendConfirmPrompt below -- ids are literally 'confirm_yes'/'confirm_no').
+  // Fallback: match on the button's TITLE text ('Confirm'/'Cancel',
+  // hardcoded English in sendConfirmPrompt regardless of session language)
+  // when replyId is absent -- covers a WhatsApp client that degrades an
+  // interactive button tap to a plain text reply instead of a structured
+  // button_reply, and also just lets a customer type confirm/cancel.
+  const normalizedText = parsed.text?.trim().toLowerCase();
+  const isConfirm = parsed.replyId === 'confirm_yes' || (!parsed.replyId && normalizedText === 'confirm');
+  const isCancel  = parsed.replyId === 'confirm_no'  || (!parsed.replyId && normalizedText === 'cancel');
+
+  if (isCancel) {
     await whatsapp.sendText(session.phone, t(lang, 'cancelled'));
     await endSession(session.phone);
     return;
   }
 
-  if (parsed.replyId !== 'confirm_yes') {
+  if (!isConfirm) {
+    console.warn('[whatsappFlow] AWAITING_CONFIRM got unrecognized reply:', JSON.stringify({ replyId: parsed.replyId, text: parsed.text }));
     await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
     await sendConfirmPrompt(session.phone, lang, {
       serviceLabel: session.serviceLabel,

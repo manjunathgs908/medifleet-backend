@@ -25,6 +25,17 @@ const WhatsAppSessionSchema = new mongoose.Schema({
   // for an unanswered prompt.
   language: { type: String, enum: ['en', 'hi', 'kn', 'te'], default: 'en' },
 
+  // Human-readable, already-language-resolved label for whatever
+  // service/sub-type the customer picked (e.g. "ALS (Tempo)") -- set once
+  // in whatsappFlow.js right after service/sub-type selection, then read
+  // back for the AWAITING_CONFIRM booking summary. MUST be a declared
+  // schema path: this schema has no {strict:false}, so Mongoose's default
+  // strict mode silently drops any session.set() write to a path that
+  // isn't declared here -- not even held in memory after .save(), let
+  // alone persisted. That silent drop is exactly what left the summary's
+  // {service} placeholder un-interpolated before this field existed.
+  serviceLabel: { type: String },
+
   draftBooking: {
     serviceType: { type: String },
     pickup: {

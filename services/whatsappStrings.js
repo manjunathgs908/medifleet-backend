@@ -35,6 +35,7 @@ const STRINGS = {
     placeNotFound  : "Sorry, I couldn't find that place. Please share your location using the button below.",
     placeConfirmed : 'Found: {place}',
     chooseLocationFromList: 'I found multiple matching places. Please choose the correct one:',
+    bookingFailed  : 'Sorry, something went wrong creating your booking. Please try again or call us.',
   },
 
   hi: {
@@ -56,6 +57,7 @@ const STRINGS = {
     placeNotFound  : 'क्षमा करें, वह स्थान नहीं मिला। कृपया नीचे दिए गए बटन से अपना स्थान साझा करें।',
     placeConfirmed : 'मिला: {place}',
     chooseLocationFromList: 'कई मिलते-जुलते स्थान मिले। कृपया सही वाला चुनें:',
+    bookingFailed  : 'क्षमा करें, आपकी बुकिंग बनाने में कुछ गड़बड़ हुई। कृपया फिर से प्रयास करें या हमें कॉल करें।',
   },
 
   kn: {
@@ -77,6 +79,7 @@ const STRINGS = {
     placeNotFound  : 'ಕ್ಷಮಿಸಿ, ಆ ಸ್ಥಳ ಸಿಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಬಟನ್ ಬಳಸಿ ನಿಮ್ಮ ಸ್ಥಳವನ್ನು ಹಂಚಿಕೊಳ್ಳಿ.',
     placeConfirmed : 'ಸಿಕ್ಕಿದೆ: {place}',
     chooseLocationFromList: 'ಹಲವಾರು ಹೊಂದಾಣಿಕೆಯ ಸ್ಥಳಗಳು ಸಿಕ್ಕಿವೆ. ದಯವಿಟ್ಟು ಸರಿಯಾದುದನ್ನು ಆಯ್ಕೆಮಾಡಿ:',
+    bookingFailed  : 'ಕ್ಷಮಿಸಿ, ನಿಮ್ಮ ಬುಕಿಂಗ್ ಮಾಡುವಲ್ಲಿ ಏನೋ ತಪ್ಪಾಗಿದೆ. ದಯವಿಟ್ಟು ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ ಅಥವಾ ನಮಗೆ ಕರೆ ಮಾಡಿ.',
   },
 
   te: {
@@ -98,6 +101,7 @@ const STRINGS = {
     placeNotFound  : 'క్షమించండి, ఆ స్థలం కనుగొనబడలేదు. దయచేసి క్రింది బటన్ ఉపయోగించి మీ లొకేషన్‌ను పంపండి.',
     placeConfirmed : 'కనుగొనబడింది: {place}',
     chooseLocationFromList: 'అనేక సరిపోలిన స్థలాలు కనుగొనబడ్డాయి. దయచేసి సరైనదాన్ని ఎంచుకోండి:',
+    bookingFailed  : 'క్షమించండి, మీ బుకింగ్ చేయడంలో ఏదో తప్పు జరిగింది. దయచేసి మళ్ళీ ప్రయత్నించండి లేదా మాకు కాల్ చేయండి.',
   },
 };
 

@@ -57,6 +57,7 @@ const GREETING_RE = /^\s*(hi|hello|hey|start|menu)\s*$/i;
 // internal HTTP round-trip through that controller's own routes, mirroring
 // how tripController.js's verifyRoadDistanceKm calls Directions directly.
 const PLACES_TEXTSEARCH_URL = 'https://maps.googleapis.com/maps/api/place/textsearch/json';
+const GEOCODE_URL = 'https://maps.googleapis.com/maps/api/geocode/json';
 const PLACES_OK_STATUSES = ['OK', 'ZERO_RESULTS'];
 // Central Bengaluru + a ~50km radius -- every customer-facing booking
 // flow in this codebase is Bengaluru-only today, so this bias (not a
@@ -200,10 +201,14 @@ async function sendDropPrompt(phone, lang) {
 }
 
 async function sendConfirmPrompt(phone, lang, draft) {
+  // pickup.address/drop.address are resolved (Meta's own address, a
+  // reverse-geocode, or a last-resort coordinate string) at the pickup/
+  // drop step itself -- see resolveAddressForLocation -- so both are
+  // guaranteed non-empty by the time this runs, never bare lat/lng here.
   const summary = t(lang, 'bookingSummary', {
     service : draft.serviceLabel,
-    pickup  : draft.pickup.address || `${draft.pickup.lat}, ${draft.pickup.lng}`,
-    drop    : draft.drop.address || `${draft.drop.lat}, ${draft.drop.lng}`,
+    pickup  : draft.pickup.address,
+    drop    : draft.drop.address,
     distance: draft.distanceKm.toFixed(1),
     fare    : draft.fareEstimate,
   });
@@ -277,6 +282,49 @@ async function resolvePlaceFromText(query) {
     console.error('[whatsappFlow] Places Text Search request error:', err.message);
     return { status: 'none' };
   }
+}
+
+// Same GOOGLE_MAPS_API_KEY/timeout/OK_STATUSES convention as
+// resolvePlaceFromText above and placesController.js's own reverse
+// handler -- returns a formatted address string, or null if Google has
+// nothing (missing key, request failure, no result). Never throws.
+async function reverseGeocode(lat, lng) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) {
+    console.error('[whatsappFlow] GOOGLE_MAPS_API_KEY not set -- cannot reverse-geocode.');
+    return null;
+  }
+
+  try {
+    const { data } = await axios.get(GEOCODE_URL, {
+      params : { latlng: `${lat},${lng}`, key: apiKey },
+      timeout: 5000,
+    });
+
+    if (!PLACES_OK_STATUSES.includes(data.status)) {
+      console.error('[whatsappFlow] Reverse geocode failed:', data.status, data.error_message);
+      return null;
+    }
+
+    return (data.results || [])[0]?.formatted_address || null;
+  } catch (err) {
+    console.error('[whatsappFlow] Reverse geocode request error:', err.message);
+    return null;
+  }
+}
+
+// A shared location pin's address is only sometimes present (Meta's own
+// payload sometimes includes name/address, sometimes just bare lat/lng --
+// confirmed live: the pickup pin in the reported failure had neither).
+// Trip.create requires pickup.address to be non-empty, so this NEVER
+// returns a falsy value -- resolution order: Meta's own address/name,
+// then a reverse-geocoded address, then a last-resort coordinate string
+// that is at minimum a valid (if unfriendly) string.
+async function resolveAddressForLocation(lat, lng, metaAddress) {
+  if (metaAddress) return metaAddress;
+  const geocoded = await reverseGeocode(lat, lng);
+  if (geocoded) return geocoded;
+  return `Lat: ${lat}, Lng: ${lng}`;
 }
 
 async function logLead(phone, service) {
@@ -392,9 +440,8 @@ async function handleAwaitingPickup(session, parsed) {
   const lang = session.language;
 
   if (parsed.location) {
-    await advanceFromPickup(session, lang, {
-      address: parsed.location.address, lat: parsed.location.lat, lng: parsed.location.lng,
-    });
+    const address = await resolveAddressForLocation(parsed.location.lat, parsed.location.lng, parsed.location.address);
+    await advanceFromPickup(session, lang, { address, lat: parsed.location.lat, lng: parsed.location.lng });
     return;
   }
 
@@ -506,9 +553,8 @@ async function handleAwaitingDrop(session, parsed) {
   const lang = session.language;
 
   if (parsed.location) {
-    await advanceFromDrop(session, lang, {
-      address: parsed.location.address, lat: parsed.location.lat, lng: parsed.location.lng,
-    });
+    const address = await resolveAddressForLocation(parsed.location.lat, parsed.location.lng, parsed.location.address);
+    await advanceFromDrop(session, lang, { address, lat: parsed.location.lat, lng: parsed.location.lng });
     return;
   }
 
@@ -643,7 +689,10 @@ async function handleAwaitingConfirm(session, parsed) {
     await endSession(session.phone);
   } catch (err) {
     console.error('[whatsappFlow] Trip.create failed:', err.message);
-    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+    // A creation failure isn't "didn't understand you" -- invalidInput
+    // was misleading here; bookingFailed says what actually happened and
+    // that a retry is worth trying.
+    await whatsapp.sendText(session.phone, t(lang, 'bookingFailed'));
     // Session stays as-is -- confirm_yes can be retried without redoing the whole flow.
   }
 }

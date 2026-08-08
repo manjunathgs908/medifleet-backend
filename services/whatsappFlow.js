@@ -51,6 +51,15 @@ const whatsapp = require('./whatsappService');
 // needs the same constant, not a shared export it didn't ask for).
 const GST_RATE = 5;
 
+// Read fresh at send time (see bookingConfirmed's {phone} interpolation
+// below), never hardcoded in the message string itself -- same
+// warn-at-boot convention as whatsappService.js's WA_TOKEN check, so a
+// missing env var is loud at startup instead of a silent gap in a
+// customer-facing message.
+if (!process.env.SUPPORT_PHONE) {
+  console.warn('[whatsappFlow] SUPPORT_PHONE not set -- the booking-received message will show the literal "{phone}" placeholder instead of a real number.');
+}
+
 const LANGUAGES = [
   { id: 'lang_en', code: 'en', title: 'English' },
   { id: 'lang_hi', code: 'hi', title: 'हिन्दी' },
@@ -766,7 +775,10 @@ async function handleAwaitingConfirm(session, parsed) {
       whatsappLanguage : lang,
     });
 
-    await whatsapp.sendText(session.phone, t(lang, 'bookingConfirmed', { bookingId: trip.tripNumber || trip._id }));
+    await whatsapp.sendText(session.phone, t(lang, 'bookingConfirmed', {
+      bookingId: trip.tripNumber || trip._id,
+      phone    : process.env.SUPPORT_PHONE,
+    }));
     await endSession(session.phone);
   } catch (err) {
     console.error('[whatsappFlow] Trip.create failed:', err.message);

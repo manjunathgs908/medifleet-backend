@@ -10,6 +10,10 @@
  *   services that have sub-types) → AWAITING_PICKUP → AWAITING_DROP →
  *   AWAITING_CONFIRM → (Trip created, session deleted)
  *
+ * AWAITING_LANGUAGE has a side-branch: WhatsApp reply buttons cap at 3, so
+ *   the 4 languages don't fit one message. "More" -> AWAITING_LANGUAGE_MORE
+ *   (Hindi/Telugu in a second message) -> back onto the main path.
+ *
  * AWAITING_PICKUP/AWAITING_DROP each have a side-branch:
  *   typed text with 2+ Google Places matches -> AWAITING_PICKUP_CHOICE /
  *   AWAITING_DROP_CHOICE (customer taps one from a list) -> back onto the
@@ -161,11 +165,29 @@ async function endSession(phone) {
 // Outbound prompt senders -- one per step, so each branch below is just
 // "validate input, mutate session, call the matching sendX*".
 // ============================================================
+// 4 languages, but WhatsApp reply buttons hard-cap at 3 -- a list no longer
+// fits all 4 in a single message the way it used to. Two-step instead:
+// Kannada/English/More here, then a second message (sendMoreLanguagePrompt)
+// with Hindi/Telugu if "More" is tapped. Buttons show their options
+// immediately (no extra "Select" tap), which is the whole point of this
+// change over the list this replaces.
 async function sendLanguagePrompt(phone) {
-  // 4 options, and sendButtons hard-caps at 3 (WhatsApp's own reply-button
-  // limit) -- a list is the only interactive widget that fits all 4.
-  await whatsapp.sendList(phone, 'Please choose your language / भाषा चुनें / ಭಾಷೆ ಆಯ್ಕೆಮಾಡಿ / భాష ఎంచుకోండి:', 'Select', [
-    { title: 'Language', rows: LANGUAGES.map((l) => ({ id: l.id, title: l.title })) },
+  await whatsapp.sendButtons(phone, 'Please choose your language / भाषा चुनें / ಭಾಷೆ ಆಯ್ಕೆಮಾಡಿ / భాష ఎంచుకోండి:', [
+    { id: 'lang_kn', title: LANGUAGES.find((l) => l.id === 'lang_kn').title },
+    { id: 'lang_en', title: LANGUAGES.find((l) => l.id === 'lang_en').title },
+    { id: 'lang_more', title: 'More' },
+  ]);
+}
+
+// Second step of language selection, only reached via the "More" button
+// above. Own state (AWAITING_LANGUAGE_MORE) rather than folding into
+// AWAITING_LANGUAGE, so a customer who taps More and then goes idle is
+// re-prompted with THIS message (not the first one) if they message again
+// before the session's 30-minute TTL expires.
+async function sendMoreLanguagePrompt(phone) {
+  await whatsapp.sendButtons(phone, 'अधिक भाषाएँ चुनें / మరిన్ని భాషలను ఎంచుకోండి:', [
+    { id: 'lang_hi', title: LANGUAGES.find((l) => l.id === 'lang_hi').title },
+    { id: 'lang_te', title: LANGUAGES.find((l) => l.id === 'lang_te').title },
   ]);
 }
 
@@ -335,14 +357,36 @@ async function logLead(phone, service) {
 // they send whatever reply is appropriate and/or advance session.step.
 // ============================================================
 
+// Shared tail once a language id (from either button message) resolves to
+// a LANGUAGES entry -- identical next step regardless of which message it
+// came from.
+async function completeLanguageSelection(session, match) {
+  await saveSession(session, { language: match.code, step: 'AWAITING_SERVICE' });
+  await sendServicePrompt(session.phone, match.code);
+}
+
 async function handleAwaitingLanguage(session, parsed) {
+  if (parsed.replyId === 'lang_more') {
+    await saveSession(session, { step: 'AWAITING_LANGUAGE_MORE' });
+    await sendMoreLanguagePrompt(session.phone);
+    return;
+  }
+
   const match = LANGUAGES.find((l) => l.id === parsed.replyId);
   if (!match) {
     await sendLanguagePrompt(session.phone);
     return;
   }
-  await saveSession(session, { language: match.code, step: 'AWAITING_SERVICE' });
-  await sendServicePrompt(session.phone, match.code);
+  await completeLanguageSelection(session, match);
+}
+
+async function handleAwaitingLanguageMore(session, parsed) {
+  const match = LANGUAGES.find((l) => l.id === parsed.replyId);
+  if (!match) {
+    await sendMoreLanguagePrompt(session.phone);
+    return;
+  }
+  await completeLanguageSelection(session, match);
 }
 
 async function handleAwaitingService(session, parsed) {
@@ -679,6 +723,7 @@ async function handleAwaitingConfirm(session, parsed) {
 
 const STEP_HANDLERS = {
   AWAITING_LANGUAGE: handleAwaitingLanguage,
+  AWAITING_LANGUAGE_MORE: handleAwaitingLanguageMore,
   AWAITING_SERVICE : handleAwaitingService,
   AWAITING_SUBTYPE : handleAwaitingSubType,
   AWAITING_PICKUP  : handleAwaitingPickup,

@@ -14,6 +14,10 @@
  *   the 4 languages don't fit one message. "More" -> AWAITING_LANGUAGE_MORE
  *   (Hindi/Telugu in a second message) -> back onto the main path.
  *
+ * AWAITING_SERVICE has the same side-branch, same reason: 9 services don't
+ *   fit 3 buttons. "Other Services" -> AWAITING_SERVICE_MORE (remaining 7
+ *   as a list) -> back onto the main path.
+ *
  * AWAITING_PICKUP/AWAITING_DROP each have a side-branch:
  *   typed text with 2+ Google Places matches -> AWAITING_PICKUP_CHOICE /
  *   AWAITING_DROP_CHOICE (customer taps one from a list) -> back onto the
@@ -191,8 +195,33 @@ async function sendMoreLanguagePrompt(phone) {
   ]);
 }
 
+// 9 services, but WhatsApp reply buttons hard-cap at 3 -- same problem and
+// same fix as AWAITING_LANGUAGE above. The 2 most-requested services get a
+// button each; everything else sits behind an "Other Services" button that
+// reveals the remaining 7 as a list (sendMoreServicePrompt) -- the exact
+// list widget this whole flow used to use for all 9.
+const TOP_SERVICE_IDS = ['svc_emergency', 'svc_dead_body'];
+const OTHER_SERVICES_LABEL = { en: 'Other Services', hi: 'अन्य सेवाएं', kn: 'ಇತರ ಸೇವೆಗಳು', te: 'ఇతర సేవలు' };
+
 async function sendServicePrompt(phone, lang) {
-  const rows = catalog.getServiceList().map((svc) => ({ id: svc.id, title: svc.label[lang] || svc.label.en }));
+  const buttons = TOP_SERVICE_IDS.map((id) => {
+    const svc = catalog.getService(id);
+    return { id: svc.id, title: svc.label[lang] || svc.label.en };
+  });
+  buttons.push({ id: 'svc_more', title: OTHER_SERVICES_LABEL[lang] || OTHER_SERVICES_LABEL.en });
+  await whatsapp.sendButtons(phone, t(lang, 'chooseService'), buttons);
+}
+
+// Second step of service selection, only reached via the "Other Services"
+// button above. Own state (AWAITING_SERVICE_MORE) rather than folding into
+// AWAITING_SERVICE, so a customer who taps it and then goes idle is
+// re-prompted with THIS list (not the 3 buttons) if they message again
+// before the session's 30-minute TTL expires -- same reasoning as
+// AWAITING_LANGUAGE_MORE.
+async function sendMoreServicePrompt(phone, lang) {
+  const rows = catalog.getServiceList()
+    .filter((svc) => !TOP_SERVICE_IDS.includes(svc.id))
+    .map((svc) => ({ id: svc.id, title: svc.label[lang] || svc.label.en }));
   await whatsapp.sendList(phone, t(lang, 'chooseService'), 'Select', [{ title: 'Services', rows }]);
 }
 
@@ -389,15 +418,12 @@ async function handleAwaitingLanguageMore(session, parsed) {
   await completeLanguageSelection(session, match);
 }
 
-async function handleAwaitingService(session, parsed) {
-  const lang = session.language;
-  const service = catalog.getService(parsed.replyId);
-  if (!service) {
-    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
-    await sendServicePrompt(session.phone, lang);
-    return;
-  }
-
+// Shared tail once a service id (from either the 3-button message or the
+// "Other Services" list) resolves to a catalog entry -- identical
+// subtype/lead-capture/pickup branching regardless of which message it
+// came from. Body unchanged from before this change, just relocated so
+// handleAwaitingServiceMore below can reuse it without duplicating it.
+async function completeServiceSelection(session, lang, service) {
   if (service.subTypes.length > 0) {
     await saveSession(session, { step: 'AWAITING_SUBTYPE', 'draftBooking.serviceType': service.id });
     await sendSubTypePrompt(session.phone, lang, service);
@@ -420,6 +446,37 @@ async function handleAwaitingService(session, parsed) {
     serviceLabel: service.label[lang] || service.label.en,
   });
   await sendPickupPrompt(session.phone, lang);
+}
+
+async function handleAwaitingService(session, parsed) {
+  const lang = session.language;
+
+  if (parsed.replyId === 'svc_more') {
+    await saveSession(session, { step: 'AWAITING_SERVICE_MORE' });
+    await sendMoreServicePrompt(session.phone, lang);
+    return;
+  }
+
+  const service = catalog.getService(parsed.replyId);
+  if (!service) {
+    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+    await sendServicePrompt(session.phone, lang);
+    return;
+  }
+
+  await completeServiceSelection(session, lang, service);
+}
+
+async function handleAwaitingServiceMore(session, parsed) {
+  const lang = session.language;
+  const service = catalog.getService(parsed.replyId);
+  if (!service) {
+    await whatsapp.sendText(session.phone, t(lang, 'invalidInput'));
+    await sendMoreServicePrompt(session.phone, lang);
+    return;
+  }
+
+  await completeServiceSelection(session, lang, service);
 }
 
 async function handleAwaitingSubType(session, parsed) {
@@ -725,6 +782,7 @@ const STEP_HANDLERS = {
   AWAITING_LANGUAGE: handleAwaitingLanguage,
   AWAITING_LANGUAGE_MORE: handleAwaitingLanguageMore,
   AWAITING_SERVICE : handleAwaitingService,
+  AWAITING_SERVICE_MORE: handleAwaitingServiceMore,
   AWAITING_SUBTYPE : handleAwaitingSubType,
   AWAITING_PICKUP  : handleAwaitingPickup,
   AWAITING_PICKUP_CHOICE: handleAwaitingPickupChoice,

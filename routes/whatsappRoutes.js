@@ -386,7 +386,11 @@ router.post('/call-outcome', protect, authorize('owner'), async (req, res, next)
     try {
       await upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId: req.user._id });
     } catch (err) {
-      console.error('[whatsapp call-outcome] Lead upsert failed:', err.message);
+      // Full error (err, not err.message) -- console.error prints a
+      // ValidationError's .errors detail and the stack trace, not just the
+      // top-level message, which is what actually pinpoints which field/
+      // path failed. This was the only reason this bug was invisible.
+      console.error('[whatsapp call-outcome] Lead upsert failed:', err);
     }
 
     res.json({ success: true, log });

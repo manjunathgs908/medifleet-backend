@@ -27,9 +27,43 @@ const whatsappFlow = require('../services/whatsappFlow');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
+const { Trip } = require('../models');
 const { protect, authorize } = require('../middleware/auth');
 
 const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
+
+// ============================================================
+// Phone normalisation -- GET /customer/:phone's own header comment has the
+// full investigation, short version here: WhatsApp-side collections
+// (WhatsAppSession/WhatsAppFunnelEvent/WhatsAppCallLog) store the number
+// Meta's Cloud API sends (services/whatsappFlow.js's parseMessage reads it
+// straight off message.from) -- country code included, no '+', e.g.
+// "919986844442". Trip.patientPhone is whatever the booking channel sent
+// (controllers/tripController.js's createTrip takes req.body.patientPhone
+// with no normalisation at all) -- for WhatsApp-sourced trips that's the
+// same wa_id (services/whatsappFlow.js sets patientPhone: session.phone
+// directly), but for CRM/app/web-sourced trips it's most likely the bare
+// 10-digit number, matching this codebase's other phone convention (the
+// User model's own phone field is regex-enforced to exactly 10 digits,
+// /^[6-9]\d{9}$/, no country code). controllers/telephonyController.js
+// already has its own ad-hoc fix for this exact mismatch (a leading
+// +91/91/0 strip) for its Exotel-popup lookup -- this endpoint uses a
+// different, more general normalisation (last 10 digits, whatever comes
+// before them) rather than reusing that one, per what was asked here.
+function last10Digits(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  return digits.slice(-10);
+}
+
+// Same last-10-digits rule as last10Digits, as a query filter -- "ends
+// with these 10 digits, whatever precedes them". Assumes phone fields in
+// this codebase are stored as plain digit strings (true everywhere checked
+// above; no dashes/spaces/parens seen in any phone field), so an
+// end-anchored regex is equivalent to "last 10 digits" without needing a
+// digit-stripping expression inside the query itself.
+function phoneSuffixQuery(normalized) {
+  return { $regex: `${normalized}$` };
+}
 // Rules used by both POST /call-outcome (log a call) and GET /conversations
 // (needsCall) -- kept in one place so they can't drift apart.
 const MAX_NO_ANSWER_ATTEMPTS = 3;
@@ -353,6 +387,7 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
           followUpAt: 1,
           noAnswerCount: 1,
           needsCall: 1,
+          isReturning: 1,
         },
       },
     );
@@ -427,10 +462,29 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
           noAnswerCount: { $ifNull: [{ $arrayElemAt: ['$callLogSummary.noAnswerCount', 0] }, 0] },
         },
       },
+      // isReturning -- a call log already exists (so this phone was
+      // reached AND given an outcome -- booked/not_interested/followup/
+      // no_answer all count) but they've since sent a NEW message, later
+      // than that call. Without this, a phone marked not_interested or
+      // booked would never resurface in needs_call even after messaging
+      // the bot again days later with fresh intent. Gated on hasCallLog:
+      // a phone with NO call log at all is caught by the first needsCall
+      // branch below already ("never called"), not "returning".
+      {
+        $addFields: {
+          isReturning: {
+            $and: [
+              { $eq: ['$hasCallLog', true] },
+              { $ne: ['$lastCalledAt', null] },
+              { $gt: ['$lastSeenAt', '$lastCalledAt'] },
+            ],
+          },
+        },
+      },
       // needsCall -- see models/WhatsAppCallLog.js's own rules, mirrored
       // here in the pipeline (no call log at all; a followup whose
-      // followUpAt has passed; or a no_answer under the retry cap and
-      // over NO_ANSWER_RETRY_MS since the last attempt).
+      // followUpAt has passed; a no_answer under the retry cap and over
+      // NO_ANSWER_RETRY_MS since the last attempt; or isReturning above).
       {
         $addFields: {
           needsCall: {
@@ -450,6 +504,7 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
                   { $lt: ['$lastCalledAt', { $subtract: ['$$NOW', NO_ANSWER_RETRY_MS] }] },
                 ],
               },
+              { $eq: ['$isReturning', true] },
             ],
           },
         },
@@ -496,6 +551,7 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
       followUpAt: row.followUpAt,
       noAnswerCount: row.noAnswerCount,
       needsCall: row.needsCall,
+      isReturning: row.isReturning,
     }));
 
     res.json({
@@ -511,6 +567,115 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
         done: counts.done,
       },
       conversations,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================
+// @route   GET /api/whatsapp/customer/:phone
+// @desc    Full permanent history for one customer across every WhatsApp
+//          conversation, ops call, and Trip -- no date limit, unlike
+//          /funnel and /conversations above. Phone matching is normalised
+//          to the last 10 digits on both sides (see last10Digits/
+//          phoneSuffixQuery above) because WhatsApp-side collections and
+//          Trip.patientPhone do not reliably share one format -- see the
+//          normalisation helpers' own comment for the full investigation.
+// @access  Private [owner] -- same reasoning as /funnel above.
+// ============================================================
+router.get('/customer/:phone', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const normalized = last10Digits(req.params.phone);
+    if (normalized.length !== 10) {
+      return res.status(400).json({ success: false, message: 'phone must contain at least 10 digits.' });
+    }
+    const phoneQuery = phoneSuffixQuery(normalized);
+    const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
+
+    const [events, calls, trips] = await Promise.all([
+      // Ascending -- the conversation-segmentation walk below needs
+      // chronological order.
+      WhatsAppFunnelEvent.find({ phone: phoneQuery }).sort({ enteredAt: 1 }).lean(),
+      WhatsAppCallLog.find({ phone: phoneQuery }).sort({ createdAt: -1 }).populate('calledBy', 'name').lean(),
+      Trip.find({ patientPhone: phoneQuery }).sort({ createdAt: -1 }).lean(),
+    ]);
+
+    // Segments this phone's full event history into discrete conversations.
+    // startFreshSession (services/whatsappFlow.js) is the ONLY place that
+    // ever logs an AWAITING_LANGUAGE event, and it runs at exactly every
+    // conversation-start boundary (first-ever message, a TTL-expired
+    // restart, or a mid-flow "hi"/"menu" reset) -- so each AWAITING_LANGUAGE
+    // event marks where a new conversation begins. The `|| length === 0`
+    // fallback only matters for a phone whose very first-ever logged event
+    // predates that guarantee (shouldn't happen going forward, but avoids
+    // silently dropping data if it ever does).
+    const conversationBuckets = [];
+    for (const ev of events) {
+      if (ev.step === 'AWAITING_LANGUAGE' || conversationBuckets.length === 0) {
+        conversationBuckets.push([]);
+      }
+      conversationBuckets[conversationBuckets.length - 1].push(ev);
+    }
+
+    const conversations = conversationBuckets
+      .map((bucket) => {
+        const last = bucket[bucket.length - 1];
+        return {
+          startedAt: bucket[0].enteredAt,
+          lastStep: last.step,
+          lastStepLabel: STEP_LABELS[last.step] || last.step,
+          serviceLabel: last.serviceLabel,
+          completed: bucket.some((ev) => ev.step === TERMINAL_STEP),
+        };
+      })
+      .sort((a, b) => b.startedAt - a.startedAt); // newest first
+
+    const callRows = calls.map((c) => ({
+      createdAt: c.createdAt,
+      outcome: c.outcome,
+      followUpAt: c.followUpAt,
+      note: c.note,
+      calledBy: c.calledBy?.name || null,
+      tripId: c.tripId,
+    }));
+
+    const tripRows = trips.map((t) => ({
+      tripNumber: t.tripNumber,
+      createdAt: t.createdAt,
+      status: t.status,
+      // No field literally named "serviceType" on Trip -- mapped from the
+      // actual field, selectedType (see models/index.js's own comment on
+      // it: "Vehicle/service type id, matched against Pricing.serviceType").
+      serviceType: t.selectedType,
+      pickup: t.pickup,
+      // No single "drop" field either -- Trip stores dropAddress/dropLat/
+      // dropLng as separate top-level fields (dropHospital is a Hospital
+      // ref, unrelated), assembled into one object here.
+      drop: { address: t.dropAddress || null, lat: t.dropLat ?? null, lng: t.dropLng ?? null },
+      // No single "fare" field -- grandTotal (final billed amount, set at
+      // completion) when present, else estimatedFare (the booking-time
+      // quote) for a trip that hasn't completed yet.
+      fare: t.grandTotal ?? t.estimatedFare ?? null,
+    }));
+
+    const summary = {
+      firstSeenAt: events[0]?.enteredAt || null,
+      totalConversations: conversations.length,
+      completedBookings: conversations.filter((c) => c.completed).length,
+      totalTrips: trips.length,
+      cancelledTrips: trips.filter((t) => t.status === 'cancelled').length,
+      totalCallsMade: calls.length,
+      lastOutcome: calls[0]?.outcome || null, // calls already sorted newest first
+    };
+
+    res.json({
+      success: true,
+      phone: normalized,
+      summary,
+      conversations,
+      calls: callRows,
+      trips: tripRows,
     });
   } catch (err) {
     next(err);

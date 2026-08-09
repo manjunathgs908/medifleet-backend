@@ -424,7 +424,10 @@ const leadSchema = new Schema(
     // â”€â”€ Lead source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     source: {
       type    : String,
-      enum    : ['facebook_ad', 'google_ad', 'inbound_call', 'walk_in', 'referral', 'manual'],
+      // 'whatsapp' appended, not inserted -- existing Lead documents'
+      // source values must keep validating unchanged (Mongoose only
+      // checks enum on save, but a re-save of an old doc must still pass).
+      enum    : ['facebook_ad', 'google_ad', 'inbound_call', 'walk_in', 'referral', 'manual', 'whatsapp'],
       default : 'manual',
     },
 

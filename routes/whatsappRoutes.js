@@ -22,52 +22,105 @@
 'use strict';
 const express = require('express');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const router = express.Router();
 const whatsappFlow = require('../services/whatsappFlow');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
-const { Trip } = require('../models');
+const { Trip, Lead } = require('../models');
+const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { protect, authorize } = require('../middleware/auth');
 
 const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
 
-// ============================================================
-// Phone normalisation -- GET /customer/:phone's own header comment has the
-// full investigation, short version here: WhatsApp-side collections
-// (WhatsAppSession/WhatsAppFunnelEvent/WhatsAppCallLog) store the number
-// Meta's Cloud API sends (services/whatsappFlow.js's parseMessage reads it
-// straight off message.from) -- country code included, no '+', e.g.
-// "919986844442". Trip.patientPhone is whatever the booking channel sent
-// (controllers/tripController.js's createTrip takes req.body.patientPhone
-// with no normalisation at all) -- for WhatsApp-sourced trips that's the
-// same wa_id (services/whatsappFlow.js sets patientPhone: session.phone
-// directly), but for CRM/app/web-sourced trips it's most likely the bare
-// 10-digit number, matching this codebase's other phone convention (the
-// User model's own phone field is regex-enforced to exactly 10 digits,
-// /^[6-9]\d{9}$/, no country code). controllers/telephonyController.js
-// already has its own ad-hoc fix for this exact mismatch (a leading
-// +91/91/0 strip) for its Exotel-popup lookup -- this endpoint uses a
-// different, more general normalisation (last 10 digits, whatever comes
-// before them) rather than reusing that one, per what was asked here.
-function last10Digits(raw) {
-  const digits = String(raw || '').replace(/\D/g, '');
-  return digits.slice(-10);
-}
-
-// Same last-10-digits rule as last10Digits, as a query filter -- "ends
-// with these 10 digits, whatever precedes them". Assumes phone fields in
-// this codebase are stored as plain digit strings (true everywhere checked
-// above; no dashes/spaces/parens seen in any phone field), so an
-// end-anchored regex is equivalent to "last 10 digits" without needing a
-// digit-stripping expression inside the query itself.
-function phoneSuffixQuery(normalized) {
-  return { $regex: `${normalized}$` };
-}
 // Rules used by both POST /call-outcome (log a call) and GET /conversations
 // (needsCall) -- kept in one place so they can't drift apart.
 const MAX_NO_ANSWER_ATTEMPTS = 3;
 const NO_ANSWER_RETRY_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+// ============================================================
+// Ads-pipeline Lead mirroring -- POST /call-outcome's side effect of
+// surfacing WhatsApp conversations in the CRM Leads Dashboard alongside
+// Google/Facebook/inbound-call leads (models/index.js's Lead model,
+// routes/leads.js). Phone matching here goes through the same shared
+// utils/phone.js normalisePhone as everywhere else in this file and in
+// controllers/telephonyController.js -- so a WhatsApp number and an
+// inbound-call number for the same person converge on one Lead.
+const OUTCOME_TO_LEAD_STATUS = {
+  booked: 'converted',
+  followup: 'contacted',
+  not_interested: 'lost',
+  no_answer: 'contacted',
+};
+
+// Finds a Trip by whatever the caller put in WhatsAppCallLog.tripId --
+// that field is a free-text String (see models/WhatsAppCallLog.js's own
+// comment: the ops caller may type either a Trip's _id or its human
+// tripNumber), so this tries both. mongoose.Types.ObjectId.isValid guards
+// the _id branch -- comparing an arbitrary non-ObjectId string against an
+// ObjectId-typed field throws a CastError rather than just not matching.
+async function findTripForCallOutcome(tripId) {
+  if (!tripId) return null;
+  const query = mongoose.Types.ObjectId.isValid(tripId)
+    ? { $or: [{ _id: tripId }, { tripNumber: tripId }] }
+    : { tripNumber: tripId };
+  return Trip.findOne(query);
+}
+
+// Mirrors one call outcome onto the ads Lead pipeline. Read-then-write
+// (not a single findOneAndUpdate/upsert) because appending to notes -- a
+// plain String field, not an array -- needs the CURRENT value in hand
+// first; same overall create-vs-update shape as
+// controllers/telephonyController.js's inboundCallWebhook.
+async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId }) {
+  const normalisedPhone = normalisePhone(phone);
+  const calledAt = new Date();
+
+  const [existingLead, latestServiceEvent, trip] = await Promise.all([
+    // Exact match, not phoneSuffixQuery -- both sides of this comparison
+    // go through normalisePhone every time, so they're guaranteed to
+    // agree exactly; the fuzzier suffix match is for reconciling against
+    // data this route doesn't control (Trip.patientPhone, Lead entries
+    // written by other channels).
+    Lead.findOne({ source: 'whatsapp', phone: normalisedPhone }),
+    // Raw (un-normalised) phone -- WhatsAppFunnelEvent always stores the
+    // wa_id Meta sent, never the telephony-style normalised form.
+    WhatsAppFunnelEvent.findOne({ phone, serviceLabel: { $ne: null } }).sort({ enteredAt: -1 }),
+    outcome === 'booked' ? findTripForCallOutcome(tripId) : Promise.resolve(null),
+  ]);
+
+  const serviceLabel = latestServiceEvent?.serviceLabel || null;
+  const status = OUTCOME_TO_LEAD_STATUS[outcome];
+  const trimmedNote = note?.trim();
+  const noteEntry = trimmedNote ? `[${calledAt.toISOString()}] ${trimmedNote}` : null;
+  const callHistoryEntry = { direction: 'outbound', status: outcome, calledAt };
+
+  if (existingLead) {
+    existingLead.status = status;
+    if (serviceLabel) existingLead.message = serviceLabel; // else leave as-is
+    if (noteEntry) {
+      existingLead.notes = existingLead.notes ? `${existingLead.notes}\n${noteEntry}` : noteEntry;
+    }
+    existingLead.assignedTo = calledByUserId;
+    if (trip) existingLead.convertedTrip = trip._id;
+    existingLead.callHistory.push(callHistoryEntry);
+    await existingLead.save();
+    return existingLead;
+  }
+
+  return Lead.create({
+    source: 'whatsapp',
+    phone: normalisedPhone,
+    status,
+    message: serviceLabel || undefined,
+    notes: noteEntry || undefined,
+    assignedTo: calledByUserId,
+    convertedTrip: trip?._id,
+    callHistory: [callHistoryEntry],
+    receivedAt: calledAt,
+  });
+}
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message
 // (network retry, or our own >5s response in some edge case) even though
@@ -326,6 +379,16 @@ router.post('/call-outcome', protect, authorize('owner'), async (req, res, next)
       tripId: tripId || null,
     });
 
+    // Side effect: mirror this outcome onto the ads Lead pipeline so
+    // WhatsApp conversations show up in the Leads Dashboard too. Logging
+    // the call (above) is the primary action -- a failure here must never
+    // turn an already-successfully-logged call into an error response.
+    try {
+      await upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId: req.user._id });
+    } catch (err) {
+      console.error('[whatsapp call-outcome] Lead upsert failed:', err.message);
+    }
+
     res.json({ success: true, log });
   } catch (err) {
     next(err);
@@ -577,20 +640,20 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
 // @route   GET /api/whatsapp/customer/:phone
 // @desc    Full permanent history for one customer across every WhatsApp
 //          conversation, ops call, and Trip -- no date limit, unlike
-//          /funnel and /conversations above. Phone matching is normalised
-//          to the last 10 digits on both sides (see last10Digits/
-//          phoneSuffixQuery above) because WhatsApp-side collections and
-//          Trip.patientPhone do not reliably share one format -- see the
-//          normalisation helpers' own comment for the full investigation.
+//          /funnel and /conversations above. Phone matching goes through
+//          utils/phone.js (normalisePhone/phoneSuffixQuery) because
+//          WhatsApp-side collections and Trip.patientPhone do not
+//          reliably share one format -- see that module's own comment
+//          for the full investigation.
 // @access  Private [owner] -- same reasoning as /funnel above.
 // ============================================================
 router.get('/customer/:phone', protect, authorize('owner'), async (req, res, next) => {
   try {
-    const normalized = last10Digits(req.params.phone);
+    const normalized = normalisePhone(req.params.phone);
     if (normalized.length !== 10) {
       return res.status(400).json({ success: false, message: 'phone must contain at least 10 digits.' });
     }
-    const phoneQuery = phoneSuffixQuery(normalized);
+    const phoneQuery = phoneSuffixQuery(req.params.phone);
     const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
 
     const [events, calls, trips] = await Promise.all([

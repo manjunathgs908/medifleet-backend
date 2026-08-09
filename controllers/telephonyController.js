@@ -40,6 +40,7 @@
 const crypto = require('crypto');
 const axios  = require('axios');
 const { Lead, Trip, User, Notification } = require('../models');
+const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 
 
 // ════════════════════════════════════════════════════════════
@@ -94,16 +95,21 @@ exports.inboundCallWebhook = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Caller phone not provided.' });
     }
 
-    // Normalise Indian phone number (remove +91, country code, etc.)
-    const normalised = callerPhone.replace(/^(\+91|91|0)/, '').replace(/\D/g, '');
+    // Normalise Indian phone number -- see utils/phone.js for why this is
+    // last-10-digits rather than a +91/91/0 prefix strip.
+    const normalised = normalisePhone(callerPhone);
 
     // ── 3. Customer History Lookup ────────────────────────────
     // Search leads, past trips to build caller context for popup
     const [existingLead, pastTrips] = await Promise.all([
-      Lead.findOne({ phone: { $regex: normalised } })
+      Lead.findOne({ phone: phoneSuffixQuery(normalised) })
         .sort({ createdAt: -1 })
         .populate('assignedTo', 'name')
         .lean(),
+      // Not yet switched to phoneSuffixQuery -- Trip.patientPhone's own
+      // format inconsistency is reported, not fixed, in this pass (see
+      // utils/phone.js's investigation trail / the phone-normalisation
+      // consolidation this came from).
       Trip.find({ patientPhone: { $regex: normalised } })
         .sort({ createdAt: -1 })
         .limit(5)
@@ -185,11 +191,11 @@ exports.inboundCallWebhook = async (req, res, next) => {
 exports.callStatusWebhook = async (req, res, next) => {
   try {
     const { CallSid, From, CallDuration, Status } = req.body;
-    const normalised = (From || '').replace(/^(\+91|91|0)/, '').replace(/\D/g, '');
+    const normalised = normalisePhone(From);
 
     // Update call history entry for this CallSid
     await Lead.findOneAndUpdate(
-      { phone: { $regex: normalised }, 'callHistory.callSid': CallSid },
+      { phone: phoneSuffixQuery(normalised), 'callHistory.callSid': CallSid },
       {
         $set: {
           'callHistory.$.duration': Number(CallDuration) || 0,

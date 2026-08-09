@@ -26,7 +26,14 @@ const router = express.Router();
 const whatsappFlow = require('../services/whatsappFlow');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
+const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { protect, authorize } = require('../middleware/auth');
+
+const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
+// Rules used by both POST /call-outcome (log a call) and GET /conversations
+// (needsCall) -- kept in one place so they can't drift apart.
+const MAX_NO_ANSWER_ATTEMPTS = 3;
+const NO_ANSWER_RETRY_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message
 // (network retry, or our own >5s response in some edge case) even though
@@ -236,6 +243,62 @@ router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
 });
 
 // ============================================================
+// @route   POST /api/whatsapp/call-outcome
+// @desc    Logs the outcome of an ops call-back to a WhatsApp customer.
+//          Permanent, append-only -- see models/WhatsAppCallLog.js.
+// @access  Private [owner] -- same reasoning as /funnel above.
+//
+// Body: { phone, outcome, followUpAt, note, tripId }
+// ============================================================
+router.post('/call-outcome', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const { phone, outcome, followUpAt, note, tripId } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ success: false, message: 'phone is required.' });
+    }
+
+    if (!CALL_OUTCOMES.includes(outcome)) {
+      return res.status(400).json({
+        success: false,
+        message: `outcome must be one of: ${CALL_OUTCOMES.join(', ')}.`,
+      });
+    }
+
+    // followUpAt is only meaningful (and only ever persisted) for
+    // outcome:'followup' -- required and must be in the future there,
+    // silently dropped to null for every other outcome even if the client
+    // sent one.
+    let followUpDate = null;
+    if (outcome === 'followup') {
+      followUpDate = followUpAt ? new Date(followUpAt) : null;
+      if (!followUpDate || Number.isNaN(followUpDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'followUpAt is required and must be a valid date when outcome is followup.',
+        });
+      }
+      if (followUpDate <= new Date()) {
+        return res.status(400).json({ success: false, message: 'followUpAt must be in the future.' });
+      }
+    }
+
+    const log = await WhatsAppCallLog.create({
+      phone,
+      outcome,
+      followUpAt: followUpDate,
+      note,
+      calledBy: req.user._id,
+      tripId: tripId || null,
+    });
+
+    res.json({ success: true, log });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================
 // @route   GET /api/whatsapp/conversations
 // @desc    One row per distinct phone active in the window -- their latest
 //          known state, whether they ever completed a booking, and whether
@@ -247,6 +310,9 @@ router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
 // Query params:
 //   days   - lookback window in days (default 7)
 //   status - all | dropped | completed (default all)
+//   bucket - all | needs_call | done (default all) -- needsCall/done are
+//            computed from WhatsAppCallLog, independent of status, and
+//            combine with it (both filters apply together).
 // ============================================================
 router.get('/conversations', protect, authorize('owner'), async (req, res, next) => {
   try {
@@ -255,12 +321,18 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const status = ['all', 'dropped', 'completed'].includes(req.query.status) ? req.query.status : 'all';
+    const bucket = ['all', 'needs_call', 'done'].includes(req.query.bucket) ? req.query.bucket : 'all';
 
     const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
 
+    const rowsMatch = {};
+    if (status === 'completed')   rowsMatch.completed = true;
+    if (status === 'dropped')     rowsMatch.completed = false;
+    if (bucket === 'needs_call')  rowsMatch.needsCall = true;
+    if (bucket === 'done')        { rowsMatch.needsCall = false; rowsMatch.hasCallLog = true; }
+
     const rowsPipeline = [];
-    if (status === 'completed') rowsPipeline.push({ $match: { completed: true } });
-    if (status === 'dropped')   rowsPipeline.push({ $match: { completed: false } });
+    if (Object.keys(rowsMatch).length > 0) rowsPipeline.push({ $match: rowsMatch });
     rowsPipeline.push(
       { $sort: { lastSeenAt: -1 } },
       { $limit: 300 },
@@ -276,6 +348,11 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
           completed: 1,
           isLive: 1,
           minutesSince: { $round: [{ $divide: [{ $subtract: ['$$NOW', '$lastSeenAt'] }, 60000] }, 1] },
+          lastOutcome: 1,
+          lastCalledAt: 1,
+          followUpAt: 1,
+          noAnswerCount: 1,
+          needsCall: 1,
         },
       },
     );
@@ -317,6 +394,67 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
       },
       { $addFields: { isLive: { $gt: [{ $size: '$liveSession' }, 0] } } },
 
+      // Per-phone call-log summary -- a $lookup pipeline (not the simple
+      // localField/foreignField form) because this needs the MOST RECENT
+      // log's outcome/date plus a count of no_answer logs, not the raw
+      // array of logs. Yields 0 or 1 documents per phone.
+      {
+        $lookup: {
+          from: WhatsAppCallLog.collection.name,
+          let: { phone: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$phone', '$$phone'] } } },
+            { $sort: { createdAt: -1 } },
+            {
+              $group: {
+                _id: '$phone',
+                lastOutcome: { $first: '$outcome' },
+                lastCalledAt: { $first: '$createdAt' },
+                followUpAt: { $first: '$followUpAt' },
+                noAnswerCount: { $sum: { $cond: [{ $eq: ['$outcome', 'no_answer'] }, 1, 0] } },
+              },
+            },
+          ],
+          as: 'callLogSummary',
+        },
+      },
+      {
+        $addFields: {
+          hasCallLog: { $gt: [{ $size: '$callLogSummary' }, 0] },
+          lastOutcome: { $ifNull: [{ $arrayElemAt: ['$callLogSummary.lastOutcome', 0] }, null] },
+          lastCalledAt: { $ifNull: [{ $arrayElemAt: ['$callLogSummary.lastCalledAt', 0] }, null] },
+          followUpAt: { $ifNull: [{ $arrayElemAt: ['$callLogSummary.followUpAt', 0] }, null] },
+          noAnswerCount: { $ifNull: [{ $arrayElemAt: ['$callLogSummary.noAnswerCount', 0] }, 0] },
+        },
+      },
+      // needsCall -- see models/WhatsAppCallLog.js's own rules, mirrored
+      // here in the pipeline (no call log at all; a followup whose
+      // followUpAt has passed; or a no_answer under the retry cap and
+      // over NO_ANSWER_RETRY_MS since the last attempt).
+      {
+        $addFields: {
+          needsCall: {
+            $or: [
+              { $eq: ['$hasCallLog', false] },
+              {
+                $and: [
+                  { $eq: ['$lastOutcome', 'followup'] },
+                  { $ne: ['$followUpAt', null] },
+                  { $lt: ['$followUpAt', '$$NOW'] },
+                ],
+              },
+              {
+                $and: [
+                  { $eq: ['$lastOutcome', 'no_answer'] },
+                  { $lt: ['$noAnswerCount', MAX_NO_ANSWER_ATTEMPTS] },
+                  { $lt: ['$lastCalledAt', { $subtract: ['$$NOW', NO_ANSWER_RETRY_MS] }] },
+                ],
+              },
+            ],
+          },
+        },
+      },
+
       {
         $facet: {
           counts: [
@@ -327,6 +465,12 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
                 completed: { $sum: { $cond: ['$completed', 1, 0] } },
                 dropped: { $sum: { $cond: ['$completed', 0, 1] } },
                 live: { $sum: { $cond: ['$isLive', 1, 0] } },
+                needsCall: { $sum: { $cond: ['$needsCall', 1, 0] } },
+                done: {
+                  $sum: {
+                    $cond: [{ $and: [{ $eq: ['$needsCall', false] }, { $eq: ['$hasCallLog', true] }] }, 1, 0],
+                  },
+                },
               },
             },
           ],
@@ -335,7 +479,7 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
       },
     ]);
 
-    const counts = result.counts[0] || { total: 0, completed: 0, dropped: 0, live: 0 };
+    const counts = result.counts[0] || { total: 0, completed: 0, dropped: 0, live: 0, needsCall: 0, done: 0 };
     const conversations = result.rows.map((row) => ({
       phone: row.phone,
       lastStep: row.lastStep,
@@ -347,6 +491,11 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
       minutesSince: row.minutesSince,
       completed: row.completed,
       isLive: row.isLive,
+      lastOutcome: row.lastOutcome,
+      lastCalledAt: row.lastCalledAt,
+      followUpAt: row.followUpAt,
+      noAnswerCount: row.noAnswerCount,
+      needsCall: row.needsCall,
     }));
 
     res.json({
@@ -356,6 +505,10 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
         completed: counts.completed,
         dropped: counts.dropped,
         live: counts.live,
+      },
+      callCounts: {
+        needsCall: counts.needsCall,
+        done: counts.done,
       },
       conversations,
     });

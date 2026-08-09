@@ -850,6 +850,33 @@ const STEP_HANDLERS = {
 const TERMINAL_STEP = 'BOOKING_CONFIRMED';
 const FUNNEL_STEPS = [...Object.keys(STEP_HANDLERS), TERMINAL_STEP];
 
+// Plain-English gloss for each step, phrased as "what they'd done, what
+// they hadn't" -- the single place a raw step code gets translated for
+// anything customer/ops-facing (routes/whatsappRoutes.js's /conversations
+// endpoint looks these up rather than hardcoding its own copy).
+const STEP_LABELS = {
+  AWAITING_LANGUAGE: "Started conversation, hasn't picked a language",
+  AWAITING_LANGUAGE_MORE: "Viewing more language options, hasn't picked one",
+  AWAITING_SERVICE: "Picked language, hasn't chosen a service",
+  AWAITING_SERVICE_MORE: "Viewing more services, hasn't chosen one",
+  AWAITING_SUBTYPE: "Chose service, hasn't picked a sub-type",
+  AWAITING_PICKUP: "Chose service, didn't share pickup",
+  AWAITING_PICKUP_CHOICE: "Shared pickup text, choosing from multiple matches",
+  AWAITING_DROP: "Shared pickup, didn't share drop location",
+  AWAITING_DROP_CHOICE: "Shared drop text, choosing from multiple matches",
+  AWAITING_CONFIRM: "Saw fare estimate, didn't confirm booking",
+  [TERMINAL_STEP]: 'Booking confirmed',
+};
+
+// Loud at boot, not a runtime throw -- a missing label must never break the
+// /conversations endpoint, it should just fall back to the raw step code
+// there. This is what actually catches the drift if a step is ever added
+// to STEP_HANDLERS without a matching label above.
+const missingStepLabels = FUNNEL_STEPS.filter((step) => !STEP_LABELS[step]);
+if (missingStepLabels.length > 0) {
+  console.warn(`[whatsappFlow] STEP_LABELS has no entry for: ${missingStepLabels.join(', ')} -- these will show as a raw step code instead of a plain-English label.`);
+}
+
 // ============================================================
 // @desc  Entry point -- called once per deduped inbound message by
 //        routes/whatsappRoutes.js. Never throws (the route already
@@ -883,4 +910,4 @@ async function handleMessage(message) {
   }
 }
 
-module.exports = { handleMessage, FUNNEL_STEPS, TERMINAL_STEP };
+module.exports = { handleMessage, FUNNEL_STEPS, TERMINAL_STEP, STEP_LABELS };

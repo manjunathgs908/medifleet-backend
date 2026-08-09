@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const whatsappFlow = require('../services/whatsappFlow');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
+const WhatsAppSession = require('../models/WhatsAppSession');
 const { protect, authorize } = require('../middleware/auth');
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message
@@ -228,6 +229,135 @@ router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
       completed: overview.completed,
       steps,
       dropoffs: result.dropoffs,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ============================================================
+// @route   GET /api/whatsapp/conversations
+// @desc    One row per distinct phone active in the window -- their latest
+//          known state, whether they ever completed a booking, and whether
+//          a live (non-TTL-expired) WhatsAppSession still exists for them.
+//          Same data source and reasoning as /funnel above (WhatsAppSession
+//          TTL-expires, WhatsAppFunnelEvent doesn't).
+// @access  Private [owner] -- same reasoning as /funnel above.
+//
+// Query params:
+//   days   - lookback window in days (default 7)
+//   status - all | dropped | completed (default all)
+// ============================================================
+router.get('/conversations', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const parsedDays = parseInt(req.query.days, 10);
+    const days = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 7;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const status = ['all', 'dropped', 'completed'].includes(req.query.status) ? req.query.status : 'all';
+
+    const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
+
+    const rowsPipeline = [];
+    if (status === 'completed') rowsPipeline.push({ $match: { completed: true } });
+    if (status === 'dropped')   rowsPipeline.push({ $match: { completed: false } });
+    rowsPipeline.push(
+      { $sort: { lastSeenAt: -1 } },
+      { $limit: 300 },
+      {
+        $project: {
+          _id: 0,
+          phone: '$_id',
+          lastStep: 1,
+          language: 1,
+          serviceLabel: 1,
+          firstSeenAt: 1,
+          lastSeenAt: 1,
+          completed: 1,
+          isLive: 1,
+          minutesSince: { $round: [{ $divide: [{ $subtract: ['$$NOW', '$lastSeenAt'] }, 60000] }, 1] },
+        },
+      },
+    );
+
+    const [result] = await WhatsAppFunnelEvent.aggregate([
+      { $match: { enteredAt: { $gte: cutoff } } },
+
+      // Ascending so $first/$last below give each phone's true first/most
+      // recent event in the window.
+      { $sort: { enteredAt: 1 } },
+
+      {
+        $group: {
+          _id: '$phone',
+          lastStep: { $last: '$step' },
+          language: { $last: '$language' },
+          serviceLabel: { $last: '$serviceLabel' },
+          firstSeenAt: { $first: '$enteredAt' },
+          lastSeenAt: { $last: '$enteredAt' },
+          // "Ever reached the terminal step in this window", not "is the
+          // terminal step their latest event" -- same reasoning as /funnel's
+          // reachedTerminal. Boolean $max works because false < true in
+          // BSON comparison order, so this is true if ANY event in the
+          // group was the terminal step.
+          completed: { $max: { $cond: [{ $eq: ['$step', TERMINAL_STEP] }, true, false] } },
+        },
+      },
+
+      // Cross-reference the live (non-TTL-expired) session collection --
+      // .collection.name rather than a hardcoded 'whatsappsessions' string,
+      // so this can't drift from whatever Mongoose actually calls it.
+      {
+        $lookup: {
+          from: WhatsAppSession.collection.name,
+          localField: '_id',
+          foreignField: 'phone',
+          as: 'liveSession',
+        },
+      },
+      { $addFields: { isLive: { $gt: [{ $size: '$liveSession' }, 0] } } },
+
+      {
+        $facet: {
+          counts: [
+            {
+              $group: {
+                _id: null,
+                total: { $sum: 1 },
+                completed: { $sum: { $cond: ['$completed', 1, 0] } },
+                dropped: { $sum: { $cond: ['$completed', 0, 1] } },
+                live: { $sum: { $cond: ['$isLive', 1, 0] } },
+              },
+            },
+          ],
+          rows: rowsPipeline,
+        },
+      },
+    ]);
+
+    const counts = result.counts[0] || { total: 0, completed: 0, dropped: 0, live: 0 };
+    const conversations = result.rows.map((row) => ({
+      phone: row.phone,
+      lastStep: row.lastStep,
+      lastStepLabel: STEP_LABELS[row.lastStep] || row.lastStep,
+      language: row.language,
+      serviceLabel: row.serviceLabel,
+      firstSeenAt: row.firstSeenAt,
+      lastSeenAt: row.lastSeenAt,
+      minutesSince: row.minutesSince,
+      completed: row.completed,
+      isLive: row.isLive,
+    }));
+
+    res.json({
+      success: true,
+      counts: {
+        total: counts.total,
+        completed: counts.completed,
+        dropped: counts.dropped,
+        live: counts.live,
+      },
+      conversations,
     });
   } catch (err) {
     next(err);

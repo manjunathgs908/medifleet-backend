@@ -39,6 +39,7 @@
 const axios = require('axios');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppLead = require('../models/WhatsAppLead');
+const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const { Trip } = require('../models');
 const { t } = require('./whatsappStrings');
 const catalog = require('./whatsappServiceCatalog');
@@ -153,6 +154,12 @@ async function loadSession(phone) {
 }
 
 async function saveSession(session, patch) {
+  // Captured before session.set(patch) mutates session.step in place --
+  // this is the only way to tell "patch changed the step" from "patch
+  // touched other fields (e.g. a re-prompt's draftBooking.drop write) while
+  // step stays the same", which must NOT log a funnel event.
+  const stepChanged = Object.prototype.hasOwnProperty.call(patch, 'step') && patch.step !== session.step;
+
   // session.set() (not Object.assign) -- patch keys like
   // 'draftBooking.serviceType' are dotted nested-path strings, which
   // Mongoose's set() resolves into the subdocument correctly; a plain
@@ -162,12 +169,22 @@ async function saveSession(session, patch) {
   session.set(patch);
   session.set('updatedAt', new Date());
   await session.save();
+
+  // Logged after save so language/serviceLabel reflect the fully-persisted
+  // post-transition snapshot, even when this same patch also set them
+  // (e.g. completeLanguageSelection's { language, step } in one call).
+  if (stepChanged) {
+    logFunnelEvent(session.phone, session._id, session.step, session.language, session.serviceLabel);
+  }
+
   return session;
 }
 
 async function startFreshSession(phone) {
   await WhatsAppSession.deleteOne({ phone }); // drop any stale session before creating a clean one
-  return WhatsAppSession.create({ phone, step: 'AWAITING_LANGUAGE', updatedAt: new Date() });
+  const session = await WhatsAppSession.create({ phone, step: 'AWAITING_LANGUAGE', updatedAt: new Date() });
+  logFunnelEvent(session.phone, session._id, session.step, session.language, session.serviceLabel);
+  return session;
 }
 
 async function endSession(phone) {
@@ -388,6 +405,19 @@ async function logLead(phone, service) {
     // the console.log above is the fallback record if this ever throws.
     console.error('[whatsappFlow] WhatsAppLead.create failed:', err.message);
   }
+}
+
+// Fire-and-forget funnel logging -- deliberately NOT awaited by any call
+// site (unlike logLead above). WhatsAppSession TTL-expires 30 minutes after
+// last activity, so it can't back funnel/drop-off reporting once a stale
+// conversation is reaped; this is the permanent record of every step
+// transition. The .catch here (rather than a caller-side try/catch) is what
+// makes the write genuinely non-blocking: nothing awaits this promise, so a
+// slow or failing write can never delay or break the customer-facing
+// message it accompanies.
+function logFunnelEvent(phone, sessionId, step, language, serviceLabel) {
+  WhatsAppFunnelEvent.create({ phone, sessionId, step, language, serviceLabel })
+    .catch((err) => console.error('[whatsappFlow] WhatsAppFunnelEvent.create failed:', err.message));
 }
 
 // ============================================================
@@ -775,6 +805,12 @@ async function handleAwaitingConfirm(session, parsed) {
       whatsappLanguage : lang,
     });
 
+    // Terminal funnel step -- not a session.step value (the session is
+    // deleted below, never transitions to a "confirmed" step of its own),
+    // so this is logged explicitly rather than falling out of saveSession's
+    // generic step-change check above.
+    logFunnelEvent(session.phone, session._id, TERMINAL_STEP, lang, session.serviceLabel);
+
     await whatsapp.sendText(session.phone, t(lang, 'bookingConfirmed', {
       bookingId: trip.tripNumber || trip._id,
       phone    : process.env.SUPPORT_PHONE,
@@ -802,6 +838,17 @@ const STEP_HANDLERS = {
   AWAITING_DROP_CHOICE  : handleAwaitingDropChoice,
   AWAITING_CONFIRM : handleAwaitingConfirm,
 };
+
+// Sentinel funnel step for a completed booking. Not a real session.step
+// value -- handleAwaitingConfirm's success path deletes the session
+// (endSession) rather than transitioning it to any further step, so this
+// is logged as its own explicit event instead of falling out of
+// saveSession's step-change instrumentation. Appended after
+// STEP_HANDLERS' own order so routes/whatsappRoutes.js's funnel endpoint
+// can derive its full ordered step list (mid-flow steps + the terminal
+// one) from this module alone, with no separate hardcoded list.
+const TERMINAL_STEP = 'BOOKING_CONFIRMED';
+const FUNNEL_STEPS = [...Object.keys(STEP_HANDLERS), TERMINAL_STEP];
 
 // ============================================================
 // @desc  Entry point -- called once per deduped inbound message by
@@ -836,4 +883,4 @@ async function handleMessage(message) {
   }
 }
 
-module.exports = { handleMessage };
+module.exports = { handleMessage, FUNNEL_STEPS, TERMINAL_STEP };

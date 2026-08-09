@@ -24,6 +24,8 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const whatsappFlow = require('../services/whatsappFlow');
+const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
+const { protect, authorize } = require('../middleware/auth');
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message
 // (network retry, or our own >5s response in some edge case) even though
@@ -121,6 +123,115 @@ router.post('/webhook', (req, res) => {
       console.error('[whatsapp webhook] Processing failed:', err.message);
     }
   })();
+});
+
+// ============================================================
+// @route   GET /api/whatsapp/funnel
+// @desc    Funnel/drop-off analytics for the WhatsApp booking flow, read
+//          from WhatsAppFunnelEvent (WhatsAppSession itself TTL-expires 30
+//          minutes after last activity, so it can't back this report --
+//          see that model's own comment).
+// @access  Private [owner] -- the two routes above are intentionally
+//          public/webhook-authenticated (Meta's verify_token + HMAC
+//          signature, not a user login), which doesn't apply to an
+//          admin-facing analytics endpoint returning customer phone
+//          numbers; protect+authorize('owner') is the CRM-read pattern
+//          routes/whatsappLeads.js already uses for this same WhatsApp
+//          feature area.
+//
+// Query params:
+//   days - lookback window in days (default 7)
+// ============================================================
+router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const parsedDays = parseInt(req.query.days, 10);
+    const days = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 7;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const { FUNNEL_STEPS, TERMINAL_STEP } = whatsappFlow;
+
+    const [result] = await WhatsAppFunnelEvent.aggregate([
+      { $match: { enteredAt: { $gte: cutoff } } },
+
+      // Ascending so $last below reflects each phone's truly most recent
+      // event in the window.
+      { $sort: { enteredAt: 1 } },
+
+      // One row per phone: latest step/language/serviceLabel/enteredAt,
+      // whether this phone ever logged the terminal step (regardless of
+      // whether it's their most recent event), and the full distinct set
+      // of steps they've ever logged -- feeds reachedByStep below without
+      // a second pass over the raw events.
+      {
+        $group: {
+          _id: '$phone',
+          lastStep: { $last: '$step' },
+          language: { $last: '$language' },
+          serviceLabel: { $last: '$serviceLabel' },
+          lastSeenAt: { $last: '$enteredAt' },
+          reachedTerminal: { $max: { $cond: [{ $eq: ['$step', TERMINAL_STEP] }, 1, 0] } },
+          stepsSeen: { $addToSet: '$step' },
+        },
+      },
+
+      {
+        $facet: {
+          overview: [
+            {
+              $group: {
+                _id: null,
+                totalConversations: { $sum: 1 },
+                completed: { $sum: '$reachedTerminal' },
+              },
+            },
+          ],
+          reachedByStep: [
+            { $unwind: '$stepsSeen' },
+            { $group: { _id: '$stepsSeen', reached: { $sum: 1 } } },
+          ],
+          droppedByStep: [
+            { $match: { reachedTerminal: 0 } },
+            { $group: { _id: '$lastStep', droppedHere: { $sum: 1 } } },
+          ],
+          dropoffs: [
+            { $match: { reachedTerminal: 0 } },
+            { $sort: { lastSeenAt: -1 } },
+            { $limit: 200 },
+            {
+              $project: {
+                _id: 0,
+                phone: '$_id',
+                lastStep: 1,
+                language: 1,
+                serviceLabel: 1,
+                lastSeenAt: 1,
+                minutesSince: { $round: [{ $divide: [{ $subtract: ['$$NOW', '$lastSeenAt'] }, 60000] }, 1] },
+              },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const overview = result.overview[0] || { totalConversations: 0, completed: 0 };
+    const reachedMap = Object.fromEntries(result.reachedByStep.map((r) => [r._id, r.reached]));
+    const droppedMap = Object.fromEntries(result.droppedByStep.map((r) => [r._id, r.droppedHere]));
+
+    const steps = FUNNEL_STEPS.map((step) => ({
+      step,
+      reached: reachedMap[step] || 0,
+      droppedHere: droppedMap[step] || 0,
+    }));
+
+    res.json({
+      success: true,
+      totalConversations: overview.totalConversations,
+      completed: overview.completed,
+      steps,
+      dropoffs: result.dropoffs,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

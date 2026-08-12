@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(node -c services/whatsappFlow.js)",
+      "Bash(timeout 15 node server.js)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(echo \"---exit:$?---\")",
+      "Read(//tmp/**)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(rm -f server_boot_test.pid server_boot_test.log)",
+      "Bash(netstat -ano)",
+      "Bash(powershell -Command \"Stop-Process -Id 1012 -Force\")",
+      "Bash(node -c services/whatsappStrings.js)",
+      "Bash(powershell -Command \"Get-Process -Id 5692 | Select-Object Id,ProcessName,Path,StartTime\")",
+      "Bash(powershell -Command \"Stop-Process -Id 5692 -Force\")",
+      "Bash(awk '{print $5}')"
+    ]
+  }
+}

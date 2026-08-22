@@ -51,7 +51,11 @@ const TEMPLATE_LANG = 'en';
 // whoever holds the phone, and an ObjectId is guessable from a known
 // neighbour. Served by savelife-web's app/track/[token] page against the
 // public GET /api/trips/track/:token endpoint.
-const TRACK_URL_BASE = 'https://savelife.health/track';
+//
+// Same base as the SMS channel (services/trackingNotifications.js). WhatsApp
+// has no DLT whitelist to satisfy, but a customer who gets both messages
+// must not receive two different-looking links for one trip.
+const TRACK_URL_BASE = `${process.env.PUBLIC_TRACKING_BASE_URL || 'https://www.savelife.health'}/track`;
 
 // Same rough straight-line assumption trackTrip uses for its "~6 min
 // away" indicator -- not a routed ETA (no Directions call, same quota

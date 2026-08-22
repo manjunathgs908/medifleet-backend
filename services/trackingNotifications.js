@@ -25,7 +25,11 @@ const { Trip } = require('../models');
 const smsService = require('../utils/smsService');
 const whatsappNotifications = require('./whatsappNotifications');
 
-const TRACK_URL_BASE = 'https://savelife.health/track';
+// www, not apex: the Jio/TrueConnect DLT whitelist is registered
+// against www.savelife.health, and DLT matches the URL in the SMS body
+// as text — an apex link is judged unwhitelisted even though it would
+// 308 to the same page. www is also what production serves directly.
+const TRACK_URL_BASE = `${process.env.PUBLIC_TRACKING_BASE_URL || 'https://www.savelife.health'}/track`;
 
 // Resolved here rather than taken off the passed trip: trackingToken is
 // select:false, so the trip objects the dispatch path hands us do not

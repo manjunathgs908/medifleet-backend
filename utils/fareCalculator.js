@@ -61,6 +61,7 @@ exports.compute = async ({
   oneWayKm,
   tripType          = 'one_way',
   acEnabled         = false,
+  helperEnabled     = false,
   additionalCharges = 0,
   gstRate,
 }) => {
@@ -83,7 +84,16 @@ exports.compute = async ({
   // AC stays on the distance actually driven, not the one-way leg: the air
   // conditioning runs for the whole journey, both directions.
   const acCharge = acEnabled && doc.acPerKm ? Math.round(doc.acPerKm * distanceKm) : 0;
-  const totalAdditionalCharges = additionalCharges + acCharge;
+
+  // Helper/attendant: a flat per-trip fee, added once. Deliberately NOT
+  // multiplied by distance the way acCharge is - a helper costs the same
+  // whether the trip is 5 km or 50. Falls back to 0 when the Pricing doc
+  // carries no helperCharge, so a service without one can never be billed
+  // for it. NOTE: which services may offer a helper, and the distance cap,
+  // are enforced by the booking UIs only - this function bills whatever a
+  // caller asks for. Tighten here if that becomes a trust boundary.
+  const helperCharge = helperEnabled && doc.helperCharge ? doc.helperCharge : 0;
+  const totalAdditionalCharges = additionalCharges + acCharge + helperCharge;
 
   const subTotal   = baseFare + totalAdditionalCharges;
   const gstAmount   = Math.round((subTotal * gstRate) / 100);

@@ -592,6 +592,7 @@ const tripSchema = new Schema(
     scheduleType  : { type: String, enum: ['now', 'later'], default: 'now' },
     scheduleDate  : { type: Date },
     acEnabled     : { type: Boolean, default: false },
+    helperEnabled : { type: Boolean, default: false },
 
     // â”€â”€ Assignment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     vehicle       : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
@@ -1216,6 +1217,12 @@ const pricingSchema = new Schema(
     nightEndHour: Number,
     oxygenPerKm: Number,
     acPerKm: Number,
+
+    // Flat per-trip helper/attendant fee. Unlike acPerKm above this is NOT
+    // distance-based - the same amount is added once however long the trip.
+    // Which services may offer it, and up to what distance, is a booking-UI
+    // rule rather than a pricing one; see compute() in utils/fareCalculator.js.
+    helperCharge: { type: Number, default: 300 },
     after300KmRate: Number,
     slabs: Array,
     active: Boolean,

@@ -221,7 +221,7 @@ exports.verifyBookingOtp = async (req, res, next) => {
 // ============================================================
 exports.estimateTrip = async (req, res, next) => {
   try {
-    const { pickupLat, pickupLng, dropLat, dropLng, selectedType, tripType, acEnabled } = req.body;
+    const { pickupLat, pickupLng, dropLat, dropLng, selectedType, tripType, acEnabled, helperEnabled } = req.body;
 
     const route = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
     if (!route) {
@@ -257,6 +257,7 @@ exports.estimateTrip = async (req, res, next) => {
         oneWayKm : route.distanceKm,
         tripType : isRound ? 'round_trip' : 'one_way',
         acEnabled: !!acEnabled,
+        helperEnabled: !!helperEnabled,
         gstRate  : GST_RATE,
       });
     } catch (fareErr) {
@@ -290,7 +291,7 @@ exports.createTrip = async (req, res, next) => {
       pickupLabel, dropLabel, dist, effectiveDist,
       dropLat, dropLng,
       scheduleType, scheduleDate, selectedType,
-      tripType, returnAddress, acEnabled,
+      tripType, returnAddress, acEnabled, helperEnabled,
       paymentPreference,
     } = req.body;
 
@@ -323,6 +324,7 @@ exports.createTrip = async (req, res, next) => {
         oneWayKm : verifiedOneWayKm ?? undefined,
         tripType : tripType === 'round_trip' ? 'round_trip' : 'one_way',
         acEnabled: !!acEnabled,
+        helperEnabled: !!helperEnabled,
         gstRate  : GST_RATE,
       });
     } catch (fareErr) {
@@ -348,6 +350,7 @@ exports.createTrip = async (req, res, next) => {
       scheduleType  : scheduleType || 'now',
       scheduleDate  : scheduleType === 'later' && scheduleDate ? new Date(scheduleDate) : undefined,
       acEnabled     : !!acEnabled,
+      helperEnabled : !!helperEnabled,
       baseFare      : fare.baseFare,
       distanceKm    : fare.distanceKm,
       additionalCharges: fare.additionalCharges,
@@ -1021,6 +1024,7 @@ exports.completeTrip = async (req, res, next) => {
         // to find the leg. That matches how createTrip built it.
         tripType         : trip.tripType,
         acEnabled        : trip.acEnabled,
+        helperEnabled    : trip.helperEnabled,
         additionalCharges: additionalCharges ? additionalCharges : 0,
         gstRate          : GST_RATE,
       });

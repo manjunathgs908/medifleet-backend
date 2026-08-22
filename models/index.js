@@ -538,6 +538,14 @@ const tripSchema = new Schema(
     // select:false keeps it out of ordinary reads; the CRM asks for it.
     trackingToken: { type: String, unique: true, sparse: true, index: true, select: false },
 
+    // Set the first time the customer is sent their tracking link, and
+    // used as the lock that makes that send once-per-trip: a reassignment
+    // or a retried dispatch finds it already set and sends nothing.
+    // Explicitly null (not merely absent) so the conditional claim in
+    // services/trackingNotifications.js can match on it.
+    trackingLinkSentAt  : { type: Date, default: null },
+    trackingLinkChannels: { type: [String], default: [] }, // 'sms' | 'whatsapp'
+
     // â”€â”€ Patient Details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     patientName   : { type: String, required: true, trim: true },
     patientPhone  : { type: String, required: true },

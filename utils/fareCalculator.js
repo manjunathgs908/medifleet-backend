@@ -112,6 +112,53 @@ const sendOtp = async (phone, otp) => {
   return response.data;
 };
 
+// Tracking-link SMS. Uses MSG91's v5 Flow API rather than the legacy
+// sendhttp.php that sendAlert below still uses, because in India a
+// transactional SMS has to quote a DLT-approved template -- a free-text
+// body is accepted by MSG91 and then held by the operator in 'pending'
+// forever, which is exactly how the OTP rollout failed.
+//
+// MSG91_TRACKING_TEMPLATE_ID is MSG91's own template id for the approved
+// tracking message (NOT the 19-digit DLT id -- that one is entered into
+// the template on the MSG91 panel). The template must define the
+// ##TRACKING_URL## variable, and the URL's domain has to be whitelisted
+// on the DLT portal or the message is rejected on content.
+//
+// Unset means no approved template exists yet: skip loudly rather than
+// send something that will silently never arrive.
+const sendTrackingSms = async (phone, trackingUrl) => {
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[SMS Mock] Tracking link for ${phone}: ${trackingUrl}`);
+    return { success: true, mock: true };
+  }
+
+  const templateId = process.env.MSG91_TRACKING_TEMPLATE_ID;
+  if (!templateId) {
+    return { skipped: true, reason: 'MSG91_TRACKING_TEMPLATE_ID is not set — no DLT-approved tracking template' };
+  }
+
+  const response = await axios.post(
+    'https://control.msg91.com/api/v5/flow/',
+    {
+      template_id: templateId,
+      // Never shorten: DLT matches the delivered body against the approved
+      // template, and a rewritten link no longer matches.
+      short_url  : '0',
+      ...(process.env.MSG91_SENDER_ID ? { sender: process.env.MSG91_SENDER_ID } : {}),
+      recipients : [{ mobiles: `91${phone}`, TRACKING_URL: trackingUrl }],
+    },
+    { headers: { 'Content-Type': 'application/json', authkey: process.env.MSG91_AUTH_KEY } },
+  );
+
+  console.log('[smsService.sendTrackingSms] MSG91 raw response:', JSON.stringify(response.data));
+  // MSG91 answers HTTP 200 with a payload-level failure, so the caller
+  // cannot rely on the absence of a throw.
+  if (response.data?.type === 'error') {
+    return { skipped: true, reason: response.data.message || 'MSG91 rejected the send', msg91: response.data };
+  }
+  return response.data;
+};
+
 const sendAlert = async (phone, message) => {
   if (process.env.NODE_ENV === 'development') {
     console.log(`[SMS Mock] Alert to ${phone}: ${message}`);
@@ -155,6 +202,7 @@ module.exports = {
   findPricingDoc,
   sendOtp,
   sendAlert,
+  sendTrackingSms,
   cloudinary,
   uploadToCloudinary
 };

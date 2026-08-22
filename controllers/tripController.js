@@ -27,6 +27,7 @@ const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/
 const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
 const whatsappNotifications = require('../services/whatsappNotifications');
+const trackingNotifications = require('../services/trackingNotifications');
 
 const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
 
@@ -460,6 +461,15 @@ const dispatchTripToDriver = async (trip, driverId) => {
   // since both funnel through this shared tail.
   whatsappNotifications.notifyDriverAssigned(trip)
     .catch((err) => console.error('[whatsappNotifications] notifyDriverAssigned failed:', err.message));
+
+  // Customer's live tracking link, over SMS and WhatsApp. Placed here
+  // because this tail is the single point both dispatch paths funnel
+  // through — auto-assign in createTrip and manual assign via
+  // assignVehicle — so website, app, CRM and WhatsApp bookings all get it
+  // from one call site. Once per trip, not per assignment: the guard lives
+  // in the service, keyed on trip.trackingLinkSentAt.
+  trackingNotifications.notifyTrackingLink(trip)
+    .catch((err) => console.error('[trackingNotifications] notifyTrackingLink failed:', err.message));
 };
 
 // ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
@@ -1783,6 +1793,11 @@ exports.trackTripByToken = async (req, res, next) => {
     return res.json({
       success: true,
       trip: {
+        // Display-only, and the lookup key POST /api/call/connect accepts —
+        // that is what lets the browser page place a masked call without
+        // ever seeing the driver's number. Already shown to this customer
+        // in every WhatsApp template, so it is not a new disclosure.
+        tripNumber     : trip.tripNumber,
         status         : trip.status,
         customerStatus : customerFacingStatus(trip),
         driverConfirmed: !!trip.driverConfirmed,

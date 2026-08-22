@@ -2,10 +2,11 @@
  * services/whatsappNotifications.js
  * ============================================================
  * Outbound WhatsApp messages for trip lifecycle events -- driver assigned,
- * trip started (dispatched -> en_route), trip completed. Every function
- * is a no-op for anything but a WhatsApp-origin trip (trip.bookingSource
- * === 'whatsapp'): app/CRM customers may not be on WhatsApp at all, so
- * this must never fire for them.
+ * trip started (dispatched -> en_route), trip completed, plus the customer
+ * tracking link. These used to fire only for WhatsApp-origin trips; they
+ * now fire for every booking source, because a customer who booked on the
+ * website has the same need to know an ambulance is coming. The only gate
+ * left is having a patientPhone.
  *
  * Approved message templates (driver_assigned / trip_started /
  * trip_complete), not plain text. Templates are required to message
@@ -16,7 +17,7 @@
  * what Meta approved; changing it silently sends the wrong values into
  * the wrong slots (Meta validates the count, never the meaning).
  *
- * Language: English only. All five templates are approved in 'en' and
+ * Language: English only. The approved templates exist in 'en' and
  * nothing else, so every customer gets 'en' regardless of
  * trip.whatsappLanguage. That field is still set at booking time (see
  * whatsappFlow.js) and still drives the booking conversation itself --
@@ -247,4 +248,41 @@ async function notifyTripCompleted(trip) {
   }
 }
 
-module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted };
+// ============================================================
+// @desc  The customer's live tracking link, sent the moment a driver is
+//        assigned. A NEW template rather than a slot bolted onto
+//        driver_assigned: that one is already approved and in use, and
+//        editing an approved template sends it back through Meta review,
+//        taking the working driver-assignment notification down with it.
+//
+//        Template tracking_link (body-only, one variable):
+//          🚑 SaveLife Ambulance
+//          Your ambulance has been assigned.
+//          Track your ambulance live:
+//          {{1}} tracking URL
+//
+//        Must be submitted and approved in Meta Business Manager before
+//        this delivers; an unapproved name is rejected at send time and
+//        surfaces here as a skip, not a crash.
+//
+// @param url  Already built from trip.trackingToken by the caller.
+// ============================================================
+async function notifyTrackingLink(trip, url) {
+  if (!trip.patientPhone) return { skipped: true, reason: 'no patient phone' };
+  if (!url) return { skipped: true, reason: 'no tracking url' };
+
+  const res = await whatsapp.sendTemplate(
+    trip.patientPhone,
+    'tracking_link',
+    TEMPLATE_LANG,
+    bodyComponents(url),
+  );
+
+  // sendMessage swallows Meta's errors and returns null, so a missing
+  // result means the send did not happen (most likely: template not yet
+  // approved under this name).
+  if (!res) return { skipped: true, reason: 'WhatsApp send failed — is the tracking_link template approved?' };
+  return res;
+}
+
+module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted, notifyTrackingLink };

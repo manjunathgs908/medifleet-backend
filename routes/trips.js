@@ -7,6 +7,7 @@ const { protect, authorize } = require('../middleware/auth');
 
 router.post('/send-otp',   tripCtrl.sendBookingOtp);
 router.post('/verify-otp', tripCtrl.verifyBookingOtp);
+router.post('/estimate', protect, tripCtrl.estimateTrip);
 router.post('/', tripCtrl.createTrip);
 router.get('/:id/track', tripCtrl.trackTrip);
 router.put('/:id/customer-cancel', tripCtrl.customerCancelTrip);

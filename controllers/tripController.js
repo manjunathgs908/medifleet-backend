@@ -30,15 +30,19 @@ const whatsappNotifications = require('../services/whatsappNotifications');
 
 const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
 
-// Independently verifies road distance server-side via Google Directions,
-// using the trip's own coordinates — never trusts the client-submitted
+// Independently resolves the route server-side via Google Directions, using
+// the trip's own coordinates — never trusts the client-submitted
 // dist/effectiveDist for billing (a client bug, like the website's old
 // silent Haversine fallback, or outright tampering, could otherwise
 // underprice a trip). Returns null if coordinates are incomplete or the
 // Google call fails, so the caller can fall back safely rather than
 // hard-blocking every booking on a Google outage. Same GOOGLE_MAPS_API_KEY
 // env var placesController.js already uses for /api/places/directions.
-async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
+//
+// One call, three consumers: the billing distance (via verifyRoadDistanceKm
+// below), and the duration + overview polyline the dispatch map draws — so
+// quoting a trip and drawing its route cost one Directions request, not two.
+async function verifyRoute(originLat, originLng, destLat, destLng) {
   if (![originLat, originLng, destLat, destLng].every(Number.isFinite)) return null;
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) return null;
@@ -49,10 +53,20 @@ async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
     });
     const leg = data.routes?.[0]?.legs?.[0];
     if (!leg) return null;
-    return leg.distance.value / 1000;
+    return {
+      distanceKm : leg.distance.value / 1000,
+      durationSec: leg.duration?.value ?? null,
+      polyline   : data.routes[0].overview_polyline?.points || null,
+    };
   } catch {
     return null;
   }
+}
+exports.verifyRoute = verifyRoute;
+
+async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
+  const route = await verifyRoute(originLat, originLng, destLat, destLng);
+  return route ? route.distanceKm : null;
 }
 exports.verifyRoadDistanceKm = verifyRoadDistanceKm; // reused by whatsappFlow.js for the same Google-Directions-verified billing distance
 
@@ -188,6 +202,74 @@ exports.verifyBookingOtp = async (req, res, next) => {
 
 
 // ============================================================
+// @route   POST /api/trips/estimate
+// @desc    Quote a trip without creating one. Deliberately runs the SAME
+//          two steps createTrip runs -- verifyRoute for the billing
+//          distance, then fareCalculator.compute at the same GST_RATE --
+//          so the number the CRM operator reads out to a caller is the
+//          number the booking will actually be created with. Any other
+//          implementation would be a second pricing formula, which is
+//          exactly what the three existing client-side copies already
+//          cost us.
+//
+//          selectedType is optional: without it this returns route only
+//          (distance/duration/polyline), which is what the dispatch map
+//          needs before the operator has picked a service. Read-only --
+//          writes nothing.
+// @access  Private [all CRM staff]
+// ============================================================
+exports.estimateTrip = async (req, res, next) => {
+  try {
+    const { pickupLat, pickupLng, dropLat, dropLng, selectedType, tripType, acEnabled } = req.body;
+
+    const route = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
+    if (!route) {
+      return res.status(422).json({
+        success: false,
+        message: 'Could not calculate a route between these locations. Check both pins and try again.',
+      });
+    }
+
+    // Round trip bills the road distance both ways -- identical to
+    // createTrip, not a rule re-invented here.
+    const isRound    = tripType === 'round_trip';
+    const distanceKm = isRound ? route.distanceKm * 2 : route.distanceKm;
+
+    const payload = {
+      success   : true,
+      tripType  : isRound ? 'round_trip' : 'one_way',
+      oneWayKm  : route.distanceKm,
+      distanceKm,
+      // Duration stays one-way: it is how long until the ambulance
+      // reaches the drop, which is what dispatch actually needs.
+      durationSec: route.durationSec,
+      polyline   : route.polyline,
+      fare       : null,
+    };
+
+    if (!selectedType) return res.json(payload);
+
+    try {
+      payload.fare = await fareCalculator.compute({
+        selectedType,
+        distanceKm,
+        acEnabled: !!acEnabled,
+        gstRate  : GST_RATE,
+      });
+    } catch (fareErr) {
+      // A missing Pricing doc is a configuration answer, not a crash: the
+      // route is still valid and the map should still draw.
+      payload.fareError = fareErr.message;
+    }
+
+    return res.json(payload);
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
 // @route   POST /api/trips
 // @desc    Create a new booking (Owner)
 // @access  Private [owner]
@@ -220,7 +302,8 @@ exports.createTrip = async (req, res, next) => {
     // fall back to the client-submitted figure if verification isn't
     // possible (client not yet sending dropLat/dropLng, or the Google call
     // itself fails) so a booking never hard-blocks on that.
-    const verifiedOneWayKm = await verifyRoadDistanceKm(pickupLat, pickupLng, dropLat, dropLng);
+    const verifiedRoute    = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
+    const verifiedOneWayKm = verifiedRoute ? verifiedRoute.distanceKm : null;
     const distanceKm = verifiedOneWayKm != null
       ? (tripType === 'round_trip' ? verifiedOneWayKm * 2 : verifiedOneWayKm)
       : (effectiveDist ?? dist ?? 0);
@@ -265,6 +348,7 @@ exports.createTrip = async (req, res, next) => {
       // grandTotal get recomputed at completion (see Trip schema comment).
       estimatedDistanceKm: fare.distanceKm,
       estimatedFare      : fare.grandTotal,
+      estimatedDurationSec: verifiedRoute?.durationSec ?? undefined,
       bookedBy      : req.user?._id || undefined,
       leadId,
       paymentPreference: validPaymentPreference,

@@ -606,6 +606,10 @@ const tripSchema = new Schema(
     // "Estimated ₹X → Final ₹Y" like Ola/Uber.
     estimatedDistanceKm: { type: Number },
     estimatedFare      : { type: Number },
+    // One-way driving time from the same Google Directions response the
+    // billing distance comes from -- captured at booking so dispatch can
+    // show an ETA without re-querying Google per board refresh.
+    estimatedDurationSec: { type: Number },
 
     // ── Actual trip telemetry — set at completion (not this pass; see
     // fareCalculator/completeTrip work, tracked separately).

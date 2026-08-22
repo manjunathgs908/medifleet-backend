@@ -254,6 +254,8 @@ exports.estimateTrip = async (req, res, next) => {
       payload.fare = await fareCalculator.compute({
         selectedType,
         distanceKm,
+        oneWayKm : route.distanceKm,
+        tripType : isRound ? 'round_trip' : 'one_way',
         acEnabled: !!acEnabled,
         gstRate  : GST_RATE,
       });
@@ -316,6 +318,10 @@ exports.createTrip = async (req, res, next) => {
       fare = await fareCalculator.compute({
         selectedType,
         distanceKm,
+        // Null when Google could not be reached and distanceKm fell back to
+        // the client figure; compute() then derives the leg itself.
+        oneWayKm : verifiedOneWayKm ?? undefined,
+        tripType : tripType === 'round_trip' ? 'round_trip' : 'one_way',
         acEnabled: !!acEnabled,
         gstRate  : GST_RATE,
       });
@@ -1011,6 +1017,9 @@ exports.completeTrip = async (req, res, next) => {
       fare = await fareCalculator.compute({
         selectedType     : trip.selectedType,
         distanceKm       : trip.distanceKm,
+        // No one-way figure is stored, so compute() halves trip.distanceKm
+        // to find the leg. That matches how createTrip built it.
+        tripType         : trip.tripType,
         acEnabled        : trip.acEnabled,
         additionalCharges: additionalCharges ? additionalCharges : 0,
         gstRate          : GST_RATE,

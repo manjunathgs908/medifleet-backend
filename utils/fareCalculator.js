@@ -41,9 +41,25 @@ async function findPricingDoc(selectedType) {
 }
 exports.findPricingDoc = findPricingDoc;
 
+// True only when this trip should be priced off the dedicated round-trip
+// table: the caller said round trip AND the service actually has one. A
+// service without the field falls through to the historical behaviour
+// rather than silently losing its round-trip uplift.
+function roundTripTable(doc, tripType) {
+  if (tripType !== 'round_trip') return null;
+  if (!Array.isArray(doc.roundTripSlabs) || doc.roundTripSlabs.length < 2) return null;
+  return { slabs: doc.roundTripSlabs, after300KmRate: doc.roundTripAfter300KmRate };
+}
+
 exports.compute = async ({
   selectedType,
   distanceKm        = 0,
+  // The single leg. Only used to look up roundTripSlabs, which is keyed on
+  // it. Derived from distanceKm when a caller cannot supply it (completeTrip
+  // only ever holds the round figure), because distanceKm for a round trip
+  // is that leg doubled.
+  oneWayKm,
+  tripType          = 'one_way',
   acEnabled         = false,
   additionalCharges = 0,
   gstRate,
@@ -55,7 +71,17 @@ exports.compute = async ({
     throw new Error(`No active pricing found for vehicle type "${selectedType}"`);
   }
 
-  const baseFare = interpolateSlabFare(doc, distanceKm);
+  // Round trip reads its own table at the one-way distance; everything else
+  // reads the ordinary slabs at the distance being billed. Same
+  // interpolation either way — there is one implementation of that maths.
+  const rtTable = roundTripTable(doc, tripType);
+  const rtLegKm = oneWayKm != null ? oneWayKm : distanceKm / 2;
+  const baseFare = rtTable
+    ? interpolateSlabFare(rtTable, rtLegKm)
+    : interpolateSlabFare(doc, distanceKm);
+
+  // AC stays on the distance actually driven, not the one-way leg: the air
+  // conditioning runs for the whole journey, both directions.
   const acCharge = acEnabled && doc.acPerKm ? Math.round(doc.acPerKm * distanceKm) : 0;
   const totalAdditionalCharges = additionalCharges + acCharge;
 

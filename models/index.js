@@ -1220,6 +1220,19 @@ const pricingSchema = new Schema(
     slabs: Array,
     active: Boolean,
 
+    // ── Round-trip pricing, edited by hand in MongoDB ──────────────
+    // Same [{km, price}] shape as `slabs`, and read by the same
+    // interpolateSlabFare() — but keyed on the ONE-WAY distance, because
+    // that is the journey an operator actually quotes: "10 km each way,
+    // round trip" is one row, not a doubled number to work backwards from.
+    //
+    // Absent or shorter than 2 points means round trips keep billing the
+    // way they always have (one-way slabs at twice the distance), so
+    // adding the field to one service never disturbs the others. No price
+    // or multiplier for this lives in code — only here.
+    roundTripSlabs: Array,
+    roundTripAfter300KmRate: Number,
+
     // ── Wait-time charges (Ola/Uber-style), editable in DB/CRM — never
     // hardcoded in fare logic. Three independent brackets, each with its
     // own free-minutes threshold and rate; return-drop wait is two-tier

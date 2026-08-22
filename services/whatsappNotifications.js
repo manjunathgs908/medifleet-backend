@@ -33,7 +33,7 @@
  */
 'use strict';
 
-const { User, Vehicle } = require('../models');
+const { User, Vehicle, Trip } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const whatsapp = require('./whatsappService');
 const { haversineKm } = require('../utils/haversine');
@@ -45,14 +45,11 @@ const { haversineKm } = require('../utils/haversine');
 // English message.
 const TEMPLATE_LANG = 'en';
 
-// Customer-facing tracking page. The only tracking key this backend
-// actually resolves is the Mongo _id (GET /api/trips/:id/track does
-// Trip.findById) -- trip.tripNumber is display-only, nothing looks a trip
-// up by it -- so the link is built from _id even though it is the uglier
-// of the two.
-// TODO: the /track/:id page itself does not exist on savelife-web yet;
-// this link 404s until it ships. Build it against the existing public
-// GET /api/trips/:id/track response.
+// Customer-facing tracking page.
+// Built from trip.trackingToken, never the _id: this URL is handed to
+// whoever holds the phone, and an ObjectId is guessable from a known
+// neighbour. Served by savelife-web's app/track/[token] page against the
+// public GET /api/trips/track/:token endpoint.
 const TRACK_URL_BASE = 'https://savelife.health/track';
 
 // Same rough straight-line assumption trackTrip uses for its "~6 min
@@ -98,8 +95,17 @@ function etaToPickup(trip, driver) {
   return Math.max(1, Math.round((km / ASSUMED_KMPH) * 60));
 }
 
-function trackUrl(trip) {
-  return `${TRACK_URL_BASE}/${trip._id}`;
+// trackingToken is select:false, so the trip objects the controllers hand
+// us almost never carry it. Resolved here rather than by asking every
+// caller to remember `.select('+trackingToken')` — one forgotten call site
+// would silently send the customer a '-' instead of a link.
+async function trackUrl(trip) {
+  let token = trip.trackingToken;
+  if (!token && trip._id) {
+    const doc = await Trip.findById(trip._id).select('+trackingToken').lean();
+    token = doc?.trackingToken;
+  }
+  return token ? `${TRACK_URL_BASE}/${token}` : null;
 }
 
 // ============================================================
@@ -121,7 +127,10 @@ function trackUrl(trip) {
 //        becomes the only sanctioned path.
 // ============================================================
 async function notifyDriverAssigned(trip) {
-  if (trip.bookingSource !== 'whatsapp') return;
+  // Was gated to WhatsApp-origin trips only. Every booking source now
+  // gets the same notification — a customer who booked on the website
+  // or over the phone has the same need to know an ambulance is coming.
+  if (!trip.patientPhone) return;
   try {
     const [driver, vehicle, ambulance] = await Promise.all([
       trip.driver ? User.findById(trip.driver).select('name phone availability') : null,
@@ -175,7 +184,10 @@ async function notifyDriverAssigned(trip) {
 //        24h window too (a plain text there is silently dropped by Meta).
 // ============================================================
 async function notifyTripStarted(trip, otp) {
-  if (trip.bookingSource !== 'whatsapp') return;
+  // Was gated to WhatsApp-origin trips only. Every booking source now
+  // gets the same notification — a customer who booked on the website
+  // or over the phone has the same need to know an ambulance is coming.
+  if (!trip.patientPhone) return;
   try {
     await whatsapp.sendTemplate(
       trip.patientPhone,
@@ -185,7 +197,7 @@ async function notifyTripStarted(trip, otp) {
         trip.tripNumber,
         trip.pickup?.address,
         trip.dropAddress,
-        trackUrl(trip),
+        await trackUrl(trip),
       ),
     );
 
@@ -214,7 +226,10 @@ async function notifyTripStarted(trip, otp) {
 //        creation, and there is no hosted invoice document today.
 // ============================================================
 async function notifyTripCompleted(trip) {
-  if (trip.bookingSource !== 'whatsapp') return;
+  // Was gated to WhatsApp-origin trips only. Every booking source now
+  // gets the same notification — a customer who booked on the website
+  // or over the phone has the same need to know an ambulance is coming.
+  if (!trip.patientPhone) return;
   try {
     await whatsapp.sendTemplate(
       trip.patientPhone,
@@ -224,7 +239,7 @@ async function notifyTripCompleted(trip) {
         trip.tripNumber,
         trip.distanceKm,
         trip.grandTotal,
-        trackUrl(trip),
+        await trackUrl(trip),
       ),
     );
   } catch (err) {

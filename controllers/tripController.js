@@ -1581,6 +1581,9 @@ exports.getTrips = async (req, res, next) => {
 exports.getLiveBoard = async (req, res, next) => {
   try {
     const activeTrips = await Trip.find({ status: { $in: ['booked', 'dispatched', 'en_route'] } })
+      // trackingToken is select:false — the dispatch board asks for it
+      // explicitly so operators can hand a caller their tracking link.
+      .select('+trackingToken')
       .populate('vehicle',      'registrationNumber model gps status')
       .populate('ambulance',    'registrationNumber')
       .populate('driver',       'name phone availability')
@@ -1688,6 +1691,139 @@ exports.getTripById = async (req, res, next) => {
 // its own existing Directions helper without needing this to be exact.
 const ASSUMED_KMPH = 30;
 
+// Vehicle identity for a customer-facing view. Ambulance-sourced dispatch
+// (an owner/driver on duty via the mobile app) never sets trip.vehicle at
+// all, only trip.ambulance, so those trips would otherwise read "details
+// pending" forever. Shared by both tracking endpoints.
+function trackedVehicleInfo(trip) {
+  if (trip.ambulance) {
+    return {
+      registrationNumber: trip.ambulance.registrationNumber,
+      type              : trip.ambulance.serviceType,
+      typeLabel         : trip.ambulance.serviceTypeLabel,
+      model             : trip.ambulance.vehicleModel,
+    };
+  }
+  if (trip.vehicle) {
+    return {
+      registrationNumber: trip.vehicle.registrationNumber,
+      type              : trip.vehicle.type,
+    };
+  }
+  return null;
+}
+
+// Driver's last reported position plus a rough straight-line distance/ETA
+// to the pickup point. Only meaningful before pickup is verified. Shared by
+// both tracking endpoints so the number the app shows and the number the
+// browser page shows are computed once, not twice.
+function trackedDriverPosition(trip) {
+  const lat = trip.driver?.availability?.lat;
+  const lng = trip.driver?.availability?.lng;
+  if (lat == null || lng == null) {
+    return { driverLocation: null, distanceToPickupKm: null, etaMinutes: null };
+  }
+
+  const driverLocation = { lat, lng, updatedAt: trip.driver.availability.updatedAt };
+
+  if (trip.pickupVerified || trip.pickup?.lat == null || trip.pickup?.lng == null) {
+    return { driverLocation, distanceToPickupKm: null, etaMinutes: null };
+  }
+
+  const distanceToPickupKm =
+    Math.round(haversineKm(lat, lng, trip.pickup.lat, trip.pickup.lng) * 10) / 10;
+  const etaMinutes = Math.max(1, Math.round((distanceToPickupKm / ASSUMED_KMPH) * 60));
+  return { driverLocation, distanceToPickupKm, etaMinutes };
+}
+
+// The one line a customer should read. Collapses the trip lifecycle plus
+// its three milestone flags into plain language -- it does NOT change the
+// state machine, and nothing branches on the string it returns.
+function customerFacingStatus(trip) {
+  if (trip.status === 'cancelled')  return 'Trip Cancelled';
+  if (trip.status === 'completed')  return 'Trip Completed';
+  if (trip.pickupVerified)          return 'On the way to hospital';
+  if (trip.arrivedAtPickupAt)       return 'Ambulance has arrived';
+  if (trip.status === 'en_route')   return 'Ambulance is on the way';
+  if (trip.status === 'dispatched') return trip.driverConfirmed ? 'Driver Assigned' : 'Searching for ambulance';
+  return 'Searching for ambulance';
+}
+
+
+// ============================================================
+// @route   GET /api/trips/track/:token
+// @desc    Public browser tracking, keyed on the random trackingToken
+//          rather than the _id. Deliberately a narrower payload than the
+//          legacy /:id/track: no pickupOtp, no bill, no payment
+//          preference, no raw driver phone -- anyone holding the URL can
+//          read this, and the URL travels over WhatsApp and SMS.
+// @access  Public
+// ============================================================
+exports.trackTripByToken = async (req, res, next) => {
+  try {
+    const trip = await Trip.findOne({ trackingToken: req.params.token })
+      .populate('vehicle',   'registrationNumber type')
+      .populate('ambulance', 'registrationNumber serviceType serviceTypeLabel vehicleModel')
+      .populate('driver',    'name availability ratingSum ratingCount completedTripsCount');
+
+    if (!trip) {
+      return res.status(404).json({ success: false, message: 'Tracking link not found or expired.' });
+    }
+
+    // Same rule the legacy endpoint applies: a dispatched trip the driver
+    // has not accepted yet is still "searching" to the customer, so the
+    // driver and vehicle stay hidden rather than appearing prematurely.
+    const showDriver = !(trip.status === 'dispatched' && !trip.driverConfirmed) && trip.driver;
+
+    const { driverLocation, distanceToPickupKm, etaMinutes } =
+      showDriver ? trackedDriverPosition(trip) : { driverLocation: null, distanceToPickupKm: null, etaMinutes: null };
+
+    const ratingCount = trip.driver?.ratingCount || 0;
+
+    return res.json({
+      success: true,
+      trip: {
+        status         : trip.status,
+        customerStatus : customerFacingStatus(trip),
+        driverConfirmed: !!trip.driverConfirmed,
+        pickupVerified : !!trip.pickupVerified,
+        arrivedAtPickupAt: trip.arrivedAtPickupAt || null,
+        tripType       : trip.tripType,
+
+        // Name and rating only. The raw phone is withheld here exactly as
+        // it is on the legacy endpoint -- masked calling via
+        // POST /api/call/connect is the only route to the driver.
+        driver: showDriver ? {
+          name               : trip.driver.name,
+          ratingAvg          : ratingCount > 0 ? Math.round((trip.driver.ratingSum / ratingCount) * 10) / 10 : null,
+          ratingCount,
+          completedTripsCount: trip.driver.completedTripsCount || 0,
+        } : null,
+
+        vehicle: showDriver ? trackedVehicleInfo(trip) : null,
+
+        pickup     : trip.pickup,
+        dropAddress: trip.dropAddress,
+        dropLat    : trip.dropLat,
+        dropLng    : trip.dropLng,
+
+        driverLocation,
+        distanceToPickupKm,
+        etaMinutes,
+
+        estimatedDistanceKm : trip.estimatedDistanceKm,
+        estimatedDurationSec: trip.estimatedDurationSec,
+        estimatedFare       : trip.estimatedFare,
+
+        waitState: trip.getLiveWaitState(),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
 exports.trackTrip = async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.id)
@@ -1713,22 +1849,7 @@ exports.trackTrip = async (req, res, next) => {
     // app's Ambulance/Assignment system — see ownerController.actAsDriver)
     // never set trip.vehicle at all, only trip.ambulance. Prefer it when
     // present so those trips don't show "Vehicle details pending" forever.
-    let vehicleInfo = null;
-    if (!awaitingDriverAccept) {
-      if (trip.ambulance) {
-        vehicleInfo = {
-          registrationNumber: trip.ambulance.registrationNumber,
-          type               : trip.ambulance.serviceType,
-          typeLabel          : trip.ambulance.serviceTypeLabel,
-          model              : trip.ambulance.vehicleModel,
-        };
-      } else if (trip.vehicle) {
-        vehicleInfo = {
-          registrationNumber: trip.vehicle.registrationNumber,
-          type               : trip.vehicle.type,
-        };
-      }
-    }
+    const vehicleInfo = awaitingDriverAccept ? null : trackedVehicleInfo(trip);
 
     // Live driver position + a rough distance/ETA to the pickup point —
     // only meaningful pre-pickup (booked/dispatched/en_route-to-pickup).
@@ -1739,22 +1860,9 @@ exports.trackTrip = async (req, res, next) => {
     // unbuilt here rather than assuming they're always present; the
     // fields themselves are still returned below for callers that can
     // use them when they exist (see the driver app's proximity gate).
-    let driverLocation = null;
-    let distanceToPickupKm = null;
-    let etaMinutes = null;
-    if (showDriver && trip.driver.availability?.lat != null && trip.driver.availability?.lng != null) {
-      driverLocation = {
-        lat      : trip.driver.availability.lat,
-        lng      : trip.driver.availability.lng,
-        updatedAt: trip.driver.availability.updatedAt,
-      };
-      if (!trip.pickupVerified && trip.pickup?.lat != null && trip.pickup?.lng != null) {
-        distanceToPickupKm = Math.round(
-          haversineKm(driverLocation.lat, driverLocation.lng, trip.pickup.lat, trip.pickup.lng) * 10
-        ) / 10;
-        etaMinutes = Math.max(1, Math.round((distanceToPickupKm / ASSUMED_KMPH) * 60));
-      }
-    }
+    const { driverLocation, distanceToPickupKm, etaMinutes } = showDriver
+      ? trackedDriverPosition(trip)
+      : { driverLocation: null, distanceToPickupKm: null, etaMinutes: null };
 
     const ratingCount = trip.driver?.ratingCount || 0;
 
@@ -1784,6 +1892,11 @@ exports.trackTrip = async (req, res, next) => {
       success: true,
       trip: {
         status        : awaitingDriverAccept ? 'booked' : trip.status,
+        // Additive — the app can ignore these; the browser tracking page
+        // needs them to tell "on the way" from "has arrived".
+        customerStatus   : customerFacingStatus(trip),
+        driverConfirmed  : !!trip.driverConfirmed,
+        arrivedAtPickupAt: trip.arrivedAtPickupAt || null,
         pickupVerified: trip.pickupVerified,
         // Withheld once verified — no reason to keep displaying a
         // used/stale code (schema's own select:false intent: only the

@@ -26,6 +26,7 @@
 
 const mongoose = require('mongoose');
 const bcrypt   = require('bcryptjs');
+const crypto   = require('crypto');
 
 const { Schema } = mongoose;
 
@@ -528,6 +529,15 @@ const tripSchema = new Schema(
   {
     tripNumber: { type: String, unique: true }, // Auto-generated: TRP-YYYYMMDD-001
 
+    // Identifier for the public browser tracking link. Random on purpose,
+    // never the _id: that page is open to anyone holding the URL, and an
+    // ObjectId is a timestamp plus a per-process counter, so one known id
+    // makes its neighbours guessable -- and a guessed trip used to hand out
+    // the pickup OTP. sparse because trips created before this field
+    // existed have none, and a unique index cannot hold many nulls.
+    // select:false keeps it out of ordinary reads; the CRM asks for it.
+    trackingToken: { type: String, unique: true, sparse: true, index: true, select: false },
+
     // â”€â”€ Patient Details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     patientName   : { type: String, required: true, trim: true },
     patientPhone  : { type: String, required: true },
@@ -720,6 +730,10 @@ tripSchema.pre('save', function (next) {
   const rand = Math.random().toString(36).substr(2, 4).toUpperCase();
   this.tripNumber = `TRP-${Date.now()}-${rand}`;
   this.pickupOtp = String(Math.floor(1000 + Math.random() * 9000));
+  // 16 random bytes -> 22 url-safe characters. Hung off save rather than a
+  // controller so every creation path gets one: website, mobile app,
+  // WhatsApp flow and the CRM dispatch desk alike.
+  this.trackingToken = crypto.randomBytes(16).toString('base64url');
   next();
 });
 

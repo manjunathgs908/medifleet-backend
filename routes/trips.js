@@ -9,6 +9,10 @@ router.post('/send-otp',   tripCtrl.sendBookingOtp);
 router.post('/verify-otp', tripCtrl.verifyBookingOtp);
 router.post('/estimate', protect, tripCtrl.estimateTrip);
 router.post('/', tripCtrl.createTrip);
+// Token-keyed public tracking. Declared before '/:id/track' and
+// before any '/:id' pattern so 'track' is never read as an id.
+router.get('/track/:token', tripCtrl.trackTripByToken);
+// Legacy, still used by the released SaveLife mobile app — keep.
 router.get('/:id/track', tripCtrl.trackTrip);
 router.put('/:id/customer-cancel', tripCtrl.customerCancelTrip);
 router.put('/:id/rate', tripCtrl.rateTrip);

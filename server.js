@@ -100,6 +100,7 @@ app.use('/api/call',      require('./routes/callRoutes'));
 app.use('/api/sos',       sosRoutes);
 app.use('/api/whatsapp',  whatsappRoutes);
 app.use('/api/whatsapp-leads', whatsappLeadRoutes);
+app.use('/api/seo',       require('./routes/seo'));
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

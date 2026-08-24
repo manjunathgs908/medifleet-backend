@@ -216,6 +216,13 @@ function normaliseLegacy(raw) {
 
 seoArticleSchema.statics.normaliseLegacy = normaliseLegacy;
 
+// The only two states that may be served to the public. Defined here, next to
+// the enum it is drawn from, so the public API and the website cannot drift
+// from the model's idea of what "signed off" means. A draft, an in_review or a
+// rejected article is not a page -- it is work in progress, and serving one
+// would publish text no human has approved.
+seoArticleSchema.statics.PUBLIC_STATUSES = Object.freeze(['approved', 'published']);
+
 // Hydrated documents. pre('init') runs before casting, so the raw object is
 // corrected while it is still a plain object; strict mode then drops the
 // now-copied `schema` key instead of trying to cast it to a path that no

@@ -100,7 +100,8 @@ app.use('/api/call',      require('./routes/callRoutes'));
 app.use('/api/sos',       sosRoutes);
 app.use('/api/whatsapp',  whatsappRoutes);
 app.use('/api/whatsapp-leads', whatsappLeadRoutes);
-app.use('/api/seo',       require('./routes/seo'));
+app.use('/api/seo',       require('./routes/seo'));       // owner-only
+app.use('/api/guides',    require('./routes/seoPublic'));  // public, approved articles only
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

@@ -161,6 +161,10 @@ exports.setStatus = async (req, res, next) => {
       if (blocking.length) reasons.push(`${blocking.length} unverified claim(s)`);
       if (c.duplicateSlug) reasons.push('duplicate slug');
       if (c.similarityScore >= SIMILARITY_BLOCK) reasons.push(`too similar to an existing draft (${Math.round(c.similarityScore * 100)}%)`);
+      if (c.livePageSimilarity >= SIMILARITY_BLOCK) {
+        reasons.push(`too similar to the live page ${c.similarToLivePage || '(unknown)'} (${Math.round(c.livePageSimilarity * 100)}%)`);
+      }
+      if (c.schemaErrors?.length) reasons.push(`${c.schemaErrors.length} structured-data error(s)`);
       if ((c.wordCount || 0) < MIN_WORDS) reasons.push(`too short (${c.wordCount} words)`);
       if (c.titleLength < TITLE_MIN || c.titleLength > TITLE_MAX) reasons.push(`title is ${c.titleLength} characters (must be ${TITLE_MIN}-${TITLE_MAX})`);
       if (c.metaLength < META_MIN || c.metaLength > META_MAX) reasons.push(`meta description is ${c.metaLength} characters (must be ${META_MIN}-${META_MAX})`);

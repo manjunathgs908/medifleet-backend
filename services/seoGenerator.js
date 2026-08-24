@@ -16,6 +16,8 @@
 'use strict';
 
 const SeoArticle = require('../models/SeoArticle');
+const { validateJsonLd } = require('./seoSchemaValidator');
+const { refreshLivePageIndex, loadLivePageIndex, isIndexStale } = require('./seoLivePages');
 const { buildFactSheet } = require('./seoFacts');
 
 // Never hard-coded. An unset key is a configuration answer, not a crash.
@@ -261,13 +263,61 @@ async function generateDraft(input, user) {
   const duplicateSlug = Boolean(await SeoArticle.exists({ slug }));
 
   const shingles = shingle(`${article.h1} ${article.content}`);
-  const existing = await SeoArticle.find({}, 'slug title').select('+shingles').lean();
+  const existing = await SeoArticle.find({}, 'slug title status searchIntent cluster').select('+shingles').lean();
   let similarityScore = 0;
   let similarTo = null;
   for (const other of existing) {
     const score = jaccard(shingles, other.shingles || []);
     if (score > similarityScore) { similarityScore = score; similarTo = other._id; }
   }
+
+  // ── Against the pages that already rank ─────────────────────
+  //
+  // The similarity gate above only ever compared drafts to other drafts. The
+  // curated pages on savelife.health were invisible to it, so an article
+  // reworded from the live Whitefield page passed cleanly -- and publishing it
+  // would have put the two into competition for the same query, costing the
+  // ranking the site already had. Those pages are protected canonical
+  // content; nothing generated may duplicate one.
+  //
+  // Same fingerprint and the same SIMILARITY_BLOCK as the draft comparison.
+  // Two thresholds for one question would mean one of them was wrong.
+  if (await isIndexStale()) {
+    await refreshLivePageIndex({ base: facts.business.website, shingle });
+  }
+  const livePages = await loadLivePageIndex();
+
+  let livePageSimilarity = 0;
+  let similarToLivePage = null;
+  for (const page of livePages) {
+    const score = jaccard(shingles, page.shingles || []);
+    if (score > livePageSimilarity) { livePageSimilarity = score; similarToLivePage = page.path; }
+  }
+  const livePagesIndexed = livePages.length;
+
+  // ── Intent collisions ───────────────────────────────────────
+  //
+  // Two pages can be worded quite differently and still compete: same cluster,
+  // same search intent, same job. Body similarity does not catch that, and no
+  // threshold in this project describes it, so this is recorded and shown to
+  // the reviewer rather than blocking. Deliberately a plain equality test --
+  // inventing a cutoff for "too close in intent" would be a number nobody
+  // chose. See docs in the Phase 2 report: the blocking rule is a decision
+  // the business has to make, not one the code should assume.
+  const intentCollisions = existing
+    .filter((other) =>
+      other.status !== 'rejected' &&
+      other.cluster &&
+      article.cluster &&
+      other.cluster === article.cluster &&
+      other.searchIntent === article.searchIntent)
+    .map((other) => ({
+      source: 'article',
+      ref: other.slug,
+      cluster: other.cluster,
+      searchIntent: other.searchIntent,
+      titleSimilarity: jaccard(shingle(article.title, 2), shingle(other.title || '', 2)),
+    }));
 
   // Links must point at pages that exist. A plausible-looking URL that 404s
   // is worse than no link. Rejects are recorded rather than dropped: a draft
@@ -302,10 +352,19 @@ async function generateDraft(input, user) {
   );
   const blockingClaims = unverifiedClaims.filter((c) => c.severity !== 'phrasing');
 
+  // Structured data is checked here, where the article is assembled, rather
+  // than only at render time. The renderer still drops invalid nodes -- that
+  // stays the last line of defence -- but a reviewer must not be able to
+  // approve a page whose schema was never going to work.
+  const jsonLd = buildJsonLd(article, slug, facts);
+  const schemaErrors = validateJsonLd(jsonLd);
+
   const passed =
     blockingClaims.length === 0 &&
     !duplicateSlug &&
     similarityScore < SIMILARITY_BLOCK &&
+    livePageSimilarity < SIMILARITY_BLOCK &&
+    schemaErrors.length === 0 &&
     wordCount >= MIN_WORDS &&
     internalLinks.length >= 2 &&
     titleOk &&
@@ -326,11 +385,14 @@ async function generateDraft(input, user) {
     content: article.content,
     faqs: article.faqs || [],
     internalLinks,
-    jsonLd: buildJsonLd(article, slug, facts),
+    jsonLd,
     status: 'draft',
     shingles,
     checks: {
       similarityScore, similarTo, duplicateSlug,
+      livePageSimilarity, similarToLivePage, livePagesIndexed,
+      intentCollisions,
+      schemaErrors,
       unverifiedClaims, droppedLinks,
       titleLength, metaLength,
       wordCount, passed,

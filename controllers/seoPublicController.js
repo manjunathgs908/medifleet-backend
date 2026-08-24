@@ -49,14 +49,38 @@ const PAGE_FIELDS =
 // changes rarely, and the website is not the only thing that may fetch this.
 const CACHE = 'public, max-age=300, s-maxage=300, stale-while-revalidate=3600';
 
+// A path a curated page lives at, e.g. '/icu-ambulance-bangalore'. Bounded
+// and anchored so the value cannot be turned into a regex or a query operator.
+const LINK_PATH = new RegExp('^/[a-z0-9/-]{0,120}$');
+
 // ============================================================
 // @route   GET /api/guides
-// @desc    Every publicly visible guide, newest first. Index + sitemap.
+// @query   linksTo=/some-page   guides whose internal links point there
+// @desc    Every publicly visible guide, newest first. Index + sitemap, and
+//          the reverse-link block on curated pages.
 // @access  Public
 // ============================================================
 exports.list = async (req, res, next) => {
   try {
-    const articles = await SeoArticle.find(PUBLIC)
+    // Reverse links. A curated page asks "which approved guides link to me?",
+    // and the answer is the set of guides whose generator-validated
+    // internalLinks already name this page.
+    //
+    // Reversing an existing link rather than inventing a new relevance rule
+    // is the whole point: the forward link was chosen by the writer, checked
+    // against the live page list, and then approved by a human. A page that
+    // earned a link from a guide is exactly the page that guide is relevant
+    // to, and nothing here has to guess.
+    const filter = { ...PUBLIC };
+    const linksTo = String(req.query?.linksTo || '').toLowerCase().trim();
+    if (linksTo) {
+      if (!LINK_PATH.test(linksTo)) {
+        return res.status(400).json({ success: false, message: 'linksTo must be a site path.' });
+      }
+      filter['internalLinks.href'] = linksTo;
+    }
+
+    const articles = await SeoArticle.find(filter)
       .select(CARD_FIELDS)
       .sort({ publishedAt: -1, updatedAt: -1 })
       // A ceiling rather than pagination: the sitemap wants the whole set in

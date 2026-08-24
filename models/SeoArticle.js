@@ -80,6 +80,26 @@ const claimSchema = new Schema(
   { _id: false },
 );
 
+// Another page in the same cluster targeting the same search intent.
+//
+// Advisory, and deliberately so. Body similarity is a measured quantity with
+// an agreed cutoff (SIMILARITY_BLOCK); "these two pages are going after the
+// same searcher" is a judgement, and this project has no threshold for it.
+// Recording the collision and showing it to the reviewer is honest. Inventing
+// a number at which it starts blocking approval would not be.
+const intentCollisionSchema = new Schema(
+  {
+    source: { type: String, enum: ['article', 'livePage'], default: 'article' },
+    // Slug for an article, path for a live page.
+    ref: { type: String, required: true },
+    cluster: { type: String },
+    searchIntent: { type: String },
+    // Word-bigram Jaccard over the two titles. Reported, never gated.
+    titleSimilarity: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
 const seoArticleSchema = new Schema(
   {
     // ── Keyword layer ────────────────────────────────────────
@@ -153,6 +173,27 @@ const seoArticleSchema = new Schema(
       metaLength: { type: Number, default: 0 },
       // Links the generator invented that are not live on the site.
       droppedLinks: { type: [droppedLinkSchema], default: [] },
+
+      // ── Against the pages that already rank ────────────────
+      // The curated pages on savelife.health are protected canonical
+      // content. livePageSimilarity is compared against the same
+      // SIMILARITY_BLOCK as similarityScore, and blocks approval the same
+      // way: a generated article that duplicates a live page would compete
+      // with it for the same query and cost a ranking the site already has.
+      livePageSimilarity: { type: Number, default: 0 },
+      similarToLivePage: { type: String },
+      // How many live pages the comparison actually ran against. A zero here
+      // means the index was empty, not that the draft is unique.
+      livePagesIndexed: { type: Number, default: 0 },
+
+      // Same cluster, same intent, different words. Advisory — see
+      // intentCollisionSchema above.
+      intentCollisions: { type: [intentCollisionSchema], default: [] },
+
+      // Shape errors in the assembled JSON-LD. Blocks: the renderer drops
+      // invalid nodes, so approving one of these ships a page with no
+      // structured data and no indication that anything went wrong.
+      schemaErrors: { type: [String], default: [] },
       wordCount: { type: Number, default: 0 },
       passed: { type: Boolean, default: false },
     },

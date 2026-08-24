@@ -74,7 +74,7 @@ describe('only approved work is public', () => {
     const { chain, calls } = stubQuery([ARTICLE]);
     const find = jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
 
-    await pub.list({}, mockRes(), next);
+    await pub.list({ query: {} }, mockRes(), next);
 
     expect(find).toHaveBeenCalledWith(PUBLIC_FILTER);
     expect(calls.select).not.toContain('content');
@@ -143,7 +143,7 @@ describe('only approved work is public', () => {
     // link the detail route answers with 404.
     const { chain: listChain, calls: listCalls } = stubQuery([]);
     jest.spyOn(SeoArticle, 'find').mockReturnValue(listChain);
-    await pub.list({}, mockRes(), next);
+    await pub.list({ query: {} }, mockRes(), next);
 
     const { chain: oneChain } = stubQuery(null);
     const findOne = jest.spyOn(SeoArticle, 'findOne').mockReturnValue(oneChain);
@@ -178,7 +178,7 @@ describe('payload shape', () => {
     jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
 
     const res = mockRes();
-    await pub.list({}, res, next);
+    await pub.list({ query: {} }, res, next);
 
     expect(res.set).toHaveBeenCalledWith('Cache-Control', expect.stringContaining('s-maxage'));
   });
@@ -186,9 +186,75 @@ describe('payload shape', () => {
   test('a database failure goes to the error handler, not the client', async () => {
     jest.spyOn(SeoArticle, 'find').mockImplementation(() => { throw new Error('mongo down'); });
 
-    await pub.list({}, mockRes(), next);
+    await pub.list({ query: {} }, mockRes(), next);
 
     expect(next).toHaveBeenCalled();
     expect(next.mock.calls[0][0].message).toBe('mongo down');
+  });
+
+  test('a request with no query object at all still works', async () => {
+    // Express always populates req.query, but the controller is called
+    // directly from tests and from other code, and a crash here would be a
+    // 500 on the public index.
+    const { chain } = stubQuery([ARTICLE]);
+    jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
+
+    await pub.list({}, mockRes(), next);
+
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('reverse links', () => {
+  test('linksTo narrows the query to guides pointing at that page', async () => {
+    const { chain } = stubQuery([ARTICLE]);
+    const find = jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
+
+    await pub.list({ query: { linksTo: '/icu-ambulance-bangalore' } }, mockRes(), next);
+
+    expect(find).toHaveBeenCalledWith({
+      ...PUBLIC_FILTER,
+      'internalLinks.href': '/icu-ambulance-bangalore',
+    });
+  });
+
+  test('the status filter still applies to a reverse-link query', async () => {
+    // A curated page must not be able to surface an unapproved guide by
+    // asking for its own path.
+    const { chain } = stubQuery([]);
+    const find = jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
+
+    await pub.list({ query: { linksTo: '/book' } }, mockRes(), next);
+
+    expect(find.mock.calls[0][0].status).toEqual({ $in: ['approved', 'published'] });
+  });
+
+  test('a linksTo that is not a site path is rejected', async () => {
+    const find = jest.spyOn(SeoArticle, 'find');
+    for (const bad of ['not-a-path', 'https://evil.test/x', '/x?y=1', '../etc']) {
+      const res = mockRes();
+      await pub.list({ query: { linksTo: bad } }, res, next);
+      expect(res.status).toHaveBeenCalledWith(400);
+    }
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  test('a query operator cannot be smuggled through linksTo', async () => {
+    const find = jest.spyOn(SeoArticle, 'find');
+    const res = mockRes();
+    // Express would parse ?linksTo[$ne]= into an object; String() flattens it
+    // and the path pattern rejects what is left.
+    await pub.list({ query: { linksTo: { $ne: '' } } }, res, next);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  test('no linksTo means the plain index, unfiltered by links', async () => {
+    const { chain } = stubQuery([ARTICLE]);
+    const find = jest.spyOn(SeoArticle, 'find').mockReturnValue(chain);
+
+    await pub.list({ query: {} }, mockRes(), next);
+
+    expect(find.mock.calls[0][0]['internalLinks.href']).toBeUndefined();
   });
 });

@@ -27,6 +27,13 @@ const EFFORT = process.env.SEO_CLAUDE_EFFORT || 'high';
 const SIMILARITY_BLOCK = Number(process.env.SEO_SIMILARITY_THRESHOLD || 0.55);
 const MIN_WORDS = Number(process.env.SEO_MIN_WORDS || 700);
 
+// Search-result truncation points. Ranges, not preferences: a title or meta
+// outside these blocks approval, so the writer schema states the same numbers.
+const TITLE_MIN = Number(process.env.SEO_TITLE_MIN || 55);
+const TITLE_MAX = Number(process.env.SEO_TITLE_MAX || 60);
+const META_MIN  = Number(process.env.SEO_META_MIN  || 150);
+const META_MAX  = Number(process.env.SEO_META_MAX  || 160);
+
 let client = null;
 function getClient() {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -77,8 +84,11 @@ const ARTICLE_SCHEMA = {
     cluster: { type: 'string', description: 'Short keyword-cluster name this page belongs to, e.g. "dead-body-transport" or "bengaluru-areas".' },
     searchIntent: { type: 'string', enum: ['informational', 'commercial', 'transactional', 'navigational'] },
     slug: { type: 'string', description: 'URL slug, lowercase, hyphenated, no leading slash.' },
-    title: { type: 'string', description: 'SEO title, under 60 characters where possible.' },
-    metaDescription: { type: 'string', description: 'Meta description, 140-160 characters.' },
+    // Hard ranges, not preferences. These are also checked mechanically after
+    // generation — a title outside the range blocks approval — so a soft
+    // "where possible" here just produced drafts that failed the gate.
+    title: { type: 'string', description: 'SEO title. MUST be between 55 and 60 characters inclusive. Count the characters before returning.' },
+    metaDescription: { type: 'string', description: 'Meta description. MUST be between 150 and 160 characters inclusive. Count the characters before returning.' },
     h1: { type: 'string' },
     content: { type: 'string', description: 'The article body in Markdown. Use ## for sections. No H1 — that is the h1 field.' },
     faqs: {
@@ -105,8 +115,25 @@ const CHECK_SCHEMA = {
   properties: {
     unverifiedClaims: {
       type: 'array',
-      description: 'Every sentence or phrase asserting something the fact sheet does not establish. Quote it verbatim. Empty array if the text is clean.',
-      items: { type: 'string' },
+      description: 'Every sentence or phrase asserting something the fact sheet does not establish. Empty array if the text is clean.',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['claim', 'severity', 'action'],
+        properties: {
+          claim: { type: 'string', description: 'The offending phrase, quoted verbatim from the article so a human can find it.' },
+          severity: {
+            type: 'string',
+            enum: ['fabricated', 'unsupported', 'phrasing'],
+            description: 'fabricated = an invented business fact (a price, a time, a partnership, a count). unsupported = a claim about the business, a service or a location that the fact sheet does not establish. phrasing = wording only; the underlying fact is fine.',
+          },
+          action: {
+            type: 'string',
+            enum: ['source', 'remove', 'rewrite'],
+            description: 'source = the real figure exists in the fact sheet and should replace this. remove = delete the sentence; nothing supports it. rewrite = reword so it stops asserting.',
+          },
+        },
+      },
     },
   },
 };
@@ -124,16 +151,45 @@ Write like a person who knows the subject and respects the reader:
 - Do not open with "In today's world" or close with "In conclusion".
 - Say what you cannot do. A page that admits a limit is more useful, and more credible, than one that does not.
 - British-Indian English. Rupee amounts as ₹1,200.
+- The title MUST be 55-60 characters and the meta description MUST be 150-160. Count them. A draft outside these ranges is rejected automatically.
 
 internalLinks: choose 3-6 from the LIVE PAGES list only. Never invent a URL. Each needs a real reason a reader on this page would want that page.`;
 
 const CHECKER_SYSTEM = `You are fact-checking a draft web page for an ambulance and death-care business before a human reviews it.
 
-You are given a FACT SHEET and an ARTICLE. Your only job is to list every claim in the article that the fact sheet does not establish.
+You are given a FACT SHEET and an ARTICLE. List every claim the fact sheet does not establish, and classify each one.
 
-Flag: any price, rate or discount not in the sheet; any response or arrival time; fleet size or coverage counts; years of experience; reviews, ratings or testimonials; hospital or crematorium names; partnerships; medical, legal or statutory assertions; licences or certifications; superiority claims; statistics; any service or city not listed.
+ALWAYS FLAG, and always as "fabricated" — these are invented business facts and none of them is ever acceptable:
+- Any price, rate, fee or discount not in the sheet's pricing sections
+- Any response time, arrival time, ETA or "reach you in N minutes"
+- Fleet size, vehicle counts, staff counts, or number of cities
+- Years in business, founding dates, experience claims
+- Reviews, ratings, testimonials, "trusted by N families"
+- Hospital or crematorium names, partnerships, tie-ups, empanelment
+- Licences, accreditations, certifications, ISO numbers, regulatory approval
+- Statistics, percentages, survey figures
+- Awards, rankings, "number one", "best in Bangalore", or any comparative superiority claim
 
-Do not flag ordinary prose, hedged invitations to call, or descriptions of a service that IS in the sheet. Quote each flagged phrase verbatim so a human can find it. If the article is clean, return an empty array.`;
+FLAG as "unsupported" — plausible but not established:
+- A service, city or area not in the sheet's services or coverage
+- A capability, inclusion or guarantee the sheet does not state
+- Medical or clinical assertions, including anything about treatment or outcomes
+- Legal or statutory assertions: what a law requires, what document is mandatory, how a permit or certificate is obtained
+- Any statement about how the business operates that the sheet does not cover
+
+FLAG as "phrasing" — ONLY when the underlying fact is established and the wording is the sole problem: an overclaiming adjective, a vague intensifier, an absolute like "always" or "never" where the sheet supports the general case.
+
+Choose the action a reviewer should take:
+- "source"  — the correct figure or fact IS in the sheet; it should replace what is written
+- "remove"  — nothing supports it; the sentence should go
+- "rewrite" — the substance is fine; it needs rewording so it stops asserting
+
+DO NOT FLAG:
+- Anything stated in approvedDescriptions. That is human-written, already-published copy from the live site; restating, rephrasing or expanding it is legitimate. It does NOT license a number, time or comparison — judge those by the rules above wherever they appear.
+- Ordinary prose, hedged invitations to call, or generic descriptions of a service that the sheet establishes
+- The business's own contact details, address or availability as given in the sheet
+
+When you are unsure whether something is unsupported or merely phrasing, choose unsupported. This is a YMYL page; "probably fine" is not a standard. Quote each claim verbatim. If the article is clean, return an empty array.`;
 
 async function callClaude({ system, prompt, schema, maxTokens = 16000 }) {
   const res = await getClient().messages.create({
@@ -214,19 +270,46 @@ async function generateDraft(input, user) {
   }
 
   // Links must point at pages that exist. A plausible-looking URL that 404s
-  // is worse than no link.
+  // is worse than no link. Rejects are recorded rather than dropped: a draft
+  // that quietly lost three of four links looks like a model that only found
+  // one, which sends the reviewer looking in the wrong place.
   const liveHrefs = new Set(facts.livePages.map((p) => p.href));
-  const internalLinks = (article.internalLinks || []).filter((l) => liveHrefs.has(l.href));
+  const proposedLinks = article.internalLinks || [];
+  const internalLinks = proposedLinks.filter((l) => liveHrefs.has(l.href));
+  const droppedLinks = proposedLinks
+    .filter((l) => !liveHrefs.has(l.href))
+    .map((l) => ({ label: l.label, href: l.href, reason: l.reason }));
 
   const wordCount = normalise(article.content).split(' ').filter(Boolean).length;
-  const unverifiedClaims = check.unverifiedClaims || [];
+
+  // Length is mechanical, not a matter of judgement, and these are the two
+  // fields that silently truncate in search results. Checked here rather than
+  // trusted to the writer prompt, because prose guidance does not hold.
+  const titleLength = String(article.title || '').length;
+  const metaLength = String(article.metaDescription || '').length;
+  const titleOk = titleLength >= TITLE_MIN && titleLength <= TITLE_MAX;
+  const metaOk = metaLength >= META_MIN && metaLength <= META_MAX;
+
+  // Severity decides what blocks. Anything fabricated or unsupported stops
+  // approval; a phrasing note is advisory, because blocking on an adjective
+  // teaches reviewers to wave failures through — which costs more than the
+  // adjective ever would. A claim with no severity (a legacy row, or a model
+  // that omitted it) is treated as unsupported, the conservative reading.
+  const unverifiedClaims = (check.unverifiedClaims || []).map((c) =>
+    typeof c === 'string'
+      ? { claim: c, severity: 'unsupported', action: 'rewrite' }
+      : { claim: c.claim, severity: c.severity || 'unsupported', action: c.action || 'rewrite' },
+  );
+  const blockingClaims = unverifiedClaims.filter((c) => c.severity !== 'phrasing');
 
   const passed =
-    unverifiedClaims.length === 0 &&
+    blockingClaims.length === 0 &&
     !duplicateSlug &&
     similarityScore < SIMILARITY_BLOCK &&
     wordCount >= MIN_WORDS &&
-    internalLinks.length >= 2;
+    internalLinks.length >= 2 &&
+    titleOk &&
+    metaOk;
 
   const doc = await SeoArticle.create({
     keyword: String(keyword).trim(),
@@ -243,10 +326,15 @@ async function generateDraft(input, user) {
     content: article.content,
     faqs: article.faqs || [],
     internalLinks,
-    schema: buildSchema(article, slug, facts),
+    jsonLd: buildJsonLd(article, slug, facts),
     status: 'draft',
     shingles,
-    checks: { similarityScore, similarTo, duplicateSlug, unverifiedClaims, wordCount, passed },
+    checks: {
+      similarityScore, similarTo, duplicateSlug,
+      unverifiedClaims, droppedLinks,
+      titleLength, metaLength,
+      wordCount, passed,
+    },
     generation: {
       model: MODEL,
       effort: EFFORT,
@@ -263,7 +351,7 @@ async function generateDraft(input, user) {
 
 // JSON-LD assembled from the article itself, so schema can never describe
 // something the page does not show. FAQPage only when there are visible FAQs.
-function buildSchema(article, slug, facts) {
+function buildJsonLd(article, slug, facts) {
   const url = `${facts.business.website}/${slug}`;
   const blocks = [
     {
@@ -299,4 +387,8 @@ function buildSchema(article, slug, facts) {
   return blocks;
 }
 
-module.exports = { generateDraft, shingle, jaccard, SIMILARITY_BLOCK, MIN_WORDS };
+module.exports = {
+  generateDraft, shingle, jaccard,
+  SIMILARITY_BLOCK, MIN_WORDS,
+  TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
+};

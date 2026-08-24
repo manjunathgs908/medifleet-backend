@@ -14,7 +14,10 @@
 'use strict';
 
 const SeoArticle = require('../models/SeoArticle');
-const { generateDraft } = require('../services/seoGenerator');
+const {
+  generateDraft,
+  SIMILARITY_BLOCK, MIN_WORDS, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
+} = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
 
 // ============================================================
@@ -59,9 +62,11 @@ exports.list = async (req, res, next) => {
     ];
 
     // Content is deliberately excluded — the list view renders hundreds of
-    // rows and does not need the article bodies.
+    // rows and does not need the article bodies. Both field names are
+    // excluded because pre-rename documents still store the JSON-LD under
+    // the old key, and a projection only knows about the name it is given.
     const articles = await SeoArticle.find(filter)
-      .select('-content -schema')
+      .select('-content -jsonLd -schema')
       .sort({ updatedAt: -1 })
       .limit(200)
       .lean();
@@ -145,11 +150,21 @@ exports.setStatus = async (req, res, next) => {
     if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
 
     if ((status === 'approved' || status === 'published') && !article.checks?.passed) {
+      // These have to mirror the generator's gate exactly. Told "checks not
+      // run" when the real problem is a 63-character title, a reviewer goes
+      // looking in the wrong place.
+      const c = article.checks || {};
       const reasons = [];
-      if (article.checks?.unverifiedClaims?.length) reasons.push(`${article.checks.unverifiedClaims.length} unverified claim(s)`);
-      if (article.checks?.duplicateSlug) reasons.push('duplicate slug');
-      if (article.checks?.similarityScore >= 0.55) reasons.push(`too similar to an existing draft (${Math.round(article.checks.similarityScore * 100)}%)`);
-      if ((article.checks?.wordCount || 0) < 700) reasons.push(`too short (${article.checks?.wordCount} words)`);
+      // Phrasing notes are advisory and do not block, so they must not be
+      // counted here either.
+      const blocking = (c.unverifiedClaims || []).filter((x) => x.severity !== 'phrasing');
+      if (blocking.length) reasons.push(`${blocking.length} unverified claim(s)`);
+      if (c.duplicateSlug) reasons.push('duplicate slug');
+      if (c.similarityScore >= SIMILARITY_BLOCK) reasons.push(`too similar to an existing draft (${Math.round(c.similarityScore * 100)}%)`);
+      if ((c.wordCount || 0) < MIN_WORDS) reasons.push(`too short (${c.wordCount} words)`);
+      if (c.titleLength < TITLE_MIN || c.titleLength > TITLE_MAX) reasons.push(`title is ${c.titleLength} characters (must be ${TITLE_MIN}-${TITLE_MAX})`);
+      if (c.metaLength < META_MIN || c.metaLength > META_MAX) reasons.push(`meta description is ${c.metaLength} characters (must be ${META_MIN}-${META_MAX})`);
+      if ((article.internalLinks || []).length < 2) reasons.push('fewer than 2 internal links');
       return res.status(422).json({
         success: false,
         message: `This draft has not passed its checks: ${reasons.join(', ') || 'checks not run'}. Fix it or reject it.`,

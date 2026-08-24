@@ -93,6 +93,80 @@ const FORBIDDEN = [
   'Statistics, percentages or survey figures of any kind.',
 ];
 
+// ── Approved descriptions, read from the live site ────────────
+//
+// The sheet used to carry prices and service codes but nothing describing
+// what any service IS. That made explanatory prose unverifiable by
+// construction: the writer would explain what a freezer box does, and the
+// checker had no fact to match it against, so it flagged perfectly accurate
+// sentences.
+//
+// The fix keeps this file's own rule — no facts typed in here. Descriptions
+// are read from savelife.health itself, whose page copy is human-written and
+// human-reviewed before it ships. If a description is wrong, it is wrong on
+// the live site too, which is the right place to fix it.
+//
+// Cached, because 30-odd requests per generation would be absurd. A failure
+// degrades to no descriptions rather than failing the generation: the model
+// is simply back to the old behaviour, which was safe if noisy.
+const DESCRIPTION_TTL_MS = Number(process.env.SEO_DESCRIPTION_TTL_MS || 6 * 60 * 60 * 1000);
+const DESCRIPTION_FETCH_TIMEOUT_MS = 8000;
+const DESCRIPTIONS_ENABLED = process.env.SEO_LIVE_DESCRIPTIONS !== 'false';
+
+let descriptionCache = { at: 0, data: null };
+
+const stripTags = (s) => String(s || '').replace(/<[^>]*>/g, '').trim();
+
+const decodeEntities = (s) =>
+  String(s || '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&nbsp;/g, ' ');
+
+async function fetchOnePage(base, page) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DESCRIPTION_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}${page.href}`, { signal: ctrl.signal });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1];
+    const desc = html.match(/<meta\s+name="description"\s+content="([^"]*)"/i)?.[1];
+    if (!desc && !h1) return null;
+    return {
+      href: page.href,
+      heading: decodeEntities(stripTags(h1)) || page.label,
+      description: decodeEntities(desc || ''),
+    };
+  } catch {
+    return null; // timeout, DNS, offline — the sheet builds without it
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchApprovedDescriptions(base) {
+  if (!DESCRIPTIONS_ENABLED) return [];
+  const fresh = Date.now() - descriptionCache.at < DESCRIPTION_TTL_MS;
+  if (fresh && descriptionCache.data) return descriptionCache.data;
+
+  // Modest concurrency: this is someone else's production site.
+  const out = [];
+  const queue = [...LIVE_PAGES];
+  const workers = Array.from({ length: 6 }, async () => {
+    while (queue.length) {
+      const page = queue.shift();
+      const got = await fetchOnePage(base, page);
+      if (got) out.push(got);
+    }
+  });
+  await Promise.all(workers);
+
+  // Only replace a good cache with a good result. A transient network failure
+  // should not blank descriptions that were working a minute ago.
+  if (out.length) descriptionCache = { at: Date.now(), data: out };
+  return out.length ? out : (descriptionCache.data || []);
+}
+
 /**
  * Reads the live configuration and assembles the fact sheet.
  * Everything is read at call time so a price change in MongoDB reaches the
@@ -150,6 +224,8 @@ async function buildFactSheet() {
     })),
   };
 
+  const approvedDescriptions = await fetchApprovedDescriptions(BUSINESS.website);
+
   const sheet = {
     business: BUSINESS,
     bookableServices,
@@ -159,16 +235,26 @@ async function buildFactSheet() {
       city: 'Bengaluru',
       note: 'Bengaluru is the verified operating city. Intercity journeys are arranged on request and must be described as "on request", never as an established route or a covered city.',
     },
+    // Human-written, already-published copy from savelife.health. Anything
+    // stated here is established and may be restated, rephrased or expanded.
+    // It does NOT license new figures: a price or a time is governed by the
+    // pricing sections and the forbidden list, wherever it appears.
+    approvedDescriptions: {
+      note: 'Descriptions of services as published on the live site, human-written and reviewed. Treat these as established facts you may restate or rephrase. They do not authorise any number, time or comparative claim not stated elsewhere in this sheet.',
+      pages: approvedDescriptions,
+    },
     livePages: LIVE_PAGES,
     forbidden: FORBIDDEN,
   };
 
   // Provenance: two articles generated against the same facts share a hash.
   // If a fact turns out to be wrong, this is how you find everything built
-  // on it.
+  // on it. Descriptions are excluded from the hash deliberately — they are
+  // fetched live and a copy tweak on the website should not make every past
+  // article look as though it was built on different facts.
   sheet.hash = crypto
     .createHash('sha256')
-    .update(JSON.stringify({ ...sheet, hash: undefined }))
+    .update(JSON.stringify({ ...sheet, hash: undefined, approvedDescriptions: undefined }))
     .digest('hex')
     .slice(0, 16);
 

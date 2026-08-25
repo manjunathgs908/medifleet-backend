@@ -80,6 +80,28 @@ const claimSchema = new Schema(
   { _id: false },
 );
 
+// One pass of the fact-repair loop in services/seoGenerator.js. Kept as
+// history rather than a counter: when a page turns out to be wrong later,
+// "the checker raised four blocking claims and one survived two repairs" is
+// the detail that explains how it got as far as a reviewer.
+//
+// claimsBefore/After count BLOCKING claims only -- the same set the gate
+// uses. A phrasing note is advisory and never triggered a repair, so
+// counting it here would suggest the loop ignored something it was never
+// asked to fix.
+const repairSchema = new Schema(
+  {
+    attempt: { type: Number, required: true },
+    claimsBefore: { type: Number, required: true },
+    claimsAfter: { type: Number, required: true },
+    // Which of title/metaDescription/h1/content/faqs the repair rewrote.
+    // Anything absent is byte-identical to the first draft.
+    repairedFields: { type: [String], default: [] },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 // Another page in the same cluster targeting the same search intent.
 //
 // Advisory, and deliberately so. Body similarity is a measured quantity with
@@ -210,9 +232,26 @@ const seoArticleSchema = new Schema(
       model: { type: String },
       effort: { type: String },
       factSheetHash: { type: String },
+      // Totals across every Claude call the generation made: the writer, each
+      // fact check and each repair. Documents written before the repair loop
+      // existed hold the writer call alone, so they under-report by history
+      // rather than by error.
       inputTokens: { type: Number },
       outputTokens: { type: Number },
       generatedAt: { type: Date },
+      // Wall-clock for the whole generation, which is what the time budget in
+      // seoGenerator.js is tuned against.
+      durationMs: { type: Number },
+
+      // ── Fact-repair loop ─────────────────────────────────────
+      // How many times the independent checker ran. 1 means it came back
+      // clean, or came back dirty with no repair attempted.
+      factCheckAttempts: { type: Number, default: 1 },
+      repairs: { type: [repairSchema], default: [] },
+      // Why the loop stopped with blocking claims outstanding:
+      // 'max-attempts' or 'time-budget'. Null when it stopped because the
+      // article came back clean.
+      repairStoppedReason: { type: String, default: null },
     },
 
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },

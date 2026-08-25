@@ -30,7 +30,11 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 const SeoArticle = require('../models/SeoArticle');
-const { findPricingClaims, APPROVED_FARE_WORDING } = require('../services/seoPricingGuard');
+const { findPricingClaims, findPricesIn, APPROVED_FARE_WORDING } = require('../services/seoPricingGuard');
+// The meta length band is a gate, not a style preference: a replacement
+// outside it would swap a stale-price failure for a metaOk failure. Imported
+// so the two can never disagree.
+const { META_MIN, META_MAX } = require('../services/seoGenerator');
 
 const arg = (name) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
@@ -49,6 +53,23 @@ const PRICING_SECTION = [
   '',
   'If you would rather hear it from a person before you commit, ring dispatch and ask.',
 ].join('\n');
+
+// The meta description is where a fare does the most damage: it is the line
+// Google prints in the result, so a stale figure is quoted to people who
+// never even open the page. The original read "Maruti Eeco from ₹1,200 or
+// Tempo Traveller from ₹1,500" — two fares, in the search snippet.
+//
+// Length matters as much as content. metaOk gates on META_MIN..META_MAX, so a
+// replacement that fell outside the band would trade one gate failure for
+// another; this one is checked against the band before it is used.
+const REPLACEMENT_META =
+  'Book a BLS ambulance in Bengaluru 24/7. Oxygen-equipped, trained attendant, GPS-tracked. The fare is shown before you confirm. Call or WhatsApp SaveLife.';
+
+/** Rewrite the meta only if it actually quotes a figure. */
+function rewriteMeta(meta) {
+  if (!findPricesIn(meta).length) return { metaDescription: meta, replaced: false };
+  return { metaDescription: REPLACEMENT_META, replaced: true };
+}
 
 // Matched on the question rather than the index, so the script is not tied to
 // the order the FAQs happen to be stored in.
@@ -127,6 +148,7 @@ function rewriteFaqs(faqs) {
 
     const previous = {
       title: article.title,
+      metaDescription: article.metaDescription,
       content: article.content,
       faqs: (article.faqs || []).map((f) => ({ q: f.q, a: f.a })),
       status: article.status,
@@ -134,11 +156,25 @@ function rewriteFaqs(faqs) {
 
     const body = rewriteBody(article.content);
     const faq = rewriteFaqs(article.faqs);
+    const meta = rewriteMeta(article.metaDescription);
 
-    const candidate = { ...article.toObject(), content: body.content, faqs: faq.faqs };
+    const candidate = {
+      ...article.toObject(),
+      content: body.content,
+      faqs: faq.faqs,
+      metaDescription: meta.metaDescription,
+    };
     const after = findPricingClaims(candidate);
 
-    console.log(`\nWould rewrite : body ${body.replaced ? 'yes' : 'NO SECTION FOUND'}, ${faq.changed} FAQ(s)`);
+    console.log(`\nWould rewrite : body ${body.replaced ? 'yes' : 'NO SECTION FOUND'}, ${faq.changed} FAQ(s), meta ${meta.replaced ? 'yes' : 'not needed'}`);
+    if (meta.replaced) {
+      const len = meta.metaDescription.length;
+      console.log(`Meta length   : ${len} (gate wants ${META_MIN}-${META_MAX}) ${len >= META_MIN && len <= META_MAX ? 'OK' : 'OUT OF BAND'}`);
+      if (len < META_MIN || len > META_MAX) {
+        console.error('\nREFUSED: the replacement meta description is outside the length gate. Nothing written.');
+        process.exit(1);
+      }
+    }
     console.log(`Prices after  : ${after.length ? after.join(', ') : 'none'}`);
 
     // Fail closed: never record a "correction" that still trips the gate.
@@ -154,16 +190,26 @@ function rewriteFaqs(faqs) {
     if (!APPLY) {
       console.log('\n--- replacement pricing section ---');
       console.log(PRICING_SECTION);
+      if (meta.replaced) {
+        console.log('\n--- replacement meta description ---');
+        console.log(meta.metaDescription);
+      }
+      console.log('\n--- replacement FAQs ---');
+      faq.faqs.forEach((f, i) => {
+        if (JSON.stringify(f) === JSON.stringify((article.faqs || [])[i])) return;
+        console.log(`[${i}] Q: ${f.q}\n     A: ${f.a}`);
+      });
       console.log('\nDRY RUN. Nothing written. Re-run with --apply to record the correction.');
       return;
     }
 
     article.content = body.content;
     article.faqs = faq.faqs;
+    article.metaDescription = meta.metaDescription;
     article.corrections.push({
       at: new Date(),
       reason: 'Removed published fares: pricing is dynamic and a fixed figure on a live page goes stale.',
-      fields: ['content', 'faqs'],
+      fields: ['content', 'faqs', ...(meta.replaced ? ['metaDescription'] : [])],
       previous,
     });
     // Back into review. It cannot be approved until a recheck passes, and the

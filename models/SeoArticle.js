@@ -252,6 +252,16 @@ const seoArticleSchema = new Schema(
       // 'max-attempts' or 'time-budget'. Null when it stopped because the
       // article came back clean.
       repairStoppedReason: { type: String, default: null },
+
+      // ── Recheck ──────────────────────────────────────────────
+      // Set by POST /api/seo/articles/:id/recheck after a human edit. The
+      // generation record above is never overwritten: this records that the
+      // same gates were run again over changed text, and what they said.
+      recheckedAt: { type: Date },
+      recheckResult: { type: String, enum: ['passed', 'failed'] },
+      // Human-readable gate failures from the last recheck, in the same
+      // wording the generator logs. Empty on a pass.
+      failedChecks: { type: [String], default: [] },
     },
 
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },

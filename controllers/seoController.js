@@ -15,7 +15,7 @@
 
 const SeoArticle = require('../models/SeoArticle');
 const {
-  generateDraft,
+  generateDraft, recheckArticle,
   SIMILARITY_BLOCK, MIN_WORDS, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
 } = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
@@ -126,6 +126,57 @@ exports.update = async (req, res, next) => {
     await article.save();
     return res.json({ success: true, article });
   } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/seo/articles/:id/recheck
+// @desc    Re-run every quality gate over an edited article.
+//
+//          Editing the body of an approved article demotes it to in_review
+//          with checks.passed false — approval belonged to text that no
+//          longer exists. This is the only way back: the SAME gates that
+//          cleared it the first time, run again over what is there now.
+//
+//          A clean recheck sets checks.passed true and STOPS. It does not
+//          approve: status stays in_review and a human still has to press
+//          Approve. The gate has never had the authority to publish, and
+//          this does not give it any.
+// @access  Private [owner]
+// ============================================================
+exports.recheck = async (req, res, next) => {
+  try {
+    const article = await SeoArticle.findById(req.params.id);
+    if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
+
+    // Nothing to re-check on a rejected article. Rechecking one would be a
+    // way to walk a rejection back without anyone re-reading it.
+    if (article.status === 'rejected') {
+      return res.status(422).json({
+        success: false,
+        message: 'This article was rejected. Reject is a decision about the article, not a failed check — edit it and move it back to draft first.',
+      });
+    }
+
+    const { passed, failedChecks } = await recheckArticle(article);
+
+    return res.json({
+      success: true,
+      passed,
+      failedChecks,
+      // Spelled out so the Studio never has to infer what happens next.
+      message: passed
+        ? 'All checks passed. The article is still in review — press Approve to publish it.'
+        : `Checks failed: ${failedChecks.join('; ')}`,
+      article,
+    });
+  } catch (err) {
+    // Same operator-facing handling as generate: a missing key or a refusal
+    // is an answer, not a stack trace.
+    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
+      return res.status(503).json({ success: false, message: err.message });
+    }
     next(err);
   }
 };

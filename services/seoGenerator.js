@@ -386,6 +386,150 @@ async function repairClaims(article, claims, factBlock, spend) {
 }
 
 /**
+ * Every quality gate, in one place.
+ *
+ * Extracted from generateDraft so the recheck endpoint runs the SAME rules
+ * over an edited article rather than a second implementation of them. The
+ * logic below is unchanged from Phase 2 — it has only moved.
+ *
+ * @param {object} article  { slug, title, metaDescription, h1, content, faqs,
+ *                            internalLinks, cluster, searchIntent } — a plain
+ *                            generator result or a hydrated SeoArticle; both
+ *                            carry the same field names.
+ * @param {object} opts
+ *   facts      the fact sheet the article is judged against
+ *   claims     normalised [{ claim, severity, action }] from runFactCheck
+ *   excludeId  an article to leave out of the duplicate-slug, similarity and
+ *              intent-collision comparisons. Null when generating (the row
+ *              does not exist yet); the article's own _id when rechecking,
+ *              because an article compared against itself is a duplicate of
+ *              itself and would fail every time.
+ *
+ * @returns { slug, shingles, jsonLd, internalLinks, checks, passed, failedChecks }
+ */
+async function evaluateGates(article, { facts, claims, excludeId = null }) {
+  const notSelf = excludeId ? { _id: { $ne: excludeId } } : {};
+
+  const slug = String(article.slug || '').toLowerCase().replace(/^\/+/, '').trim();
+  const duplicateSlug = Boolean(await SeoArticle.exists({ slug, ...notSelf }));
+
+  const shingles = shingle(`${article.h1} ${article.content}`);
+  const existing = await SeoArticle.find(notSelf, 'slug title status searchIntent cluster').select('+shingles').lean();
+  let similarityScore = 0;
+  let similarTo = null;
+  for (const other of existing) {
+    const score = jaccard(shingles, other.shingles || []);
+    if (score > similarityScore) { similarityScore = score; similarTo = other._id; }
+  }
+
+  // ── Against the pages that already rank ─────────────────────
+  // Curated pages on savelife.health are protected canonical content;
+  // nothing generated may duplicate one. Same fingerprint and the same
+  // SIMILARITY_BLOCK as the draft comparison above.
+  if (await isIndexStale()) {
+    await refreshLivePageIndex({ base: facts.business.website, shingle });
+  }
+  const livePages = await loadLivePageIndex();
+
+  let livePageSimilarity = 0;
+  let similarToLivePage = null;
+  for (const page of livePages) {
+    const score = jaccard(shingles, page.shingles || []);
+    if (score > livePageSimilarity) { livePageSimilarity = score; similarToLivePage = page.path; }
+  }
+  const livePagesIndexed = livePages.length;
+
+  // ── Intent collisions ───────────────────────────────────────
+  // Recorded and shown to the reviewer, never gated: "too close in intent"
+  // is a judgement the business has to make, not a threshold this code
+  // should invent.
+  const intentCollisions = existing
+    .filter((other) =>
+      other.status !== 'rejected' &&
+      other.cluster &&
+      article.cluster &&
+      other.cluster === article.cluster &&
+      other.searchIntent === article.searchIntent)
+    .map((other) => ({
+      source: 'article',
+      ref: other.slug,
+      cluster: other.cluster,
+      searchIntent: other.searchIntent,
+      titleSimilarity: jaccard(shingle(article.title, 2), shingle(other.title || '', 2)),
+    }));
+
+  // Links must point at pages that exist. Rejects are recorded rather than
+  // dropped silently.
+  const liveHrefs = new Set(facts.livePages.map((pg) => pg.href));
+  const proposedLinks = article.internalLinks || [];
+  const internalLinks = proposedLinks.filter((l) => liveHrefs.has(l.href));
+  const droppedLinks = proposedLinks
+    .filter((l) => !liveHrefs.has(l.href))
+    .map((l) => ({ label: l.label, href: l.href, reason: l.reason }));
+
+  const wordCount = normalise(article.content).split(' ').filter(Boolean).length;
+
+  const titleLength = String(article.title || '').length;
+  const metaLength = String(article.metaDescription || '').length;
+  const titleOk = titleLength >= TITLE_MIN && titleLength <= TITLE_MAX;
+  const metaOk = metaLength >= META_MIN && metaLength <= META_MAX;
+
+  // Severity decides what blocks: fabricated and unsupported stop approval,
+  // phrasing is advisory.
+  const unverifiedClaims = claims || [];
+  const blockingClaims = unverifiedClaims.filter(isBlocking);
+
+  // Structured data checked where the article is assembled, not only at
+  // render time. A reviewer must not be able to approve a page whose schema
+  // was never going to work.
+  const jsonLd = buildJsonLd(article, slug, facts);
+  const schemaErrors = validateJsonLd(jsonLd);
+
+  const passed =
+    blockingClaims.length === 0 &&
+    !duplicateSlug &&
+    similarityScore < SIMILARITY_BLOCK &&
+    livePageSimilarity < SIMILARITY_BLOCK &&
+    schemaErrors.length === 0 &&
+    wordCount >= MIN_WORDS &&
+    internalLinks.length >= 2 &&
+    titleOk &&
+    metaOk;
+
+  // One entry per failing term, enumerated from the same nine conditions as
+  // `passed` above. If a gate is added there it must be added here too, or
+  // both the log and the recheck response will under-report the reason.
+  const failedChecks = [];
+  if (blockingClaims.length) failedChecks.push(`${blockingClaims.length} blocking claim(s)`);
+  if (duplicateSlug) failedChecks.push('duplicate slug');
+  if (similarityScore >= SIMILARITY_BLOCK) failedChecks.push(`draft similarity ${similarityScore.toFixed(2)} >= ${SIMILARITY_BLOCK}`);
+  if (livePageSimilarity >= SIMILARITY_BLOCK) failedChecks.push(`live-page similarity ${livePageSimilarity.toFixed(2)} >= ${SIMILARITY_BLOCK} (${similarToLivePage || 'unknown page'})`);
+  if (schemaErrors.length) failedChecks.push(`${schemaErrors.length} schema error(s)`);
+  if (wordCount < MIN_WORDS) failedChecks.push(`${wordCount} words < ${MIN_WORDS}`);
+  if (internalLinks.length < 2) failedChecks.push(`${internalLinks.length} valid internal link(s) < 2`);
+  if (!titleOk) failedChecks.push(`title ${titleLength} chars, want ${TITLE_MIN}-${TITLE_MAX}`);
+  if (!metaOk) failedChecks.push(`meta ${metaLength} chars, want ${META_MIN}-${META_MAX}`);
+
+  return {
+    slug,
+    shingles,
+    jsonLd,
+    internalLinks,
+    passed,
+    failedChecks,
+    checks: {
+      similarityScore, similarTo, duplicateSlug,
+      livePageSimilarity, similarToLivePage, livePagesIndexed,
+      intentCollisions,
+      schemaErrors,
+      unverifiedClaims, droppedLinks,
+      titleLength, metaLength,
+      wordCount, passed,
+    },
+  };
+}
+
+/**
  * Generate one draft. Never publishes, never overwrites.
  *
  * @param {object} input  { keyword, service?, location?, notes? }
@@ -501,136 +645,19 @@ async function generateDraft(input, user) {
     );
   }
 
-  // ── Mechanical checks ───────────────────────────────────────
-  const slug = String(article.slug || '').toLowerCase().replace(/^\/+/, '').trim();
-  const duplicateSlug = Boolean(await SeoArticle.exists({ slug }));
-
-  const shingles = shingle(`${article.h1} ${article.content}`);
-  const existing = await SeoArticle.find({}, 'slug title status searchIntent cluster').select('+shingles').lean();
-  let similarityScore = 0;
-  let similarTo = null;
-  for (const other of existing) {
-    const score = jaccard(shingles, other.shingles || []);
-    if (score > similarityScore) { similarityScore = score; similarTo = other._id; }
-  }
-
-  // ── Against the pages that already rank ─────────────────────
+  // ── Quality gate ────────────────────────────────────────────
   //
-  // The similarity gate above only ever compared drafts to other drafts. The
-  // curated pages on savelife.health were invisible to it, so an article
-  // reworded from the live Whitefield page passed cleanly -- and publishing it
-  // would have put the two into competition for the same query, costing the
-  // ranking the site already had. Those pages are protected canonical
-  // content; nothing generated may duplicate one.
-  //
-  // Same fingerprint and the same SIMILARITY_BLOCK as the draft comparison.
-  // Two thresholds for one question would mean one of them was wrong.
-  if (await isIndexStale()) {
-    await refreshLivePageIndex({ base: facts.business.website, shingle });
-  }
-  const livePages = await loadLivePageIndex();
+  // Every gate lives in evaluateGates() so POST /articles/:id/recheck can run
+  // the identical rules over an edited article. Nothing is re-implemented
+  // there: a gate added, tightened or removed changes in exactly one place,
+  // and the two callers cannot drift into disagreeing about what "passed"
+  // means.
+  const gate = await evaluateGates(article, { facts, claims });
+  const { slug, shingles, jsonLd, internalLinks, checks, passed, failedChecks } = gate;
 
-  let livePageSimilarity = 0;
-  let similarToLivePage = null;
-  for (const page of livePages) {
-    const score = jaccard(shingles, page.shingles || []);
-    if (score > livePageSimilarity) { livePageSimilarity = score; similarToLivePage = page.path; }
-  }
-  const livePagesIndexed = livePages.length;
-
-  // ── Intent collisions ───────────────────────────────────────
-  //
-  // Two pages can be worded quite differently and still compete: same cluster,
-  // same search intent, same job. Body similarity does not catch that, and no
-  // threshold in this project describes it, so this is recorded and shown to
-  // the reviewer rather than blocking. Deliberately a plain equality test --
-  // inventing a cutoff for "too close in intent" would be a number nobody
-  // chose. See docs in the Phase 2 report: the blocking rule is a decision
-  // the business has to make, not one the code should assume.
-  const intentCollisions = existing
-    .filter((other) =>
-      other.status !== 'rejected' &&
-      other.cluster &&
-      article.cluster &&
-      other.cluster === article.cluster &&
-      other.searchIntent === article.searchIntent)
-    .map((other) => ({
-      source: 'article',
-      ref: other.slug,
-      cluster: other.cluster,
-      searchIntent: other.searchIntent,
-      titleSimilarity: jaccard(shingle(article.title, 2), shingle(other.title || '', 2)),
-    }));
-
-  // Links must point at pages that exist. A plausible-looking URL that 404s
-  // is worse than no link. Rejects are recorded rather than dropped: a draft
-  // that quietly lost three of four links looks like a model that only found
-  // one, which sends the reviewer looking in the wrong place.
-  const liveHrefs = new Set(facts.livePages.map((p) => p.href));
-  const proposedLinks = article.internalLinks || [];
-  const internalLinks = proposedLinks.filter((l) => liveHrefs.has(l.href));
-  const droppedLinks = proposedLinks
-    .filter((l) => !liveHrefs.has(l.href))
-    .map((l) => ({ label: l.label, href: l.href, reason: l.reason }));
-
-  const wordCount = normalise(article.content).split(' ').filter(Boolean).length;
-
-  // Length is mechanical, not a matter of judgement, and these are the two
-  // fields that silently truncate in search results. Checked here rather than
-  // trusted to the writer prompt, because prose guidance does not hold.
-  const titleLength = String(article.title || '').length;
-  const metaLength = String(article.metaDescription || '').length;
-  const titleOk = titleLength >= TITLE_MIN && titleLength <= TITLE_MAX;
-  const metaOk = metaLength >= META_MIN && metaLength <= META_MAX;
-
-  // Severity decides what blocks. Anything fabricated or unsupported stops
-  // approval; a phrasing note is advisory, because blocking on an adjective
-  // teaches reviewers to wave failures through — which costs more than the
-  // adjective ever would. A claim with no severity (a legacy row, or a model
-  // that omitted it) is treated as unsupported, the conservative reading.
-  // `claims` is whatever the LAST fact check returned -- after any repairs --
-  // already normalised by runFactCheck. Normalisation and the blocking rule
-  // are unchanged from Phase 2; they have only moved so the loop can apply
-  // them on every attempt rather than once at the end.
-  const unverifiedClaims = claims;
-  const blockingClaims = unverifiedClaims.filter(isBlocking);
-
-  // Structured data is checked here, where the article is assembled, rather
-  // than only at render time. The renderer still drops invalid nodes -- that
-  // stays the last line of defence -- but a reviewer must not be able to
-  // approve a page whose schema was never going to work.
-  const jsonLd = buildJsonLd(article, slug, facts);
-  const schemaErrors = validateJsonLd(jsonLd);
-
-  const passed =
-    blockingClaims.length === 0 &&
-    !duplicateSlug &&
-    similarityScore < SIMILARITY_BLOCK &&
-    livePageSimilarity < SIMILARITY_BLOCK &&
-    schemaErrors.length === 0 &&
-    wordCount >= MIN_WORDS &&
-    internalLinks.length >= 2 &&
-    titleOk &&
-    metaOk;
-
-  // One line per failing term. Enumerated from the same nine conditions as
-  // `passed` above -- if a gate is added there it must be added here too, or
-  // the log will quietly under-report why a draft was held back.
-  if (!passed) {
-    const why = [];
-    if (blockingClaims.length) why.push(`${blockingClaims.length} blocking claim(s)`);
-    if (duplicateSlug) why.push('duplicate slug');
-    if (similarityScore >= SIMILARITY_BLOCK) why.push(`draft similarity ${similarityScore.toFixed(2)} >= ${SIMILARITY_BLOCK}`);
-    if (livePageSimilarity >= SIMILARITY_BLOCK) why.push(`live-page similarity ${livePageSimilarity.toFixed(2)} >= ${SIMILARITY_BLOCK} (${similarToLivePage || 'unknown page'})`);
-    if (schemaErrors.length) why.push(`${schemaErrors.length} schema error(s)`);
-    if (wordCount < MIN_WORDS) why.push(`${wordCount} words < ${MIN_WORDS}`);
-    if (internalLinks.length < 2) why.push(`${internalLinks.length} valid internal link(s) < 2`);
-    if (!titleOk) why.push(`title ${titleLength} chars, want ${TITLE_MIN}-${TITLE_MAX}`);
-    if (!metaOk) why.push(`meta ${metaLength} chars, want ${META_MIN}-${META_MAX}`);
-    console.log(`[SEO] final quality gate: FAIL — ${why.join('; ')}`);
-  } else {
-    console.log('[SEO] final quality gate: PASS');
-  }
+  console.log(passed
+    ? '[SEO] final quality gate: PASS'
+    : `[SEO] final quality gate: FAIL — ${failedChecks.join('; ')}`);
   console.log(
     `[SEO] saved as status=draft — human approval required. `
     + `checks=${factCheckAttempts} repairs=${repairs.length} `
@@ -645,7 +672,7 @@ async function generateDraft(input, user) {
     service: service || null,
     // A duplicate slug still gets saved — suffixed — so the reviewer can
     // compare the two rather than losing the generation.
-    slug: duplicateSlug ? `${slug}-${Date.now().toString(36)}` : slug,
+    slug: checks.duplicateSlug ? `${slug}-${Date.now().toString(36)}` : slug,
     title: article.title,
     metaDescription: article.metaDescription,
     h1: article.h1,
@@ -655,15 +682,7 @@ async function generateDraft(input, user) {
     jsonLd,
     status: 'draft',
     shingles,
-    checks: {
-      similarityScore, similarTo, duplicateSlug,
-      livePageSimilarity, similarToLivePage, livePagesIndexed,
-      intentCollisions,
-      schemaErrors,
-      unverifiedClaims, droppedLinks,
-      titleLength, metaLength,
-      wordCount, passed,
-    },
+    checks,
     generation: {
       model: MODEL,
       effort: EFFORT,
@@ -721,9 +740,77 @@ function buildJsonLd(article, slug, facts) {
   return blocks;
 }
 
+/**
+ * Re-run every quality gate over an article a human has edited.
+ *
+ * The problem this solves: editing the body of an approved article demotes it
+ * to in_review and sets checks.passed false, because the approval was granted
+ * for text that no longer exists. Before this existed, nothing could ever set
+ * checks.passed true again -- only generateDraft did -- so a single typo fix
+ * locked an article out of approval permanently and the only way back was to
+ * regenerate it and lose the edit.
+ *
+ * What it deliberately does NOT do:
+ *   - It does not repair claims. The text is a person's edit; rewriting it
+ *     under them would be a surprise, and the repair loop exists to fix a
+ *     model's output, not a human's. Blocking claims come back as failures
+ *     for the editor to deal with.
+ *   - It does not approve. A clean recheck sets checks.passed true and leaves
+ *     status at in_review; a human still has to press Approve. The gate says
+ *     "this MAY be approved", never "this IS approved".
+ *
+ * Mutates and saves the document. Returns { passed, failedChecks, article }.
+ */
+async function recheckArticle(article) {
+  const startedAt = Date.now();
+  const totals = { input: 0, output: 0 };
+  const spend = (usage) => {
+    totals.input += usage?.input_tokens || 0;
+    totals.output += usage?.output_tokens || 0;
+  };
+
+  console.log(`[SEO] recheck started — slug="${article.slug}" status=${article.status}`);
+
+  const facts = await buildFactSheet();
+  const factBlock = JSON.stringify(facts, null, 2);
+
+  // The same independent checker, on the same clean context, over the edited
+  // text. No repair pass: see the note above.
+  const claims = await runFactCheck(article, factBlock, spend);
+  console.log(`[SEO] recheck fact-check: ${claims.filter(isBlocking).length} blocking claim(s) of ${claims.length} flagged`);
+
+  // excludeId is what stops the article colliding with itself on the
+  // duplicate-slug and similarity gates.
+  const gate = await evaluateGates(article, { facts, claims, excludeId: article._id });
+
+  article.checks = gate.checks;
+  article.jsonLd = gate.jsonLd;
+  article.internalLinks = gate.internalLinks;
+  article.shingles = gate.shingles;
+
+  // Provenance is added to, never replaced: the original generation record is
+  // how you find every other page produced the same way.
+  article.generation = article.generation || {};
+  article.generation.recheckedAt = new Date();
+  article.generation.recheckResult = gate.passed ? 'passed' : 'failed';
+  article.generation.failedChecks = gate.failedChecks;
+
+  // Status is not touched. An edited article is already in_review, and a
+  // clean recheck does not promote it -- that is a human's decision.
+  await article.save();
+
+  console.log(gate.passed
+    ? `[SEO] recheck: PASS — checks.passed=true, status=${article.status} (Approve still required)`
+    : `[SEO] recheck: FAIL — ${gate.failedChecks.join('; ')}`);
+  console.log(`[SEO] recheck finished in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+
+  return { passed: gate.passed, failedChecks: gate.failedChecks, article };
+}
+
 module.exports = {
   generateDraft, shingle, jaccard,
   SIMILARITY_BLOCK, MIN_WORDS,
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
+  evaluateGates, recheckArticle,
 };

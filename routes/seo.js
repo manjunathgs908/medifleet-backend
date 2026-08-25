@@ -26,6 +26,10 @@ router.post('/generate', generateLimiter, seoCtrl.generate);
 router.get('/articles', seoCtrl.list);
 router.get('/articles/:id', seoCtrl.getById);
 router.put('/articles/:id', seoCtrl.update);
+// Owner-only like everything else in this router, and rate-limited with the
+// same bucket as generate: a recheck is a Claude call too, and an operator
+// hammering it costs exactly as much.
+router.post('/articles/:id/recheck', generateLimiter, seoCtrl.recheck);
 router.put('/articles/:id/status', seoCtrl.setStatus);
 router.delete('/articles/:id', seoCtrl.remove);
 

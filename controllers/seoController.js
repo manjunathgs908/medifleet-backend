@@ -15,7 +15,7 @@
 
 const SeoArticle = require('../models/SeoArticle');
 const {
-  generateDraft, recheckArticle,
+  generateDraft, recheckArticle, DuplicateKeywordError,
   SIMILARITY_BLOCK, MIN_WORDS, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
 } = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
@@ -36,6 +36,18 @@ exports.generate = async (req, res, next) => {
     const article = await generateDraft({ keyword, service, location, notes }, req.user);
     return res.status(201).json({ success: true, article });
   } catch (err) {
+    // The keyword already has an article. 409, with the row itself, so the
+    // Studio can offer "open it" rather than leaving the operator to search.
+    // No Claude call was made and no draft was created.
+    if (err instanceof DuplicateKeywordError) {
+      const e = err.existing;
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+        existing: { id: e._id, slug: e.slug, title: e.title, status: e.status, keyword: e.keyword },
+        message: `This keyword already has an article: "${e.title}" (${e.status}). Open it instead of generating another — nothing was generated and nothing was charged.`,
+      });
+    }
     // A missing API key or a Claude refusal is an operator-facing answer,
     // not a 500 with a stack trace.
     if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {

@@ -122,10 +122,43 @@ const intentCollisionSchema = new Schema(
   { _id: false },
 );
 
+// A recorded editorial correction. An approved article that turns out to
+// carry something it should not — a stale fare, a claim that aged badly — is
+// corrected, not quietly overwritten: the previous text is kept here so
+// "what did this page say when it was approved" always has an answer.
+const correctionSchema = new Schema(
+  {
+    at: { type: Date, default: Date.now },
+    reason: { type: String, required: true },
+    fields: { type: [String], default: [] },
+    // The values as they stood before the correction. Kept whole rather than
+    // as a diff: a page that was live is evidence, and evidence is not
+    // reconstructed from a patch.
+    previous: { type: Schema.Types.Mixed },
+    by: { type: Schema.Types.ObjectId, ref: 'User' },
+  },
+  { _id: false },
+);
+
 const seoArticleSchema = new Schema(
   {
     // ── Keyword layer ────────────────────────────────────────
     keyword: { type: String, required: true, trim: true, index: true },
+    // The keyword reduced to its comparable form: trimmed, lowercased,
+    // internal whitespace collapsed. Two operators typing "BLS Ambulance
+    // Bengaluru" and "bls  ambulance bengaluru" mean one page, and each
+    // generation is a paid Claude call plus a draft nobody asked for.
+    //
+    // Unique at the database, not only in the pre-flight check: two clicks
+    // landing together both read "no existing article" and both proceed, and
+    // only the index can say no to the second one. Sparse so documents
+    // written before this field existed are simply not in the index rather
+    // than all colliding on null.
+    normalizedKeyword: {
+      type: String,
+      trim: true,
+      index: { unique: true, sparse: true },
+    },
     cluster: { type: String, trim: true, index: true },
     searchIntent: {
       type: String,
@@ -264,6 +297,10 @@ const seoArticleSchema = new Schema(
       failedChecks: { type: [String], default: [] },
     },
 
+    // Editorial corrections, oldest first. Empty for an article nobody has
+    // had to correct.
+    corrections: { type: [correctionSchema], default: [] },
+
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }, // gives createdAt / updatedAt
@@ -311,6 +348,12 @@ seoArticleSchema.statics.normaliseLegacy = normaliseLegacy;
 // from the model's idea of what "signed off" means. A draft, an in_review or a
 // rejected article is not a page -- it is work in progress, and serving one
 // would publish text no human has approved.
+// One definition of "the same keyword", used by the pre-flight check, the
+// generator and the tests. Anywhere that compares keywords must call this;
+// two normalisers would eventually disagree and let a duplicate through.
+seoArticleSchema.statics.normaliseKeyword = (k) =>
+  String(k || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
 seoArticleSchema.statics.PUBLIC_STATUSES = Object.freeze(['approved', 'published']);
 
 // Hydrated documents. pre('init') runs before casting, so the raw object is

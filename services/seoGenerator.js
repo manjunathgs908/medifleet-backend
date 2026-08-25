@@ -29,6 +29,7 @@ const SeoArticle = require('../models/SeoArticle');
 const { validateJsonLd } = require('./seoSchemaValidator');
 const { refreshLivePageIndex, loadLivePageIndex, isIndexStale } = require('./seoLivePages');
 const { buildFactSheet } = require('./seoFacts');
+const { findPricingClaims, redactPricing, APPROVED_FARE_WORDING } = require('./seoPricingGuard');
 
 // Never hard-coded. An unset key is a configuration answer, not a crash.
 const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
@@ -106,6 +107,19 @@ function getClient() {
     client = new Anthropic();
   }
   return client;
+}
+
+/**
+ * Thrown before any Claude call when the keyword already has an article.
+ * Carries the existing row so the Studio can link to it instead of just
+ * saying no.
+ */
+class DuplicateKeywordError extends Error {
+  constructor(existing) {
+    super(`This keyword already has an article: "${existing.title}" (${existing.status}).`);
+    this.name = 'DuplicateKeywordError';
+    this.existing = existing;
+  }
 }
 
 // ── Similarity ────────────────────────────────────────────────
@@ -485,8 +499,14 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
   const jsonLd = buildJsonLd(article, slug, facts);
   const schemaErrors = validateJsonLd(jsonLd);
 
+  // Published fares. Not a claim-verification problem — the fact sheet
+  // genuinely supports the figure when it is written — but a figure on a
+  // public page outlives the rules that produced it. See seoPricingGuard.js.
+  const pricingClaims = findPricingClaims(article);
+
   const passed =
     blockingClaims.length === 0 &&
+    pricingClaims.length === 0 &&
     !duplicateSlug &&
     similarityScore < SIMILARITY_BLOCK &&
     livePageSimilarity < SIMILARITY_BLOCK &&
@@ -501,6 +521,7 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
   // both the log and the recheck response will under-report the reason.
   const failedChecks = [];
   if (blockingClaims.length) failedChecks.push(`${blockingClaims.length} blocking claim(s)`);
+  if (pricingClaims.length) failedChecks.push(`${pricingClaims.length} fixed price(s): ${pricingClaims.join(', ')} — use: "${APPROVED_FARE_WORDING}"`);
   if (duplicateSlug) failedChecks.push('duplicate slug');
   if (similarityScore >= SIMILARITY_BLOCK) failedChecks.push(`draft similarity ${similarityScore.toFixed(2)} >= ${SIMILARITY_BLOCK}`);
   if (livePageSimilarity >= SIMILARITY_BLOCK) failedChecks.push(`live-page similarity ${livePageSimilarity.toFixed(2)} >= ${SIMILARITY_BLOCK} (${similarToLivePage || 'unknown page'})`);
@@ -522,6 +543,7 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
       livePageSimilarity, similarToLivePage, livePagesIndexed,
       intentCollisions,
       schemaErrors,
+      pricingClaims,
       unverifiedClaims, droppedLinks,
       titleLength, metaLength,
       wordCount, passed,
@@ -538,6 +560,21 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
 async function generateDraft(input, user) {
   const { keyword, service, location, notes } = input;
   if (!keyword || !String(keyword).trim()) throw new Error('A keyword is required.');
+
+  // ── Duplicate keyword: refuse BEFORE spending anything ──────
+  //
+  // Every status counts, rejected included. A rejected article is a decision
+  // somebody made about this keyword; generating a fresh one behind their
+  // back is how a rejection gets quietly overturned. The reviewer is told
+  // what exists and decides.
+  const normalizedKeyword = SeoArticle.normaliseKeyword(keyword);
+  const existing = await SeoArticle.findOne({ normalizedKeyword })
+    .select('_id slug title status keyword')
+    .lean();
+  if (existing) {
+    console.log(`[SEO] duplicate keyword "${normalizedKeyword}" — existing ${existing.status} article ${existing._id}, no generation run`);
+    throw new DuplicateKeywordError(existing);
+  }
 
   const startedAt = Date.now();
   const elapsed = () => Date.now() - startedAt;
@@ -572,7 +609,11 @@ async function generateDraft(input, user) {
     `4. Write the page. At least ${MIN_WORDS} words of substance, 4-6 FAQs a real person would ask.`,
     '',
     'FACT SHEET — the complete set of things you know:',
-    factBlock,
+    // Redacted: the writer is shown no fare figure at all, so it cannot
+    // publish one. The checker below still receives the real sheet — it
+    // needs true figures to judge everything else, and a price that arrives
+    // anyway is stopped by the pricing gate rather than by the checker.
+    JSON.stringify(redactPricing(facts), null, 2),
   ].filter(Boolean).join('\n');
 
   const { data: article, usage, ms: writerMs } = await callClaude({
@@ -664,8 +705,11 @@ async function generateDraft(input, user) {
     + `elapsed=${Math.round(elapsed() / 1000)}s`,
   );
 
-  const doc = await SeoArticle.create({
+  let doc;
+  try {
+    doc = await SeoArticle.create({
     keyword: String(keyword).trim(),
+    normalizedKeyword,
     cluster: article.cluster,
     searchIntent: article.searchIntent,
     location: location || null,
@@ -697,7 +741,22 @@ async function generateDraft(input, user) {
       repairStoppedReason,
     },
     createdBy: user?._id,
-  });
+    });
+  } catch (err) {
+    // 11000 is the unique index on normalizedKeyword. Two operators clicked
+    // together, both pre-flight checks read "nothing there", and the database
+    // is the only thing that can arbitrate. The loser gets the same answer
+    // the pre-flight check would have given — the work is already paid for,
+    // but a second row is not created.
+    if (err?.code === 11000) {
+      const winner = await SeoArticle.findOne({ normalizedKeyword })
+        .select('_id slug title status keyword')
+        .lean();
+      console.log(`[SEO] duplicate keyword "${normalizedKeyword}" lost the race — returning existing ${winner?._id}`);
+      if (winner) throw new DuplicateKeywordError(winner);
+    }
+    throw err;
+  }
 
   return doc;
 }
@@ -813,4 +872,5 @@ module.exports = {
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
   evaluateGates, recheckArticle,
+  DuplicateKeywordError,
 };

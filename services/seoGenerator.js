@@ -222,8 +222,8 @@ const REPAIR_SCHEMA = {
       description: 'Exactly the fields you rewrote. Omit any field you did not change.',
       items: { type: 'string', enum: ['title', 'metaDescription', 'h1', 'content', 'faqs'] },
     },
-    title: { type: 'string' },
-    metaDescription: { type: 'string' },
+    title: { type: 'string', description: 'Only if a flagged claim is inside it. MUST be between 55 and 60 characters inclusive. Count the characters before returning.' },
+    metaDescription: { type: 'string', description: 'Only if a flagged claim is inside it. MUST be between 150 and 160 characters inclusive. Count the characters before returning.' },
     h1: { type: 'string' },
     content: { type: 'string', description: 'The full repaired body in Markdown, if and only if you changed it.' },
     faqs: {
@@ -308,7 +308,8 @@ How to repair:
 - Make the smallest edit that removes the unsupported assertion. Usually that is deleting a clause, or replacing a specific figure with an honest invitation to call.
 - Where the fact cannot be verified, use cautious wording: say what the reader should do, not what is true. "Ask what is available when you call" is supportable. "We keep a vehicle stationed in your area" is not, unless the sheet says so.
 - Do not add new claims, figures, place names, services or guarantees while repairing. A repair may only narrow what the page asserts, never widen it.
-- Do not pad to replace lost length, and do not touch the title or meta description unless a flagged claim is inside one. Both are length-checked downstream and rewriting them for style will fail the page.
+- Do not pad the body to replace lost length, and never invent a claim to reach a character count. Removing an unsupported sentence and ending up shorter is the correct outcome.
+- Do not touch the title or meta description unless a flagged claim is inside one. If you do have to rewrite either, its length is a hard gate rather than a preference: the title MUST end up between 55 and 60 characters, and the meta description MUST end up between 150 and 160. Count them before returning. A repair that removes the claim but lands outside the range has traded one failure for another.
 - Keep the existing voice, British-Indian English, Markdown structure and heading order.`;
 
 async function callClaude({ system, prompt, schema, maxTokens = 16000 }) {
@@ -585,10 +586,18 @@ async function generateDraft(input, user) {
   // first slow day.
   const totals = { input: 0, output: 0 };
   let slowestCallMs = 0;
-  const spend = (usage, ms) => {
+  // Tracked apart from the writer, and this distinction is the whole point: a
+  // repair edits a few sentences and a check reads the result, while the
+  // writer composes the entire article from nothing. The writer is reliably
+  // the slowest call of the run by a wide margin, so projecting a repair
+  // cycle from its duration over-estimates that cycle badly enough to refuse
+  // passes there was comfortable time for.
+  let slowestCycleCallMs = 0;
+  const spend = (usage, ms, kind = 'cycle') => {
     totals.input += usage?.input_tokens || 0;
     totals.output += usage?.output_tokens || 0;
     if (ms > slowestCallMs) slowestCallMs = ms;
+    if (kind !== 'writer' && ms > slowestCycleCallMs) slowestCycleCallMs = ms;
   };
 
   console.log(`[SEO] generation started — keyword="${String(keyword).trim()}" model=${MODEL} effort=${EFFORT}`);
@@ -621,7 +630,7 @@ async function generateDraft(input, user) {
     prompt: brief,
     schema: ARTICLE_SCHEMA,
   });
-  spend(usage, writerMs);
+  spend(usage, writerMs, 'writer');
 
   // ── Fact check, then bounded repair ─────────────────────────
   //
@@ -653,10 +662,15 @@ async function generateDraft(input, user) {
       break;
     }
 
-    // A repair pass costs a repair call plus another check. If that would run
-    // past the budget, stop and save what we have: a draft the operator can
-    // see beats a request the Studio abandoned.
-    const projectedMs = slowestCallMs * 2;
+    // A repair pass costs one repair call plus one re-check, and both are
+    // cycle calls. Project from the slowest cycle call seen rather than the
+    // slowest call overall. The fallback to slowestCallMs cannot trigger in
+    // practice — fact-check attempt 1 always runs before this line — but it
+    // keeps the arithmetic defined if the order ever changes.
+    //
+    // If that would run past the budget, stop and save what we have: a draft
+    // the operator can see beats a request the Studio abandoned.
+    const projectedMs = (slowestCycleCallMs || slowestCallMs) * 2;
     if (elapsed() + projectedMs > GENERATION_BUDGET_MS) {
       repairStoppedReason = 'time-budget';
       console.log(

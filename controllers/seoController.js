@@ -20,6 +20,7 @@ const {
   SIMILARITY_BLOCK, MIN_WORDS, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
 } = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
+const { autoRepairArticle, AutoRepairBusyError } = require('../services/seoAutoRepair');
 
 // ============================================================
 // @route   POST /api/seo/generate
@@ -239,6 +240,54 @@ exports.repair = async (req, res, next) => {
     // Asking to repair a clean article is an answer, not a failure.
     if (err instanceof NothingToRepairError) {
       return res.status(422).json({ success: false, message: err.message });
+    }
+    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
+      return res.status(503).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/seo/articles/:id/auto-repair
+// @desc    Run repair -> recheck automatically until the gates pass, the
+//          failures stop being repairable, or the attempt cap is reached.
+//
+//          Orchestration only: it calls the same repairArticle() and
+//          recheckArticle() the manual buttons call. It cannot approve and
+//          cannot publish — a clean result leaves the article exactly where
+//          it was, with checks.passed true and a human still to press
+//          Approve.
+// @access  Private [owner]
+// ============================================================
+exports.autoRepair = async (req, res, next) => {
+  try {
+    const article = await SeoArticle.findById(req.params.id).select('_id status');
+    if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
+    if (article.status === 'rejected') {
+      return res.status(422).json({
+        success: false,
+        message: 'This article was rejected. Move it back to draft first if you want to work on it.',
+      });
+    }
+
+    const r = await autoRepairArticle(req.params.id);
+
+    return res.json({
+      success: true,
+      passed: r.passed,
+      attempts: r.attempts,
+      stoppedReason: r.stoppedReason,
+      timeline: r.timeline,
+      message: r.passed
+        ? `All checks passed after ${r.attempts} automatic repair${r.attempts === 1 ? '' : 's'}. The article is still in ${r.article.status} — press Approve to publish it.`
+        : `Stopped after ${r.attempts} attempt${r.attempts === 1 ? '' : 's'}: ${r.stoppedReason}`,
+      article: r.article,
+    });
+  } catch (err) {
+    // Another loop holds this article. Not an error the operator caused.
+    if (err instanceof AutoRepairBusyError) {
+      return res.status(409).json({ success: false, message: err.message });
     }
     if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
       return res.status(503).json({ success: false, message: err.message });

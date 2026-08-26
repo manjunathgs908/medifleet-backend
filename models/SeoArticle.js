@@ -290,6 +290,23 @@ const seoArticleSchema = new Schema(
       // Set by POST /api/seo/articles/:id/recheck after a human edit. The
       // generation record above is never overwritten: this records that the
       // same gates were run again over changed text, and what they said.
+      // ── Automatic repair loop ────────────────────────────────
+      // Driven by services/seoAutoRepair.js. `running` is the lock: it is
+      // claimed with a conditional findOneAndUpdate, so two loops racing the
+      // same article cannot both start.
+      autoRepair: {
+        running: { type: Boolean, default: false },
+        startedAt: { type: Date },
+        lastRunAt: { type: Date },
+        attempts: { type: Number, default: 0 },
+        // Why it stopped with the article still failing. Null when it stopped
+        // because the gates passed.
+        stoppedReason: { type: String, default: null },
+        // One line per step, in order, so a reviewer can read what happened
+        // without reconstructing it from logs.
+        timeline: { type: [String], default: [] },
+      },
+
       recheckedAt: { type: Date },
       recheckResult: { type: String, enum: ['passed', 'failed'] },
       // Human-readable gate failures from the last recheck, in the same

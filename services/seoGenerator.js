@@ -918,7 +918,7 @@ async function recheckArticle(article) {
  * Mutates and saves. Returns a summary that says what changed, including when
  * nothing did — a repair that achieved nothing is a result, not a success.
  */
-async function repairArticle(article) {
+async function repairArticle(article, { attempt = null, automatic = false } = {}) {
   const startedAt = Date.now();
   const totals = { input: 0, output: 0 };
   const spend = (usage) => {
@@ -983,7 +983,8 @@ async function repairArticle(article) {
 
   article.corrections.push({
     at: new Date(),
-    reason: `Repair: ${claims.length} blocking claim(s)${metaWasOk ? '' : `, meta description ${metaBefore} chars outside ${META_MIN}-${META_MAX}`}.`,
+    reason: `${automatic ? 'Automatic repair' : 'Repair'}${attempt ? ` (attempt ${attempt})` : ''}: `
+      + `${claims.length} blocking claim(s)${metaWasOk ? '' : `, meta description ${metaBefore} chars outside ${META_MIN}-${META_MAX}`}.`,
     fields: repairedFields,
     previous,
   });
@@ -1016,6 +1017,6 @@ module.exports = {
   SIMILARITY_BLOCK, MIN_WORDS,
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
-  evaluateGates, recheckArticle, repairArticle,
+  evaluateGates, recheckArticle, repairArticle, isBlocking,
   DuplicateKeywordError, NothingToRepairError,
 };

@@ -32,6 +32,8 @@ router.put('/articles/:id', seoCtrl.update);
 router.post('/articles/:id/recheck', generateLimiter, seoCtrl.recheck);
 // Same bucket again: a repair is one more Claude call.
 router.post('/articles/:id/repair', generateLimiter, seoCtrl.repair);
+// Up to four Claude calls in one request, so the same bucket again.
+router.post('/articles/:id/auto-repair', generateLimiter, seoCtrl.autoRepair);
 router.put('/articles/:id/status', seoCtrl.setStatus);
 router.delete('/articles/:id', seoCtrl.remove);
 

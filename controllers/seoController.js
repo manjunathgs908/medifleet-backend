@@ -15,7 +15,8 @@
 
 const SeoArticle = require('../models/SeoArticle');
 const {
-  generateDraft, recheckArticle, DuplicateKeywordError,
+  generateDraft, recheckArticle, repairArticle,
+  DuplicateKeywordError, NothingToRepairError,
   SIMILARITY_BLOCK, MIN_WORDS, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
 } = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
@@ -186,6 +187,59 @@ exports.recheck = async (req, res, next) => {
   } catch (err) {
     // Same operator-facing handling as generate: a missing key or a refusal
     // is an answer, not a stack trace.
+    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
+      return res.status(503).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/seo/articles/:id/repair
+// @desc    Rewrite the blocking claims the checker already raised, plus a
+//          meta description outside its length band.
+//
+//          Repair does not fact-check and does not run the gates. Recheck
+//          produces the claims, this consumes them, and Recheck runs again
+//          afterwards to find out whether it worked — which is why this sets
+//          checks.passed false and leaves it there.
+//
+//          It never approves and never publishes. Status is untouched in
+//          both directions.
+// @access  Private [owner]
+// ============================================================
+exports.repair = async (req, res, next) => {
+  try {
+    const article = await SeoArticle.findById(req.params.id);
+    if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
+
+    // Same rule as recheck: a rejection is a decision about the article, and
+    // repairing one would be a way to walk it back without a re-read.
+    if (article.status === 'rejected') {
+      return res.status(422).json({
+        success: false,
+        message: 'This article was rejected. Move it back to draft first if you want to work on it.',
+      });
+    }
+
+    const result = await repairArticle(article);
+
+    return res.json({
+      success: true,
+      repaired: result.repaired,
+      repairedFields: result.repairedFields,
+      claimsTargeted: result.claimsTargeted,
+      metaBefore: result.metaBefore,
+      metaAfter: result.metaAfter,
+      metaFixed: result.metaFixed,
+      message: result.summary,
+      article: result.article,
+    });
+  } catch (err) {
+    // Asking to repair a clean article is an answer, not a failure.
+    if (err instanceof NothingToRepairError) {
+      return res.status(422).json({ success: false, message: err.message });
+    }
     if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
       return res.status(503).json({ success: false, message: err.message });
     }

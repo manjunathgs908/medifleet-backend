@@ -122,6 +122,19 @@ class DuplicateKeywordError extends Error {
   }
 }
 
+/**
+ * Thrown when a repair is asked for on an article that has nothing to repair.
+ * Not an error condition so much as an answer: the Studio should not have
+ * offered the button, and doing the work anyway would spend a Claude call to
+ * change nothing.
+ */
+class NothingToRepairError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'NothingToRepairError';
+  }
+}
+
 // ── Similarity ────────────────────────────────────────────────
 // Word trigrams over normalised text, compared by Jaccard. Deliberately
 // simple: it catches the failure that actually happens (the same article
@@ -364,15 +377,20 @@ async function runFactCheck(article, factBlock, spend) {
  * afterwards and validated by the existing gate, so structured data can
  * never describe text a repair edited out.
  */
-async function repairClaims(article, claims, factBlock, spend) {
+async function repairClaims(article, claims, factBlock, spend, extraInstructions = []) {
   const prompt = [
     'FACT SHEET — the complete set of things you know:',
     factBlock,
     '',
     'CLAIMS THE CHECKER COULD NOT VERIFY:',
     ...claims.map((c, i) => `${i + 1}. [${c.severity} / ${c.action}] ${c.claim}`),
+    // Gate failures that are not claims — a meta description outside its
+    // length band, say. Passed through the same call rather than a second
+    // one: the model is already rewriting this article and already has the
+    // fact sheet in front of it.
+    ...(extraInstructions.length ? ['', 'ALSO FIX (these are gate failures, not claims):', ...extraInstructions.map((t) => `- ${t}`)] : []),
     '',
-    'ARTICLE (repair only the claims above):',
+    'ARTICLE (repair only the claims and fixes above):',
     JSON.stringify(
       CHECKABLE_FIELDS.reduce((o, k) => { o[k] = article[k]; return o; }, {}),
       null,
@@ -880,11 +898,124 @@ async function recheckArticle(article) {
   return { passed: gate.passed, failedChecks: gate.failedChecks, article };
 }
 
+/**
+ * Repair an article a human has looked at, using the claims the checker
+ * already raised.
+ *
+ * Deliberately NOT a second fact check. recheckArticle() produces the claims,
+ * this consumes them, and the reviewer runs recheck again to find out whether
+ * it worked. One Claude call, one job, and no competing implementation of
+ * what counts as unverified.
+ *
+ * It also does not call evaluateGates. A repair cannot decide that an article
+ * passes — it sets checks.passed false and stops, so the only thing that can
+ * clear that flag remains a fresh recheck.
+ *
+ * What it repairs is whatever the article actually carries: the blocking
+ * claims stored on checks.unverifiedClaims, plus a meta description outside
+ * its length band. Nothing about any particular article is encoded here.
+ *
+ * Mutates and saves. Returns a summary that says what changed, including when
+ * nothing did — a repair that achieved nothing is a result, not a success.
+ */
+async function repairArticle(article) {
+  const startedAt = Date.now();
+  const totals = { input: 0, output: 0 };
+  const spend = (usage) => {
+    totals.input += usage?.input_tokens || 0;
+    totals.output += usage?.output_tokens || 0;
+  };
+
+  // ── What is there to repair? ────────────────────────────────
+  const claims = normaliseClaims(article.checks?.unverifiedClaims).filter(isBlocking);
+
+  const metaBefore = String(article.metaDescription || '').length;
+  const metaWasOk = metaBefore >= META_MIN && metaBefore <= META_MAX;
+
+  if (!claims.length && metaWasOk) {
+    throw new NothingToRepairError(
+      'Nothing to repair: no blocking claims, and the meta description is within its length range. Run Recheck if the article still fails its gates.',
+    );
+  }
+
+  console.log(`[SEO] repair started — slug="${article.slug}" status=${article.status} claims=${claims.length} meta=${metaBefore}`);
+
+  // Gate failures that are not claims, handed to the same call.
+  const extraInstructions = [];
+  if (!metaWasOk) {
+    extraInstructions.push(
+      `The meta description is currently ${metaBefore} characters and MUST end up between ${META_MIN} and ${META_MAX}. `
+      + 'Rewrite it to land inside that range. Do not add any claim the fact sheet does not support in order to reach the length, and do not introduce a price.',
+    );
+  }
+
+  // Snapshot BEFORE the call: this is what makes the repair reversible.
+  const previous = {
+    title: article.title,
+    metaDescription: article.metaDescription,
+    h1: article.h1,
+    content: article.content,
+    faqs: (article.faqs || []).map((f) => ({ q: f.q, a: f.a })),
+    status: article.status,
+  };
+
+  const facts = await buildFactSheet();
+  const factBlock = JSON.stringify(facts, null, 2);
+
+  const repairedFields = await repairClaims(article, claims, factBlock, spend, extraInstructions);
+
+  const metaAfter = String(article.metaDescription || '').length;
+  const metaFixed = !metaWasOk && metaAfter >= META_MIN && metaAfter <= META_MAX;
+
+  // A repair that changed nothing is reported as such rather than saved as a
+  // correction. Recording an empty edit would put a lie in the audit trail.
+  if (!repairedFields.length) {
+    console.log('[SEO] repair: model returned no changes — nothing written');
+    return {
+      repaired: false,
+      repairedFields: [],
+      claimsTargeted: claims.length,
+      metaBefore, metaAfter, metaFixed: false,
+      summary: `No changes. The model was given ${claims.length} blocking claim(s) and returned nothing to rewrite; the article is unchanged.`,
+      article,
+    };
+  }
+
+  article.corrections.push({
+    at: new Date(),
+    reason: `Repair: ${claims.length} blocking claim(s)${metaWasOk ? '' : `, meta description ${metaBefore} chars outside ${META_MIN}-${META_MAX}`}.`,
+    fields: repairedFields,
+    previous,
+  });
+
+  // The gates have not been re-run over this text, so nothing here may claim
+  // it passes. Only recheckArticle() can set this true.
+  article.checks.passed = false;
+
+  // Status is not touched, in either direction.
+  await article.save();
+
+  const parts = [`rewrote ${repairedFields.join(', ')}`];
+  if (claims.length) parts.push(`targeting ${claims.length} blocking claim(s)`);
+  if (!metaWasOk) parts.push(metaFixed ? `meta ${metaBefore} -> ${metaAfter} chars (now in range)` : `meta ${metaBefore} -> ${metaAfter} chars (STILL outside ${META_MIN}-${META_MAX})`);
+
+  console.log(`[SEO] repair done in ${Math.round((Date.now() - startedAt) / 1000)}s — ${parts.join('; ')}`);
+
+  return {
+    repaired: true,
+    repairedFields,
+    claimsTargeted: claims.length,
+    metaBefore, metaAfter, metaFixed,
+    summary: `Repaired: ${parts.join('; ')}. checks.passed is now false — run Recheck to see whether it worked.`,
+    article,
+  };
+}
+
 module.exports = {
   generateDraft, shingle, jaccard,
   SIMILARITY_BLOCK, MIN_WORDS,
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
-  evaluateGates, recheckArticle,
-  DuplicateKeywordError,
+  evaluateGates, recheckArticle, repairArticle,
+  DuplicateKeywordError, NothingToRepairError,
 };

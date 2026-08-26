@@ -30,6 +30,8 @@ router.put('/articles/:id', seoCtrl.update);
 // same bucket as generate: a recheck is a Claude call too, and an operator
 // hammering it costs exactly as much.
 router.post('/articles/:id/recheck', generateLimiter, seoCtrl.recheck);
+// Same bucket again: a repair is one more Claude call.
+router.post('/articles/:id/repair', generateLimiter, seoCtrl.repair);
 router.put('/articles/:id/status', seoCtrl.setStatus);
 router.delete('/articles/:id', seoCtrl.remove);
 

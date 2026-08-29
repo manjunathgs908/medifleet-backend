@@ -47,7 +47,7 @@ const APPLY = process.argv.includes('--apply');
 const PRICING_SECTION = [
   '## The two BLS vehicles',
   '',
-  'BLS ambulances run on either a Maruti Eeco or a Tempo Traveller. Both are oxygen-equipped, staffed by a trained attendant, and GPS-tracked so the vehicle can be followed on its way to you.',
+  'BLS ambulances run on either a Maruti Eeco or a Tempo Traveller. Both are oxygen-equipped, carry a stretcher, and are GPS-tracked so the vehicle can be followed on its way to you. They travel with the driver; an attendant is an optional add-on you choose at booking.',
   '',
   'What a trip costs depends on the distance actually travelled, the vehicle, whether you need air conditioning, the time of day, and the other pricing rules in force when you book. ' + APPROVED_FARE_WORDING,
   '',
@@ -59,11 +59,15 @@ const PRICING_SECTION = [
 // never even open the page. The original read "Maruti Eeco from ₹1,200 or
 // Tempo Traveller from ₹1,500" — two fares, in the search snippet.
 //
+// It also must not claim an attendant. A BLS vehicle travels with the driver
+// only — the attendant is the optional paid Helper add-on — and this constant
+// previously asserted one, which is how the claim reached a live page.
+//
 // Length matters as much as content. metaOk gates on META_MIN..META_MAX, so a
 // replacement that fell outside the band would trade one gate failure for
 // another; this one is checked against the band before it is used.
 const REPLACEMENT_META =
-  'Book a BLS ambulance in Bengaluru 24/7. Oxygen-equipped, trained attendant, GPS-tracked. The fare is shown before you confirm. Call or WhatsApp SaveLife.';
+  'Book a BLS ambulance in Bengaluru 24/7. Oxygen-equipped, stretcher on board, GPS-tracked. The fare is shown before you confirm. Call or WhatsApp SaveLife.';
 
 /** Rewrite the meta only if it actually quotes a figure. */
 function rewriteMeta(meta) {

@@ -85,14 +85,23 @@ exports.compute = async ({
   // conditioning runs for the whole journey, both directions.
   const acCharge = acEnabled && doc.acPerKm ? Math.round(doc.acPerKm * distanceKm) : 0;
 
-  // Helper/attendant: a flat per-trip fee, added once. Deliberately NOT
-  // multiplied by distance the way acCharge is - a helper costs the same
-  // whether the trip is 5 km or 50. Falls back to 0 when the Pricing doc
-  // carries no helperCharge, so a service without one can never be billed
-  // for it. NOTE: which services may offer a helper, and the distance cap,
-  // are enforced by the booking UIs only - this function bills whatever a
-  // caller asks for. Tighten here if that becomes a trust boundary.
-  const helperCharge = helperEnabled && doc.helperCharge ? doc.helperCharge : 0;
+  // Helper/attendant: a flat per-LEG fee. Still deliberately NOT multiplied
+  // by distance the way acCharge is - a helper costs the same whether the
+  // trip is 5 km or 50. Legs are the exception: on a round trip the helper
+  // travels out and back, so the one-way fee is charged twice.
+  //
+  // doc.helperCharge stays the ONE-WAY rate in the Pricing collection and
+  // the doubling lives here, mirroring how acCharge reads a per-km rate and
+  // applies the distance. Storing 600 instead would silently overcharge
+  // every one-way booking.
+  //
+  // Falls back to 0 when the Pricing doc carries no helperCharge, so a
+  // service without one can never be billed for it. NOTE: which services may
+  // offer a helper, and the distance cap, are enforced by the booking UIs
+  // only - this function bills whatever a caller asks for. Tighten here if
+  // that becomes a trust boundary.
+  const helperLegs   = tripType === 'round_trip' ? 2 : 1;
+  const helperCharge = helperEnabled && doc.helperCharge ? doc.helperCharge * helperLegs : 0;
   const totalAdditionalCharges = additionalCharges + acCharge + helperCharge;
 
   const subTotal   = baseFare + totalAdditionalCharges;

@@ -50,7 +50,13 @@ const whatsapp = require('./whatsappService');
 // Mirrors tripController.js's own GST_RATE (module-private there, not
 // exported -- this is the one other place a fare gets computed, so it
 // needs the same constant, not a shared export it didn't ask for).
-const GST_RATE = 5;
+//
+// ZERO because these bookings are GST-exempt, not because the constant
+// was forgotten. The bot can only book patient ambulance (SAC 999315,
+// exempt under Notification 12/2017) and dead body transport (SAC
+// 999732, no GST). See the fuller note at tripController.js's GST_RATE;
+// the two are a mirrored pair and must change together.
+const GST_RATE = 0;
 
 // Read fresh at send time (see bookingConfirmed's {phone} interpolation
 // below), never hardcoded in the message string itself -- same

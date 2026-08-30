@@ -96,9 +96,23 @@ async function findMatchingAmbulance(registrationNumber) {
   }
 }
 
-// 5% GST on medical transport — not a Pricing-collection field, applied uniformly
-// here rather than as a silent Mongoose schema default.
-const GST_RATE = 5;
+// GST is ZERO on every fare this controller computes. That is an
+// exemption, not an oversight, and not a value waiting to be filled in.
+// Please do not "restore" it to 5.
+//
+// Patient ambulance transport is SAC 999315, exempt under Notification
+// 12/2017-Central Tax (Rate). Dead body transport is SAC 999732 and
+// carries no GST. Between them those two cover all seven bookable
+// service types, so there is no service reachable from this controller
+// whose fare is taxable.
+//
+// The rate is zero; the machinery deliberately is not. gstRate is still
+// passed to fareCalculator, gstAmount/grandTotal are still written, and
+// Bill.gstRate is still required. Corporate monthly ambulance rental
+// (SAC 9993) IS taxable at 18% and needs all of it. Zero here is the
+// rate for these booking flows, not a statement that GST does not apply
+// to the business.
+const GST_RATE = 0;
 
 
 // ============================================================

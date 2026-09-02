@@ -166,8 +166,9 @@ describe('B. a terminal phase never stands in for a gate result', () => {
   });
 
   test('a blocked failure stops without ever entering a repairing phase', async () => {
-    // duplicateSlug, not pricing: pricing is carried now, not blocked.
-    const doc = makeDoc({ duplicateSlug: true, unverifiedClaims: [blocking('a claim')] });
+    // A schema error: still genuinely blocked. Not pricing (repairable now),
+    // and not a duplicate slug (auto-renamed before the loop starts).
+    const doc = makeDoc({ schemaErrors: ['bad node'], unverifiedClaims: [blocking('a claim')] });
     mockClaim(doc);
 
     const r = await autoRepairArticle(doc._id);

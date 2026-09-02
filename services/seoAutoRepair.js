@@ -44,6 +44,9 @@ const {
 // but blind to anything only a real fact check can see, so the gates are
 // compared before and after the recheck too.
 const { isWorse } = require('./seoRepairGuard');
+// Picks a free slug for a draft whose chosen one is taken. Reads other
+// articles only to test availability; writes to none of them.
+const { findUniqueSlug } = require('./seoSlug');
 
 // Two, matching the generation loop's cap. What survives two passes is a
 // claim the fact sheet genuinely cannot support, and the answer to that is a
@@ -225,6 +228,54 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
     }
 
     await progress(article, 'detecting', timeline, 0, maxAttempts);
+
+    // ── A taken slug is fixed before the loop, not inside it ──
+    //
+    // This is not a repair: no model is asked anything, so it does not consume
+    // one of the two attempts. It runs first because a duplicate slug used to
+    // stop the run at zero attempts, which meant nothing else on the article
+    // could be fixed either — the claims, the title and the meta all went
+    // unrepaired because the URL happened to be taken.
+    //
+    // The recheck immediately afterwards is what confirms it: uniqueness is
+    // re-evaluated by the existing gate against the database, not asserted
+    // here. If the gate still reports a duplicate, classifyFailures blocks the
+    // run on the next line down, exactly as before.
+    if (article.checks?.duplicateSlug) {
+      const picked = await findUniqueSlug(article);
+      if (!picked.ok) {
+        stoppedReason = `needs human review: duplicate slug — ${picked.reason}`;
+        timeline.push(`stopped before attempt 1 — ${stoppedReason}`);
+        await release(article, { attempts: 0, maxAttempts, stoppedReason, timeline, phase: 'stopped' });
+        console.log(`[SEO] auto-repair stopped — ${stoppedReason}`);
+        return { passed: false, attempts: 0, stoppedReason, timeline, article };
+      }
+
+      const previousSlug = article.slug;
+      article.slug = picked.slug;
+      timeline.push(`duplicate slug: "${previousSlug}" was taken, renamed to "${picked.slug}" (candidate ${picked.tried})`);
+      console.log(`[SEO] auto-repair: slug "${previousSlug}" -> "${picked.slug}"`);
+      // Recorded like any other correction, so the rename is answerable later.
+      article.corrections.push({
+        at: new Date(),
+        reason: `Automatic repair: the slug "${previousSlug}" was already taken by another article; renamed to "${picked.slug}".`,
+        fields: ['slug'],
+        previous: { slug: previousSlug, status: article.status },
+      });
+      await article.save();
+
+      await progress(article, 'rechecking', timeline, 0, maxAttempts, ['duplicate slug']);
+      const rc = await recheckArticle(article);
+      timeline.push(`after rename: recheck ${rc.passed ? 'PASSED' : `failed — ${rc.failedChecks.join('; ')}`}`);
+
+      if (rc.passed) {
+        // Clean, and that is where it stops. Status untouched, Approve still a
+        // human pressing a button.
+        await release(article, { attempts: 0, maxAttempts, stoppedReason: null, timeline, phase: 'passed' });
+        console.log(`[SEO] auto-repair: PASSED after a slug rename — status=${article.status}, human approval still required`);
+        return { passed: true, attempts: 0, stoppedReason: null, timeline, article };
+      }
+    }
 
     while (attempts < maxAttempts) {
       const { repairable, blocked } = classifyFailures(article.checks);

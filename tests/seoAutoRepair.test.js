@@ -93,7 +93,9 @@ describe('E/F/G. only genuinely repairable failures are attempted', () => {
   });
 
   test('a blocked failure wins even when something repairable is also present', async () => {
-    const doc = makeDoc({ duplicateSlug: true, unverifiedClaims: [blocking('x')] });
+    // A schema error rather than a duplicate slug: a taken slug is renamed
+    // automatically before the loop now, so it is no longer a blocking case.
+    const doc = makeDoc({ schemaErrors: ['bad node'], unverifiedClaims: [blocking('x')] });
     mockClaim(doc);
 
     const r = await autoRepairArticle(doc._id);

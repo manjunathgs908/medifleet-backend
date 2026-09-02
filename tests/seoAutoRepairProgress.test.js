@@ -271,15 +271,19 @@ describe('D. the pricing guard survives a round trip through the schema', () => 
   // with eleven fares could not have a single unsupported claim or a broken
   // title fixed, because the loop declined to start. Existing pricing is
   // baseline state \u2014 carried, reported, and left exactly as it is.
-  test('classifyFailures carries a price; it is neither blocked nor repairable', () => {
-    const { repairable, blocked, carried } = classifyFailures({
+  // POLICY CHANGE. A public article carries no exact price at all, so a fare
+  // on the page is the defect and removing it is the repair. This has moved
+  // twice: `blocked` (stopped the loop before attempt 1), then `carried` (ran,
+  // but left the fares on a public page forever), now `repairable`.
+  test('classifyFailures treats a price as repairable, and never as blocking', () => {
+    const { repairable, blocked } = classifyFailures({
       pricingClaims: ['\u20b91,200'],
       unverifiedClaims: [blocking('a claim')],
       metaLength: 154, titleLength: 57, wordCount: 900,
     });
-    expect(carried.join(' ')).toMatch(/fixed price/i);
-    expect(blocked).toEqual([]);                          // does not stop the loop
-    expect(repairable.join(' ')).not.toMatch(/price/i);   // and is never repaired
+    expect(repairable.join(' ')).toMatch(/price/i);
+    expect(repairable.join(' ')).toMatch(/remove/i);
+    expect(blocked).toEqual([]); // never a reason to refuse to start
   });
 
   test('a genuinely blocked failure still refuses to start', () => {
@@ -311,7 +315,9 @@ describe('E. existing pricing is baseline state, not a preflight failure', () =>
     expect(r.timeline.join(' ')).not.toMatch(/stopped before attempt 1/i);
   });
 
-  test('the carried pricing is still reported at the end, so Approve is explained', async () => {
+  // POLICY CHANGE. The fares are no longer "carried and reported" — they are
+  // what the attempt is sent to remove.
+  test('the eleven prices are named as a repair target for the attempt', async () => {
     const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] });
     mockClaim(doc);
     repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
@@ -319,10 +325,9 @@ describe('E. existing pricing is baseline state, not a preflight failure', () =>
 
     const r = await autoRepairArticle(doc._id);
 
-    expect(r.timeline.join(' ')).toMatch(/carried, not repaired/i);
-    expect(r.stoppedReason).toMatch(/11 fixed price/i);
-    expect(r.stoppedReason).toMatch(/block approval|a person must remove/i);
-    // Carried or not, it never approves.
+    expect(r.timeline.join(' ')).toMatch(/11 exact price\(s\) to remove/i);
+    expect(repairArticle).toHaveBeenCalled();
+    // Whatever it repairs, it never approves.
     expect(doc.status).toBe('draft');
     expect(doc.checks.passed).toBe(false);
   });

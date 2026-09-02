@@ -33,6 +33,12 @@ describe('prices are detected', () => {
     ['in a sentence', 'The minimum fare is ₹1,200 for the Eeco.'],
     ['inside a markdown table', '| BLS Ambulance | Maruti Eeco | ₹1,200 |'],
     ['per-hour rate', 'standby is ₹500 per hour'],
+    // The same rates written without a currency marker. "per km" always worked
+    // bare; these units did not, so a fare could be published by dropping the ₹.
+    ['bare per-trip rate', '1200 per trip'],
+    ['bare per-hour rate', '500 per hour'],
+    ['bare per-day rate', '1500 per day'],
+    ['bare minimum', '2500 minimum'],
   ];
 
   test.each(PRICES)('%s: %s is flagged', (_label, text) => {
@@ -54,6 +60,15 @@ describe('legitimate numbers are not prices', () => {
     ['a year', 'Operating since 2019.'],
     ['a distance with no rate', 'The hospital is 12 km away.'],
     ['the approved wording itself', APPROVED_FARE_WORDING],
+    // The bare per-unit rule is why these matter. It reads a number as money
+    // only from three digits up, so a small count keeps its meaning: "2 per
+    // trip" is attendants, not rupees.
+    ['a small count per trip', 'We send 2 attendants per trip when asked.'],
+    ['a spelled-out count', 'There is one attendant per trip.'],
+    ['a duration in hours', 'A freezer box may be kept for 24 hours or longer.'],
+    ['a minimum that is not money', 'Each guide runs to a minimum of 700 words.'],
+    ['equipment counts', 'The NICU unit carries 2 oxygen cylinders.'],
+    ['a floor number', 'A stretcher carry from the 4th floor is a different job.'],
   ];
 
   test.each(CLEAN)('%s is clean: %s', (_label, text) => {

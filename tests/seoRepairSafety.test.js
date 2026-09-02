@@ -41,6 +41,8 @@ const { repairArticle, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX } = require('../
 const {
   validateProposal, newPricesIntroduced, pricesRemoved, newPromisesIntroduced, isWorse,
 } = require('../services/seoRepairGuard');
+// The real gate, read-only, used here to assert what ended up on the article.
+const { findPricingClaims } = require('../services/seoPricingGuard');
 
 const BANDS = { TITLE_MIN, TITLE_MAX, META_MIN, META_MAX };
 
@@ -214,15 +216,22 @@ describe('C. a repair that introduces a price is discarded', () => {
 });
 
 // ============================================================
-describe('D. existing pricing is not deleted to make a gate pass', () => {
-  test('a proposal that strips an existing fare is rejected', () => {
+describe('D. existing pricing is REMOVED, not preserved', () => {
+  // POLICY CHANGE. This described the opposite rule: that stripping a fare was
+  // a regression, on the reasoning that removal was a separate editorial
+  // decision. Under the content policy a public article carries no exact price
+  // at all, so removal is the repair. Treating it as damage meant an article
+  // could never be cleaned by a repair.
+  test('a proposal that strips an existing fare is accepted', () => {
     const before = { content: 'Our BLS starts at ₹1,200 today.' };
-    const after = { content: 'Our BLS is competitively priced.' };
+    const after = { content: 'What a BLS trip costs depends on the distance travelled.' };
 
-    const v = validateProposal(before, after, BANDS, {});
+    const v = validateProposal(before, after, BANDS, { pricing: true });
 
-    expect(v.ok).toBe(false);
-    expect(v.regressions.some((r) => r.code === 'pricing-deleted')).toBe(true);
+    expect(v.regressions).toEqual([]);
+    expect(v.ok).toBe(true);
+    expect(v.improved).toBe(true);
+    expect(v.improvements.join(' ')).toMatch(/removed/i);
   });
 
   test('pricesRemoved reports the exact phrase that disappeared', () => {
@@ -336,18 +345,19 @@ describe('H. prices are compared by value, not by how they were typed', () => {
     expect(v.regressions.some((r) => r.code === 'new-pricing')).toBe(true);
   });
 
-  test('a genuinely DELETED price is still rejected', () => {
-    const v = validateProposal({ content: 'BLS from \u20b91,200.' }, { content: 'BLS is available.' }, BANDS, {});
-    expect(v.ok).toBe(false);
-    expect(v.regressions.some((r) => r.code === 'pricing-deleted')).toBe(true);
+  // POLICY CHANGE: a public article carries no exact price, so removing one is
+  // the goal rather than damage. The safety half is the test below it.
+  test('a genuinely DELETED price is accepted \u2014 removal is the policy', () => {
+    const v = validateProposal({ content: 'BLS from \u20b91,200.' }, { content: 'BLS is available.' }, BANDS, { pricing: true });
+    expect(v.regressions).toEqual([]);
+    expect(v.ok).toBe(true);
   });
 
-  test('1200 changed to 1500 is rejected on both counts', () => {
-    const v = validateProposal({ content: 'BLS from \u20b91,200.' }, { content: 'BLS from \u20b91,500.' }, BANDS, {});
+  // A swap is not a removal. This is the safety rule, and it is unchanged.
+  test('1200 swapped for 1500 is still rejected', () => {
+    const v = validateProposal({ content: 'BLS from \u20b91,200.' }, { content: 'BLS from \u20b91,500.' }, BANDS, { pricing: true });
     expect(v.ok).toBe(false);
-    const codes = v.regressions.map((r) => r.code);
-    expect(codes).toContain('new-pricing');
-    expect(codes).toContain('pricing-deleted');
+    expect(v.regressions.map((r) => r.code)).toContain('new-pricing');
   });
 
   test('a per-km rate never collapses into a plain amount that shares its digits', () => {
@@ -487,25 +497,80 @@ describe('J. an article that already carries many prices', () => {
     expect(v.regressions.some((r) => r.code === 'new-pricing')).toBe(true);
   });
 
-  test('D. one of the eleven deleted is rejected', () => {
+  test('D. removing some of the eleven is accepted, with the rest reported unfinished', () => {
     const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
     const after = { content: `Fares: ${ELEVEN.slice(1).join(', ')}.` };
 
-    const v = validateProposal(before, after, BANDS, { claims: true });
+    const v = validateProposal(before, after, BANDS, { pricing: true });
 
-    expect(v.ok).toBe(false);
-    expect(v.regressions.some((r) => r.code === 'pricing-deleted')).toBe(true);
+    expect(v.regressions).toEqual([]);
+    expect(v.ok).toBe(true);
+    // Ten are still there. Kept, but honestly reported rather than called done.
+    expect(v.unmet.some((u) => u.code === 'pricing-remains')).toBe(true);
   });
 
-  test('E. one of the eleven changed in value is rejected on both counts', () => {
+  test('D2. removing ALL eleven leaves nothing unfinished', () => {
+    const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
+    const after = { content: 'The fare depends on the vehicle and the road distance travelled.' };
+
+    const v = validateProposal(before, after, BANDS, { pricing: true });
+
+    expect(v.ok).toBe(true);
+    expect(v.unmet).toEqual([]);
+    expect(v.improvements.join(' ')).toMatch(/11 published fare\(s\) removed/i);
+  });
+
+  test('E. swapping one of the eleven for a different figure is rejected', () => {
     const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
     const after = { content: `Fares: ${['\u20b95,555', ...ELEVEN.slice(1)].join(', ')}.` };
 
-    const v = validateProposal(before, after, BANDS, { claims: true });
+    const v = validateProposal(before, after, BANDS, { pricing: true });
 
     expect(v.ok).toBe(false);
-    const codes = v.regressions.map((r) => r.code);
-    expect(codes).toContain('new-pricing');
-    expect(codes).toContain('pricing-deleted');
+    expect(v.regressions.map((r) => r.code)).toContain('new-pricing');
+  });
+});
+
+// ============================================================
+describe('K. repair removes existing pricing end to end', () => {
+  const PRICED = 'A BLS trip to Whitefield is \u20b91,200 for the first 10 km, and ALS is \u20b92,500. ' + 'filler '.repeat(200);
+
+  test('the repair is told to remove the fares, and is given them verbatim', async () => {
+    const doc = hydrate({ content: PRICED, checks: { passed: false, titleLength: OK_TITLE.length, metaLength: 154, unverifiedClaims: [] } });
+    respond({ repairedFields: ['content'], content: 'What a trip costs depends on the vehicle and the road distance travelled. ' + 'filler '.repeat(200) });
+
+    const r = await repairArticle(doc);
+
+    const prompt = promptOf(0);
+    expect(prompt).toMatch(/REMOVE THE PUBLISHED PRICING/);
+    expect(prompt).toMatch(/\u20b91,200/);
+    expect(prompt).toMatch(/\u20b92,500/);
+    expect(r.repaired).toBe(true);
+    // The fares are gone from the article itself.
+    expect(findPricingClaims(doc)).toEqual([]);
+  });
+
+  test('a priced article is no longer "nothing to repair" even when every other gate passes', async () => {
+    // Title in band, meta in band, no blocking claims -- but it carries fares,
+    // so there is work to do and the repair must not refuse.
+    const doc = hydrate({ content: PRICED, checks: { passed: false, titleLength: OK_TITLE.length, metaLength: 154, unverifiedClaims: [] } });
+    respond({ repairedFields: ['content'], content: 'No figures here at all. ' + 'filler '.repeat(200) });
+
+    await expect(repairArticle(doc)).resolves.toMatchObject({ repaired: true });
+  });
+
+  test('a repair that keeps the fares is rejected as unfinished, not silently accepted', async () => {
+    const doc = hydrate({ content: PRICED, checks: { passed: false, titleLength: OK_TITLE.length, metaLength: 154, unverifiedClaims: [] } });
+    // Both rounds hand back the same priced text.
+    respond(
+      { repairedFields: ['content'], content: PRICED + ' Reworded a little.' },
+      { repairedFields: ['content'], content: PRICED + ' Reworded again.' },
+    );
+
+    const r = await repairArticle(doc);
+
+    // Nothing was gained: the fares are still there, so it is not worth saving.
+    expect(r.repaired).toBe(false);
+    expect(findPricingClaims(doc)).toHaveLength(2);  // article untouched
   });
 });

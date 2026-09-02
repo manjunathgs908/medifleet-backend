@@ -205,13 +205,19 @@ function validateProposal(before, after, bands, targets = {}) {
     });
   }
 
+  // Removing a fare is NOT a regression. Under the content policy in
+  // seoContentPolicy.js a public article carries no exact price at all, so
+  // taking one out is the desired outcome rather than something to be caught.
+  //
+  // This used to be a regression, on the reasoning that a repair should not
+  // quietly delete pricing to make a gate pass. That reasoning assumed the
+  // fares were allowed to be there. They are not, and treating their removal
+  // as damage meant an article could never be cleaned by a repair at all.
+  //
+  // The safety half of the rule is untouched and sits immediately above:
+  // introducing a figure is still disqualifying, and because the comparison is
+  // by normalised value, swapping ₹1,200 for ₹1,500 still trips `new-pricing`.
   const droppedPrices = pricesRemoved(before, after);
-  if (droppedPrices.length) {
-    regressions.push({
-      code: 'pricing-deleted',
-      detail: `the repair deleted existing pricing text (${droppedPrices.join(', ')}); removing published fares is a separate editorial decision, not a side effect of a claim repair`,
-    });
-  }
 
   const addedPromises = newPromisesIntroduced(before, after);
   if (addedPromises.length) {
@@ -270,6 +276,22 @@ function validateProposal(before, after, bands, targets = {}) {
   const improvements = [];
   if (targets.title && tOkAfter && !tOkBefore) improvements.push('the title is now inside its band');
   if (targets.meta && mOkAfter && !mOkBefore) improvements.push('the meta description is now inside its band');
+  if (targets.pricing) {
+    const left = findPricesIn(articleText(after)).length;
+    if (droppedPrices.length) {
+      improvements.push(`${droppedPrices.length} published fare(s) removed`);
+    }
+    // Asked for and not finished. Reported, not punished — the same treatment
+    // a title that came back too short gets, so a repair that cleared the
+    // claims and half the fares is still worth keeping.
+    if (left) {
+      unmet.push({
+        code: 'pricing-remains',
+        field: 'content',
+        detail: `${left} exact price(s) still in the article after the repair; a public page must carry none`,
+      });
+    }
+  }
   if (targets.claims) {
     const bodyChanged = String(before?.content || '') !== String(after?.content || '');
     const faqsChanged = JSON.stringify(before?.faqs || []) !== JSON.stringify(after?.faqs || []);

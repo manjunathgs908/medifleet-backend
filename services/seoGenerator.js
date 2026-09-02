@@ -34,6 +34,9 @@ const { findPricingClaims, redactPricing, APPROVED_FARE_WORDING } = require('./s
 // does not define what a price is -- it calls seoPricingGuard for that -- and
 // it cannot let anything through: the real gate still runs afterwards.
 const { validateProposal } = require('./seoRepairGuard');
+// The editorial rule itself, stated once and quoted by every prompt that
+// writes article text, so the writer and the repair cannot drift apart on it.
+const { NO_EXACT_PRICING_RULE, pricingRemovalInstruction } = require('./seoContentPolicy');
 
 // Never hard-coded. An unset key is a configuration answer, not a crash.
 const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
@@ -265,8 +268,10 @@ Write like a person who knows the subject and respects the reader:
 - Vary sentence length. No stacked adjectives. Never repeat the keyword to hit a density — write it the number of times a human would.
 - Do not open with "In today's world" or close with "In conclusion".
 - Say what you cannot do. A page that admits a limit is more useful, and more credible, than one that does not.
-- British-Indian English. Rupee amounts as ₹1,200.
+- British-Indian English.
 - The title MUST be 55-60 characters and the meta description MUST be 150-160. Count them. A draft outside these ranges is rejected automatically.
+
+${NO_EXACT_PRICING_RULE}
 
 internalLinks: choose 3-6 from the LIVE PAGES list only. Never invent a URL. Each needs a real reason a reader on this page would want that page.`;
 
@@ -319,9 +324,10 @@ The action on each claim tells you what the checker thinks it needs:
 - remove  = nothing supports this. Delete the sentence.
 - rewrite = reword until it stops asserting the unsupported thing.
 
+${NO_EXACT_PRICING_RULE}
+
 ABSOLUTE RULES. A repair that breaks any of these is discarded in full and you are asked again, so there is nothing to gain by it:
-- NEVER write a price, a fare, a rate, a deposit, a discount or any other money figure. Not as an example, not as "from", not as "starting at", not as a range, not even if a figure appears elsewhere in the article. If the reader needs a number, the sentence is: "${APPROVED_FARE_WORDING}"
-- NEVER delete or alter pricing wording that is already in the article. It is not yours to remove.
+- NEVER introduce a money figure that was not already there, and never swap one figure for another. Removing a fare is right; replacing it is not.
 - NEVER promise an operational fact. No "nearest", "closest", "fastest", "will arrive", "will reach", "we will send", "we will provide", "guaranteed", "within N minutes", "24/7 staffed", "always available", and nothing else of that shape, unless the fact sheet states it in those terms.
 - NEVER add a new claim of any kind. A repair may only narrow what the page asserts, never widen it.
 
@@ -1048,21 +1054,35 @@ async function repairArticle(article, { attempt = null, automatic = false } = {}
   const titleBefore = String(article.title || '').length;
   const titleWasOk = titleBefore >= TITLE_MIN && titleBefore <= TITLE_MAX;
 
-  if (!claims.length && metaWasOk && titleWasOk) {
+  if (!claims.length && metaWasOk && titleWasOk && !findPricingClaims(article).length) {
     throw new NothingToRepairError(
-      'Nothing to repair: no blocking claims, and the title and meta description are both within their length ranges. Run Recheck if the article still fails its gates.',
+      'Nothing to repair: no blocking claims, no published fares, and the title and meta description are both within their length ranges. Run Recheck if the article still fails its gates.',
     );
   }
+
+  // Fares already on the article. Under the content policy these are not
+  // something to preserve — they are the defect. Read from the text rather
+  // than from checks.pricingClaims, so a repair invoked before any recheck
+  // still sees them.
+  const pricesPresent = findPricingClaims(article);
 
   // Which gates this call is answerable for. A field named here is expected to
   // land inside its band and is reported honestly when it does not; a field
   // NOT named here must merely not get worse.
-  const targets = { title: !titleWasOk, meta: !metaWasOk, claims: claims.length > 0 };
+  const targets = {
+    title: !titleWasOk,
+    meta: !metaWasOk,
+    claims: claims.length > 0,
+    pricing: pricesPresent.length > 0,
+  };
 
   console.log(`[SEO] repair started — slug="${article.slug}" status=${article.status} claims=${claims.length} title=${titleBefore} meta=${metaBefore}`);
 
   // Gate failures that are not claims, handed to the same call.
   const extraInstructions = [];
+  // First, because it is the one that decides whether the page can ever be
+  // approved. The offending phrases are quoted back so the edit stays local.
+  if (pricesPresent.length) extraInstructions.push(pricingRemovalInstruction(pricesPresent));
   if (!titleWasOk) {
     extraInstructions.push(
       `The title is currently ${titleBefore} characters and MUST end up between ${TITLE_MIN} and ${TITLE_MAX} inclusive. `

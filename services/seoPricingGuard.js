@@ -59,6 +59,17 @@ const PRICE_PATTERNS = [
   { name: 'per-distance rate', re: /\b\d[\d,]*(?:\.\d+)?\s*(?:\/|per\s+)\s*(?:km|kms|kilometre|kilometer)s?\b/gi },
   // per-hour / per-day rates are fares too
   { name: 'per-time rate', re: /(?:₹|\bRs\.?|\bINR\b)\s*\d[\d,]*(?:\.\d+)?\s*(?:\/|per\s+)\s*(?:hr|hour|day|night|trip)s?\b/gi },
+  // The same rate written WITHOUT a currency marker: "1200 per trip",
+  // "2500 minimum". The per-km rule above already worked bare; these two units
+  // did not, so a fare could be published simply by omitting the ₹.
+  //
+  // Three digits minimum, and that threshold is the whole safety of it. A fare
+  // is never "2", whereas "2 per trip" is far more likely to be a count of
+  // attendants or cylinders — so the bare form is only read as money once the
+  // number is too large to be a count. The currency-marked patterns above are
+  // untouched and still match from a single digit.
+  { name: 'bare per-unit rate', re: /\b\d{3}[\d,]*(?:\.\d+)?\s*(?:\/|per\s+)\s*(?:trip|booking|hour|hr|day|night|patient|person)s?\b/gi },
+  { name: 'bare minimum figure', re: /\b\d{3}[\d,]*(?:\.\d+)?\s*minimum\b/gi },
 ];
 
 /** Strip the legitimate digit-bearing things before looking for prices. */

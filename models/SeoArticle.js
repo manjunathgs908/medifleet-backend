@@ -320,9 +320,14 @@ const seoArticleSchema = new Schema(
         // an article no loop has touched.
         phase: {
           type: String,
-          enum: ['idle', 'repairing', 'rechecking', 'passed', 'stopped'],
+          enum: ['idle', 'detecting', 'repairing', 'rechecking', 'passed', 'stopped'],
           default: 'idle',
         },
+        // What the current attempt is repairing, in the gate's own wording.
+        // One call fixes the claims, the title and the meta together, so these
+        // are listed rather than staged: a "Repairing title" step shown on its
+        // own would describe a call that does not happen.
+        targets: { type: [String], default: [] },
         // Why it stopped with the article still failing. Null when it stopped
         // because the gates passed.
         stoppedReason: { type: String, default: null },

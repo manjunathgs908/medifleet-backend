@@ -186,11 +186,20 @@ describe('D. two failures and it stops', () => {
 });
 
 describe('G. pricing stays blocked through the loop', () => {
-  test('a price appearing after a repair stops the loop rather than retrying', async () => {
-    const doc = makeDoc({ unverifiedClaims: [blocking('x')] });
+  // CONTRACT CHANGE. This used to assert that the loop simply stopped, which
+  // left the priced text saved on the article — the reviewer was handed a page
+  // carrying fares that the repair had just put there. A repair that
+  // introduces a price is now UNDONE: the article goes back to the text it
+  // started with, and the remaining attempt is spent from that clean state.
+  test('a price appearing after a repair is reverted, not left on the article', async () => {
+    const ORIGINAL = 'the original body, with no price in it';
+    const doc = makeDoc({ unverifiedClaims: [blocking('x')] }, { content: ORIGINAL });
     mockClaim(doc);
-    repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
-    // The repair introduced a price — a regression, not a fixable defect.
+    // The repair rewrites the body and the recheck then finds a price in it.
+    repairArticle.mockImplementation(async (a) => {
+      a.content = 'a rewritten body quoting ₹1,500';
+      return { repaired: true, repairedFields: ['content'] };
+    });
     recheckArticle.mockImplementation(async (a) => {
       a.checks.passed = false;
       a.checks.pricingClaims = ['₹1,500'];
@@ -201,9 +210,32 @@ describe('G. pricing stays blocked through the loop', () => {
     const r = await autoRepairArticle(doc._id);
 
     expect(r.passed).toBe(false);
-    expect(r.attempts).toBe(1);
+    // The whole point: the priced rewrite is gone.
+    expect(doc.content).toBe(ORIGINAL);
+    expect(doc.checks.pricingClaims).toEqual([]);
     expect(r.stoppedReason).toMatch(/price/i);
-    expect(repairArticle).toHaveBeenCalledTimes(1);
+    expect(r.timeline.join(' ')).toMatch(/REVERTED/);
+    // Never approved, never published, whatever the repair did.
+    expect(doc.status).toBe('draft');
+    expect(doc.checks.passed).toBe(false);
+  });
+
+  test('the cap still holds when every attempt has to be reverted', async () => {
+    const doc = makeDoc({ unverifiedClaims: [blocking('x')] }, { content: 'clean body' });
+    mockClaim(doc);
+    repairArticle.mockImplementation(async (a) => { a.content = 'body with ₹1,500'; return { repaired: true, repairedFields: ['content'] }; });
+    recheckArticle.mockImplementation(async (a) => {
+      a.checks.passed = false;
+      a.checks.pricingClaims = ['₹1,500'];
+      return { passed: false, failedChecks: ['1 fixed price(s)'], article: a };
+    });
+
+    const r = await autoRepairArticle(doc._id);
+
+    expect(r.attempts).toBe(MAX_AUTO_REPAIR_ATTEMPTS);
+    expect(repairArticle).toHaveBeenCalledTimes(MAX_AUTO_REPAIR_ATTEMPTS);
+    expect(doc.content).toBe('clean body');
+    expect(r.stoppedReason).toMatch(/undone/i);
   });
 });
 

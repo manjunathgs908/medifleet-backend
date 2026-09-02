@@ -70,7 +70,7 @@ afterEach(() => { jest.clearAllMocks(); jest.restoreAllMocks(); });
 
 // ============================================================
 describe('A. the phase written matches the step actually running', () => {
-  test('one successful cycle records repairing -> rechecking -> passed', async () => {
+  test('one successful cycle records detecting -> repairing -> rechecking -> passed', async () => {
     const doc = makeDoc({ unverifiedClaims: [blocking('a claim')] });
     mockClaim(doc);
     repairArticle.mockImplementation(async () => {
@@ -89,7 +89,7 @@ describe('A. the phase written matches the step actually running', () => {
     const r = await autoRepairArticle(doc._id);
 
     expect(r.passed).toBe(true);
-    expect(phases(doc)).toEqual(['repairing', 'rechecking', 'passed']);
+    expect(phases(doc)).toEqual(['detecting', 'repairing', 'rechecking', 'passed']);
   });
 
   test('a second cycle repeats the pair before the terminal phase', async () => {
@@ -102,7 +102,7 @@ describe('A. the phase written matches the step actually running', () => {
 
     await autoRepairArticle(doc._id);
 
-    expect(phases(doc)).toEqual(['repairing', 'rechecking', 'repairing', 'rechecking', 'passed']);
+    expect(phases(doc)).toEqual(['detecting', 'repairing', 'rechecking', 'repairing', 'rechecking', 'passed']);
   });
 
   test('running is true throughout and false once it is over', async () => {
@@ -172,7 +172,7 @@ describe('B. a terminal phase never stands in for a gate result', () => {
     const r = await autoRepairArticle(doc._id);
 
     expect(repairArticle).not.toHaveBeenCalled();
-    expect(phases(doc)).toEqual(['stopped']);
+    expect(phases(doc)).toEqual(['detecting', 'stopped']);
     expect(r.stoppedReason).toMatch(/needs human review/);
   });
 });

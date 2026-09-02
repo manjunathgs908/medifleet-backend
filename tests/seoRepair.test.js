@@ -152,14 +152,26 @@ describe('C. repair fixes a short meta description', () => {
     expect(r.metaFixed).toBe(true);
   });
 
-  test('a meta still out of range afterwards is reported as NOT fixed', async () => {
+  // CONTRACT CHANGE. This used to assert that an out-of-range meta was saved
+  // and merely labelled "STILL outside" in the summary, which left the article
+  // holding a value that could not pass and spent the attempt for nothing.
+  // A targeted field must now land inside its band or the whole proposal is
+  // discarded and retried.
+  test('a meta still out of range afterwards is rejected, not saved', async () => {
     const doc = hydrate({ metaDescription: SHORT_META, checks: { passed: false, metaLength: 146, unverifiedClaims: [] } });
     respond({ repairedFields: ['metaDescription'], metaDescription: 'still short' });
 
     const r = await repairArticle(doc);
 
+    expect(r.repaired).toBe(false);
+    expect(r.rejected).toBe(true);
     expect(r.metaFixed).toBe(false);
-    expect(r.summary).toMatch(/STILL outside/);
+    expect(r.summary).toMatch(/every proposal was discarded/i);
+    // The article still holds what it held before: nothing was half-applied.
+    expect(doc.metaDescription).toBe(SHORT_META);
+    expect(doc.save).not.toHaveBeenCalled();
+    // Two proposals were asked for -- the repair, then one narrower retry.
+    expect(createSpy).toHaveBeenCalledTimes(2);
   });
 });
 

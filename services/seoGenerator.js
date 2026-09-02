@@ -30,6 +30,10 @@ const { validateJsonLd } = require('./seoSchemaValidator');
 const { refreshLivePageIndex, loadLivePageIndex, isIndexStale } = require('./seoLivePages');
 const { buildFactSheet } = require('./seoFacts');
 const { findPricingClaims, redactPricing, APPROVED_FARE_WORDING } = require('./seoPricingGuard');
+// Judges a PROPOSED repair before it is allowed to replace the article. It
+// does not define what a price is -- it calls seoPricingGuard for that -- and
+// it cannot let anything through: the real gate still runs afterwards.
+const { validateProposal } = require('./seoRepairGuard');
 
 // Never hard-coded. An unset key is a configuration answer, not a crash.
 const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
@@ -311,12 +315,21 @@ Never invent a fact to satisfy the checker. If a claim cannot be verified from t
 This is a YMYL page: someone reads it during a medical emergency or a death in the family. A confident sentence you cannot support is worse than an admission that they should call and ask.
 
 The action on each claim tells you what the checker thinks it needs:
-- source  = the real figure IS in the fact sheet. Replace the invented one with it.
+- source  = the sheet establishes this. Restate it in the sheet's terms, without adding anything the sheet does not say.
 - remove  = nothing supports this. Delete the sentence.
 - rewrite = reword until it stops asserting the unsupported thing.
 
+ABSOLUTE RULES. A repair that breaks any of these is discarded in full and you are asked again, so there is nothing to gain by it:
+- NEVER write a price, a fare, a rate, a deposit, a discount or any other money figure. Not as an example, not as "from", not as "starting at", not as a range, not even if a figure appears elsewhere in the article. If the reader needs a number, the sentence is: "${APPROVED_FARE_WORDING}"
+- NEVER delete or alter pricing wording that is already in the article. It is not yours to remove.
+- NEVER promise an operational fact. No "nearest", "closest", "fastest", "will arrive", "will reach", "we will send", "we will provide", "guaranteed", "within N minutes", "24/7 staffed", "always available", and nothing else of that shape, unless the fact sheet states it in those terms.
+- NEVER add a new claim of any kind. A repair may only narrow what the page asserts, never widen it.
+
 How to repair:
 - Fix ONLY the flagged claims. Every other sentence must survive unchanged.
+- Make the smallest possible edit. Do not rewrite the article, do not restructure it, do not "improve" anything you were not asked about.
+- Keep the page useful. Where a fact cannot be supported, tell the reader what to do rather than what is true — for example: "When booking, share the patient's condition and mobility needs so the available options can be discussed."
+- Keep the keyword and the search intent of the page intact, and leave the internal links and heading structure alone.
 - Return ONLY the fields you actually rewrote, and list them in repairedFields. Omit every field you did not touch.
 - Make the smallest edit that removes the unsupported assertion. Usually that is deleting a clause, or replacing a specific figure with an honest invitation to call.
 - Where the fact cannot be verified, use cautious wording: say what the reader should do, not what is true. "Ask what is available when you call" is supportable. "We keep a vehicle stationed in your area" is not, unless the sheet says so.
@@ -710,7 +723,13 @@ async function generateDraft(input, user) {
   console.log(`[SEO] generation started — keyword="${String(keyword).trim()}" model=${MODEL} effort=${EFFORT}`);
 
   const facts = await buildFactSheet();
+  // Two views of the same sheet, and which call gets which is a safety
+  // decision. The raw block goes ONLY to the fact checker, which needs the
+  // true figures to judge everything else. Every call that WRITES text — the
+  // writer and the repair — gets the redacted block, so neither can print a
+  // fare it was never shown.
   const factBlock = JSON.stringify(facts, null, 2);
+  const writerFactBlock = JSON.stringify(redactPricing(facts), null, 2);
 
   const brief = [
     `TARGET KEYWORD: ${keyword}`,
@@ -729,7 +748,7 @@ async function generateDraft(input, user) {
     // publish one. The checker below still receives the real sheet — it
     // needs true figures to judge everything else, and a price that arrives
     // anyway is stopped by the pricing gate rather than by the checker.
-    JSON.stringify(redactPricing(facts), null, 2),
+    writerFactBlock,
   ].filter(Boolean).join('\n');
 
   const { data: article, usage, ms: writerMs } = await callClaude({
@@ -792,7 +811,13 @@ async function generateDraft(input, user) {
     console.log(`[SEO] repair attempt ${attempt} — rewriting ${claimsBefore} blocking claim(s)`);
     // Only the blocking set is sent. Handing over phrasing notes as well
     // would invite the model to restyle prose nobody asked it to touch.
-    const repairedFields = await repairClaims(article, claims.filter(isBlocking), factBlock, spend);
+    //
+    // The REDACTED sheet, exactly as the writer received it. The repair used
+    // to get the raw one, which lists live fares -- and an instruction to
+    // replace an unsupported figure with the real one from the fact sheet then
+    // reads as permission to publish a fare. A model cannot print a number it
+    // was never shown.
+    const repairedFields = await repairClaims(article, claims.filter(isBlocking), writerFactBlock, spend);
 
     factCheckAttempts += 1;
     console.log(`[SEO] fact-check attempt ${factCheckAttempts}`);
@@ -1020,25 +1045,41 @@ async function repairArticle(article, { attempt = null, automatic = false } = {}
 
   const metaBefore = String(article.metaDescription || '').length;
   const metaWasOk = metaBefore >= META_MIN && metaBefore <= META_MAX;
+  const titleBefore = String(article.title || '').length;
+  const titleWasOk = titleBefore >= TITLE_MIN && titleBefore <= TITLE_MAX;
 
-  if (!claims.length && metaWasOk) {
+  if (!claims.length && metaWasOk && titleWasOk) {
     throw new NothingToRepairError(
-      'Nothing to repair: no blocking claims, and the meta description is within its length range. Run Recheck if the article still fails its gates.',
+      'Nothing to repair: no blocking claims, and the title and meta description are both within their length ranges. Run Recheck if the article still fails its gates.',
     );
   }
 
-  console.log(`[SEO] repair started — slug="${article.slug}" status=${article.status} claims=${claims.length} meta=${metaBefore}`);
+  // Which gates this call is answerable for. A field named here is expected to
+  // land inside its band and is reported honestly when it does not; a field
+  // NOT named here must merely not get worse.
+  const targets = { title: !titleWasOk, meta: !metaWasOk, claims: claims.length > 0 };
+
+  console.log(`[SEO] repair started — slug="${article.slug}" status=${article.status} claims=${claims.length} title=${titleBefore} meta=${metaBefore}`);
 
   // Gate failures that are not claims, handed to the same call.
   const extraInstructions = [];
+  if (!titleWasOk) {
+    extraInstructions.push(
+      `The title is currently ${titleBefore} characters and MUST end up between ${TITLE_MIN} and ${TITLE_MAX} inclusive. `
+      + 'Rewrite it to land inside that range, keeping the primary keyword and the location. '
+      + 'Count the characters before you return it. Do not reach the length by adding a claim, a superlative or a price.',
+    );
+  }
   if (!metaWasOk) {
     extraInstructions.push(
       `The meta description is currently ${metaBefore} characters and MUST end up between ${META_MIN} and ${META_MAX}. `
-      + 'Rewrite it to land inside that range. Do not add any claim the fact sheet does not support in order to reach the length, and do not introduce a price.',
+      + 'Rewrite it to land inside that range, keeping the keyword and location intent. '
+      + 'Count the characters before you return it. Do not add any claim the fact sheet does not support in order to reach the length, and do not introduce a price.',
     );
   }
 
-  // Snapshot BEFORE the call: this is what makes the repair reversible.
+  // Snapshot BEFORE the call. This is both the audit trail and the rollback:
+  // a proposal that comes back worse than this is discarded, not saved.
   const previous = {
     title: article.title,
     metaDescription: article.metaDescription,
@@ -1047,25 +1088,100 @@ async function repairArticle(article, { attempt = null, automatic = false } = {}
     faqs: (article.faqs || []).map((f) => ({ q: f.q, a: f.a })),
     status: article.status,
   };
+  const restore = () => {
+    article.title = previous.title;
+    article.metaDescription = previous.metaDescription;
+    article.h1 = previous.h1;
+    article.content = previous.content;
+    article.faqs = previous.faqs.map((f) => ({ q: f.q, a: f.a }));
+  };
 
   const facts = await buildFactSheet();
-  const factBlock = JSON.stringify(facts, null, 2);
+  // The redacted sheet, exactly what the writer gets. This call used to
+  // receive the raw one, which lists live fares — and "replace the invented
+  // figure with the real one from the fact sheet" then reads as an instruction
+  // to publish a fare. That is how a repair that cleared nine claims came back
+  // carrying eleven prices. A model cannot print a number it was never shown.
+  const repairFactBlock = JSON.stringify(redactPricing(facts), null, 2);
 
-  const repairedFields = await repairClaims(article, claims, factBlock, spend, extraInstructions);
+  const bands = { TITLE_MIN, TITLE_MAX, META_MIN, META_MAX };
+  let repairedFields = [];
+  let lastRejection = null;
+  let unmetTargets = [];
+
+  // At most two proposals: the repair, and — if the first was not usable — one
+  // narrower retry that is told exactly what was wrong with it. A discarded
+  // proposal is never half-applied: the article is put back to `previous`
+  // before the retry runs.
+  //
+  // A proposal is kept when it is BOTH safe (no regression) and worth keeping
+  // (it achieved at least one thing that was asked for). A target it did not
+  // reach does not disqualify it: binning a rewrite that cleared eleven
+  // unsupported claims because it failed to shorten a title left the article
+  // carrying the claims AND the bad title, which is worse on both counts. The
+  // unmet target is carried out of here and reported instead, and the next
+  // cycle can aim at it directly.
+  for (let round = 0; round < 2; round++) {
+    const instructions = round === 0 ? extraInstructions : [
+      ...extraInstructions,
+      [
+        'YOUR PREVIOUS ATTEMPT WAS DISCARDED IN FULL. It did this:',
+        ...lastRejection.map((r) => `- ${r.detail}`),
+        'Try again and make a SMALLER edit. Touch only the sentences carrying a flagged claim,'
+        + ' leave every other sentence exactly as it is, introduce no figure of any kind, and'
+        + ' add no assurance about speed, proximity, arrival, staffing or coverage.',
+      ].join('\n'),
+    ];
+
+    repairedFields = await repairClaims(article, claims, repairFactBlock, spend, instructions);
+    if (!repairedFields.length) break;
+
+    // The gates have not run yet — this is the cheap, deterministic check that
+    // stops a bad rewrite from ever reaching the database.
+    const verdict = validateProposal(previous, article, bands, targets);
+    if (verdict.ok && verdict.improved) {
+      lastRejection = null;
+      unmetTargets = verdict.unmet;
+      if (unmetTargets.length) {
+        console.log(`[SEO] repair kept with ${unmetTargets.length} target(s) still failing — ${unmetTargets.map((u) => u.code).join(', ')}`);
+      }
+      break;
+    }
+
+    // Either it did damage, or it achieved nothing. Both are discarded, and
+    // both are worth telling the model about on the retry.
+    lastRejection = verdict.regressions.length
+      ? verdict.regressions
+      : [...verdict.unmet, ...(verdict.improved ? [] : [{ code: 'no-change', detail: 'nothing that was asked for was achieved' }])];
+    console.log(`[SEO] repair proposal DISCARDED (round ${round + 1}) — ${lastRejection.map((r) => r.code).join(', ')}`);
+    restore();
+    repairedFields = [];
+    unmetTargets = [];
+  }
 
   const metaAfter = String(article.metaDescription || '').length;
+  const titleAfter = String(article.title || '').length;
   const metaFixed = !metaWasOk && metaAfter >= META_MIN && metaAfter <= META_MAX;
+  const titleFixed = !titleWasOk && titleAfter >= TITLE_MIN && titleAfter <= TITLE_MAX;
 
-  // A repair that changed nothing is reported as such rather than saved as a
-  // correction. Recording an empty edit would put a lie in the audit trail.
+  // Nothing usable came back. Either the model returned no edit, or every
+  // proposal was worse than what it would have replaced — and in both cases
+  // the article on disk is untouched, which is the point.
   if (!repairedFields.length) {
-    console.log('[SEO] repair: model returned no changes — nothing written');
+    const why = lastRejection
+      ? `every proposal was discarded (${lastRejection.map((r) => r.detail).join('; ')})`
+      : `the model was given ${claims.length} blocking claim(s) and returned nothing to rewrite`;
+    console.log(`[SEO] repair: nothing written — ${why}`);
     return {
       repaired: false,
+      rejected: Boolean(lastRejection),
+      rejections: lastRejection || [],
+      unmetTargets: [],
       repairedFields: [],
       claimsTargeted: claims.length,
       metaBefore, metaAfter, metaFixed: false,
-      summary: `No changes. The model was given ${claims.length} blocking claim(s) and returned nothing to rewrite; the article is unchanged.`,
+      titleBefore, titleAfter, titleFixed: false,
+      summary: `No changes: ${why}. The article is exactly as it was.`,
       article,
     };
   }
@@ -1073,7 +1189,9 @@ async function repairArticle(article, { attempt = null, automatic = false } = {}
   article.corrections.push({
     at: new Date(),
     reason: `${automatic ? 'Automatic repair' : 'Repair'}${attempt ? ` (attempt ${attempt})` : ''}: `
-      + `${claims.length} blocking claim(s)${metaWasOk ? '' : `, meta description ${metaBefore} chars outside ${META_MIN}-${META_MAX}`}.`,
+      + `${claims.length} blocking claim(s)`
+      + `${titleWasOk ? '' : `, title ${titleBefore} chars outside ${TITLE_MIN}-${TITLE_MAX}`}`
+      + `${metaWasOk ? '' : `, meta description ${metaBefore} chars outside ${META_MIN}-${META_MAX}`}.`,
     fields: repairedFields,
     previous,
   });
@@ -1087,16 +1205,31 @@ async function repairArticle(article, { attempt = null, automatic = false } = {}
 
   const parts = [`rewrote ${repairedFields.join(', ')}`];
   if (claims.length) parts.push(`targeting ${claims.length} blocking claim(s)`);
+  // A length is only reported fixed when it actually lands in the band. The
+  // proposal could not have been saved otherwise — validateProposal rejects a
+  // targeted field that came back outside its range — so these read as
+  // "in range" on every saved repair, and say so from the measurement rather
+  // than from the fact that a call was made.
+  if (!titleWasOk) parts.push(titleFixed ? `title ${titleBefore} -> ${titleAfter} chars (now in range)` : `title ${titleBefore} -> ${titleAfter} chars (STILL outside ${TITLE_MIN}-${TITLE_MAX})`);
   if (!metaWasOk) parts.push(metaFixed ? `meta ${metaBefore} -> ${metaAfter} chars (now in range)` : `meta ${metaBefore} -> ${metaAfter} chars (STILL outside ${META_MIN}-${META_MAX})`);
 
   console.log(`[SEO] repair done in ${Math.round((Date.now() - startedAt) / 1000)}s — ${parts.join('; ')}`);
 
   return {
     repaired: true,
+    rejected: false,
+    rejections: [],
+    // Targets this repair was asked for and did not reach. The safe part of
+    // the work was kept; these are what is still failing, and the next cycle
+    // aims at them.
+    unmetTargets,
     repairedFields,
     claimsTargeted: claims.length,
     metaBefore, metaAfter, metaFixed,
-    summary: `Repaired: ${parts.join('; ')}. checks.passed is now false — run Recheck to see whether it worked.`,
+    titleBefore, titleAfter, titleFixed,
+    summary: `Repaired: ${parts.join('; ')}.`
+      + (unmetTargets.length ? ` STILL FAILING: ${unmetTargets.map((u) => u.detail).join('; ')}.` : '')
+      + ' checks.passed is now false — run Recheck to see whether it worked.',
     article,
   };
 }

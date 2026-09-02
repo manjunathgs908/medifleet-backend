@@ -36,6 +36,10 @@ const {
   repairArticle, recheckArticle, isBlocking,
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
 } = require('./seoGenerator');
+// The second look. repairArticle's own validation is cheap and deterministic
+// but blind to anything only a real fact check can see, so the gates are
+// compared before and after the recheck too.
+const { isWorse } = require('./seoRepairGuard');
 
 // Two, matching the generation loop's cap. What survives two passes is a
 // claim the fact sheet genuinely cannot support, and the answer to that is a
@@ -129,7 +133,7 @@ async function release(article, patch = {}) {
  * It reports progress and nothing else: no gate is evaluated here, and
  * `passed` is never set from this function.
  */
-async function progress(article, phase, timeline, attempts, maxAttempts) {
+async function progress(article, phase, timeline, attempts, maxAttempts, targets = []) {
   article.generation = article.generation || {};
   article.generation.autoRepair = {
     ...(article.generation.autoRepair?.toObject?.() || article.generation.autoRepair || {}),
@@ -137,9 +141,43 @@ async function progress(article, phase, timeline, attempts, maxAttempts) {
     phase,
     attempts,
     maxAttempts,
+    // What this attempt is actually repairing. One call fixes the claims, the
+    // title and the meta together, so these are listed rather than staged --
+    // showing "Repairing title" as a separate step would describe a call that
+    // does not exist.
+    targets: [...targets],
     timeline: [...timeline],
   };
   await article.save();
+}
+
+/** Everything a rollback has to put back, including the gate result. */
+function snapshotOf(article) {
+  return {
+    title: article.title,
+    metaDescription: article.metaDescription,
+    h1: article.h1,
+    content: article.content,
+    faqs: (article.faqs || []).map((f) => ({ q: f.q, a: f.a })),
+    checks: article.checks?.toObject?.() || { ...(article.checks || {}) },
+  };
+}
+
+/**
+ * Put the article back exactly as it was before an attempt.
+ *
+ * The checks go back too. Restoring the text but keeping the failed recheck
+ * would leave the article describing itself with gate results belonging to
+ * text that no longer exists — which is the same class of lie the repair was
+ * called to remove.
+ */
+function rollbackTo(article, snap) {
+  article.title = snap.title;
+  article.metaDescription = snap.metaDescription;
+  article.h1 = snap.h1;
+  article.content = snap.content;
+  article.faqs = snap.faqs.map((f) => ({ q: f.q, a: f.a }));
+  article.checks = snap.checks;
 }
 
 /**
@@ -154,6 +192,8 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
 
   const timeline = [];
   let attempts = 0;
+  let reverted = 0;
+  let revertReasons = [];
   let stoppedReason = null;
 
   try {
@@ -164,6 +204,8 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       await release(article, { attempts: 0, maxAttempts, stoppedReason: 'already-passing', timeline, phase: 'passed' });
       return { passed: true, attempts: 0, stoppedReason: 'already-passing', timeline, article };
     }
+
+    await progress(article, 'detecting', timeline, 0, maxAttempts);
 
     while (attempts < maxAttempts) {
       const { repairable, blocked } = classifyFailures(article.checks);
@@ -182,20 +224,51 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       attempts += 1;
       timeline.push(`attempt ${attempts}/${maxAttempts}: repairing — ${repairable.join('; ')}`);
       console.log(`[SEO] auto-repair attempt ${attempts}/${maxAttempts} — slug="${article.slug}" ${repairable.join('; ')}`);
-      await progress(article, 'repairing', timeline, attempts, maxAttempts);
+      await progress(article, 'repairing', timeline, attempts, maxAttempts, repairable);
+
+      // Taken before the repair touches anything. If the recheck comes back
+      // worse than this, the attempt is undone rather than left standing.
+      const snapshot = snapshotOf(article);
 
       const rep = await repairArticle(article, { attempt: attempts, automatic: true });
       if (!rep.repaired) {
-        stoppedReason = 'the repair returned no changes — the article is unchanged and needs a person';
-        timeline.push(`attempt ${attempts}: no changes returned`);
+        // Two different outcomes, and the operator needs to tell them apart:
+        // the model declined to edit, or it proposed something worse and every
+        // proposal was thrown away. Neither wrote anything.
+        stoppedReason = rep.rejected
+          ? `the repair produced nothing safe to keep: ${(rep.rejections || []).map((r) => r.detail).join('; ')}`
+          : 'the repair returned no changes — the article is unchanged and needs a person';
+        timeline.push(`attempt ${attempts}: ${rep.rejected ? 'proposal rejected and discarded' : 'no changes returned'}`);
         break;
       }
-      timeline.push(`attempt ${attempts}: rewrote ${rep.repairedFields.join(', ')}`);
-      await progress(article, 'rechecking', timeline, attempts, maxAttempts);
+      timeline.push(`attempt ${attempts}: rewrote ${rep.repairedFields.join(', ')}`
+        + ((rep.unmetTargets || []).length ? ` — still failing: ${rep.unmetTargets.map((u) => u.detail).join('; ')}` : ''));
+      await progress(article, 'rechecking', timeline, attempts, maxAttempts, repairable);
 
       // The existing gate run. Nothing here decides whether it passed.
       const rc = await recheckArticle(article);
       timeline.push(`attempt ${attempts}: recheck ${rc.passed ? 'PASSED' : `failed — ${rc.failedChecks.join('; ')}`}`);
+
+      // The authoritative second look. A repair that cleared some claims but
+      // introduced a price, a new claim or a schema error has not helped, and
+      // leaving it in place would hand the reviewer a worse article than the
+      // one they started with.
+      if (!rc.passed) {
+        const verdict = isWorse(snapshot.checks, article.checks);
+        if (verdict.worse) {
+          rollbackTo(article, snapshot);
+          reverted += 1;
+          revertReasons = verdict.reasons;
+          timeline.push(`attempt ${attempts}: REVERTED — ${verdict.reasons.join('; ')}`);
+          console.log(`[SEO] auto-repair attempt ${attempts} reverted — ${verdict.reasons.join('; ')}`);
+          await progress(article, 'repairing', timeline, attempts, maxAttempts, repairable);
+          // Fall through to the next attempt, if the cap allows one. The
+          // article is back to its original text, so the next attempt starts
+          // from the same place this one did rather than compounding a bad
+          // rewrite.
+          continue;
+        }
+      }
 
       if (rc.passed) {
         // Clean, and that is where it stops. Status is untouched; Approve is
@@ -207,7 +280,9 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
     }
 
     if (!stoppedReason) {
-      stoppedReason = `max-attempts: still failing after ${attempts} automatic repair(s)`;
+      stoppedReason = reverted
+        ? `max-attempts: ${attempts} automatic repair(s), of which ${reverted} made the article worse and were undone (${revertReasons.join('; ')}). It is back to the text it started with and needs a person.`
+        : `max-attempts: still failing after ${attempts} automatic repair(s)`;
       timeline.push(stoppedReason);
     }
 

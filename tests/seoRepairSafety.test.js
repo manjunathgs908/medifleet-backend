@@ -445,3 +445,67 @@ describe('I. a safe improvement survives an unmet target', () => {
     expect(v.improved).toBe(false); // but pointless
   });
 });
+
+// ============================================================
+describe('J. an article that already carries many prices', () => {
+  // The Whitefield case: eleven fares already on the page. The repair must be
+  // allowed to run, must leave every one of them alone, and must still be
+  // stopped the moment it touches one.
+  const ELEVEN = Array.from({ length: 11 }, (_, i) => `\u20b9${1000 + i * 100}`);
+  const PRICED_BODY = `Fares on this page: ${ELEVEN.join(', ')}. And some prose about ambulances.`;
+
+  test('B. a proposal that preserves all eleven prices is accepted', () => {
+    const before = { content: PRICED_BODY };
+    const after = { content: `${PRICED_BODY} Ask dispatch what applies to your trip.` };
+
+    const v = validateProposal(before, after, BANDS, { claims: true });
+
+    expect(v.regressions).toEqual([]);
+    expect(v.ok).toBe(true);
+    expect(v.improved).toBe(true);
+  });
+
+  test('F. all eleven reformatted but unchanged in value is accepted', () => {
+    // ₹1,000 -> Rs. 1000 -> INR 1,000: three spellings of one fare.
+    const reformatted = ELEVEN.map((p) => `Rs. ${p.replace('\u20b9', '').replace(/,/g, '')}`);
+    const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
+    const after = { content: `Fares: ${reformatted.join(', ')}.` };
+
+    const v = validateProposal(before, after, BANDS, {});
+
+    expect(v.regressions).toEqual([]);
+    expect(v.ok).toBe(true);
+  });
+
+  test('C. one NEW price on top of the eleven is rejected', () => {
+    const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
+    const after = { content: `Fares: ${ELEVEN.join(', ')}, \u20b99,999.` };
+
+    const v = validateProposal(before, after, BANDS, { claims: true });
+
+    expect(v.ok).toBe(false);
+    expect(v.regressions.some((r) => r.code === 'new-pricing')).toBe(true);
+  });
+
+  test('D. one of the eleven deleted is rejected', () => {
+    const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
+    const after = { content: `Fares: ${ELEVEN.slice(1).join(', ')}.` };
+
+    const v = validateProposal(before, after, BANDS, { claims: true });
+
+    expect(v.ok).toBe(false);
+    expect(v.regressions.some((r) => r.code === 'pricing-deleted')).toBe(true);
+  });
+
+  test('E. one of the eleven changed in value is rejected on both counts', () => {
+    const before = { content: `Fares: ${ELEVEN.join(', ')}.` };
+    const after = { content: `Fares: ${['\u20b95,555', ...ELEVEN.slice(1)].join(', ')}.` };
+
+    const v = validateProposal(before, after, BANDS, { claims: true });
+
+    expect(v.ok).toBe(false);
+    const codes = v.regressions.map((r) => r.code);
+    expect(codes).toContain('new-pricing');
+    expect(codes).toContain('pricing-deleted');
+  });
+});

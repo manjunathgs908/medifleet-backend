@@ -25,8 +25,12 @@
  * it stops — checks.passed true, status exactly where it found it, a human
  * still pressing Approve. It also refuses to start on an article whose
  * failures need judgement rather than rewriting: a duplicate keyword, a
- * cannibalisation score, a published price. Those are decisions, and a loop
- * that "fixed" them would be overruling somebody.
+ * cannibalisation score, a schema error. Those are decisions, and a loop that
+ * "fixed" them would be overruling somebody.
+ *
+ * A price already on the article is NOT one of those. It is carried: the loop
+ * runs, leaves the fares untouched, fixes what it can, and reports at the end
+ * that the pricing still blocks approval. See classifyFailures.
  * ============================================================
  */
 'use strict';
@@ -58,17 +62,24 @@ class AutoRepairBusyError extends Error {
  * Split a failing checks object into what a repair can fix and what it must
  * not touch.
  *
- * The repairable set is exactly what repairArticle() acts on: blocking claims
- * and the two length gates. Everything else is either a judgement call or a
- * signal that something went wrong enough to want a person.
+ * Three outcomes, not two:
  *
- * Note pricing sits firmly in `blocked`. The repair prompt forbids
- * introducing a price, so a price appearing after a repair is a regression,
- * not a fixable defect — the loop stops and says so rather than trying again.
+ *   repairable — what repairArticle() acts on: blocking claims and the two
+ *                length gates.
+ *   blocked    — a judgement call the loop must not make. It refuses to start.
+ *   carried    — a real failure the loop must neither fix nor stop for. It
+ *                runs, leaves it alone, and reports it at the end.
+ *
+ * Pricing is `carried`, not `blocked`. A price introduced BY a repair is still
+ * a regression and is still rejected — that check lives in seoRepairGuard and
+ * runs on the proposal, after the fact. A price the article already had is
+ * baseline state, and refusing to start because of it meant nothing else on
+ * that article could be fixed either.
  */
 function classifyFailures(checks = {}) {
   const repairable = [];
   const blocked = [];
+  const carried = [];
 
   const blockingClaims = (checks.unverifiedClaims || []).filter(isBlocking).length;
   if (blockingClaims) repairable.push(`${blockingClaims} blocking claim(s)`);
@@ -79,10 +90,25 @@ function classifyFailures(checks = {}) {
   const titleLen = checks.titleLength ?? 0;
   if (titleLen < TITLE_MIN || titleLen > TITLE_MAX) repairable.push(`title ${titleLen} chars, want ${TITLE_MIN}-${TITLE_MAX}`);
 
-  // ── Not repairable, each for its own reason ────────────────
+  // ── Carried, not blocked ──────────────────────────────────
+  // Pricing already on the article is BASELINE STATE, not a preflight
+  // failure. It is not something this loop did, and refusing to start because
+  // of it meant an article with eleven fares could not have a single
+  // unsupported claim or a broken title fixed — the loop stopped before
+  // attempt 1 and the reviewer got no help at all.
+  //
+  // Letting the attempt run is safe because the protection sits AFTER the
+  // proposal, not before it: seoRepairGuard compares current against proposed
+  // by normalised value, so the repair may keep these fares exactly as they
+  // are but may not add one, drop one, or change one. And none of it can
+  // reach the public — the pricing gate is part of `passed`, so an article
+  // carrying a fare still cannot be approved by anyone until a person removes
+  // it. That is reported at the end rather than used to refuse to begin.
   if ((checks.pricingClaims || []).length) {
-    blocked.push(`${checks.pricingClaims.length} fixed price(s) — a repair must never produce one; this needs a person`);
+    carried.push(`${checks.pricingClaims.length} fixed price(s) left exactly as they are — they still block approval and a person must remove them`);
   }
+
+  // ── Not repairable, each for its own reason ────────────────
   if (checks.duplicateSlug) blocked.push('duplicate slug — needs a new slug, which is an editorial decision');
   if ((checks.similarityScore ?? 0) >= 0.55) blocked.push(`draft similarity ${Number(checks.similarityScore).toFixed(2)} — rewording to dodge a similarity score is not a repair`);
   if ((checks.livePageSimilarity ?? 0) >= 0.55) blocked.push(`live-page similarity ${Number(checks.livePageSimilarity).toFixed(2)} — cannibalisation is an editorial call`);
@@ -90,7 +116,7 @@ function classifyFailures(checks = {}) {
   if ((checks.wordCount ?? 0) < 700) blocked.push(`${checks.wordCount} words — padding to a word count is how unsupported claims get written`);
   if ((checks.internalLinks ?? null) === null && false) { /* links live on the doc, checked by the caller */ }
 
-  return { repairable, blocked };
+  return { repairable, blocked, carried };
 }
 
 /**
@@ -194,6 +220,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
   let attempts = 0;
   let reverted = 0;
   let revertReasons = [];
+  let carriedNote = [];
   let stoppedReason = null;
 
   try {
@@ -208,7 +235,15 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
     await progress(article, 'detecting', timeline, 0, maxAttempts);
 
     while (attempts < maxAttempts) {
-      const { repairable, blocked } = classifyFailures(article.checks);
+      const { repairable, blocked, carried } = classifyFailures(article.checks);
+
+      // Noted once, on the first pass that sees it. It does not stop anything;
+      // it is what the operator must be told at the end, because it is the
+      // reason a clean repair still will not let them press Approve.
+      if (carried.length && !carriedNote.length) {
+        carriedNote = carried;
+        timeline.push(`carried, not repaired: ${carried.join('; ')}`);
+      }
 
       if (blocked.length) {
         stoppedReason = `needs human review: ${blocked.join('; ')}`;
@@ -286,6 +321,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       timeline.push(stoppedReason);
     }
 
+    if (carriedNote.length) stoppedReason = `${stoppedReason} Also still failing: ${carriedNote.join('; ')}.`;
     await release(article, { attempts, maxAttempts, stoppedReason, timeline, phase: 'stopped' });
     console.log(`[SEO] auto-repair stopped — ${stoppedReason}`);
     return { passed: Boolean(article.checks?.passed), attempts, stoppedReason, timeline, article };

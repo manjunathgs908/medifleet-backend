@@ -66,7 +66,6 @@ describe('E/F/G. only genuinely repairable failures are attempted', () => {
     ['duplicate slug', { duplicateSlug: true }, /duplicate slug/i],
     ['draft cannibalisation', { similarityScore: 0.8 }, /similarity/i],
     ['live-page cannibalisation', { livePageSimilarity: 0.7 }, /cannibalisation/i],
-    ['fixed pricing', { pricingClaims: ['₹1,200'] }, /price/i],
     ['schema errors', { schemaErrors: ['bad node'] }, /schema/i],
     ['short article', { wordCount: 400 }, /words/i],
   ])('%s is never auto-repaired', (_label, checks, pattern) => {

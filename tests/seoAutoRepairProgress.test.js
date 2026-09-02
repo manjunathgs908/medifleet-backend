@@ -28,7 +28,7 @@ jest.mock('../services/seoGenerator', () => ({
 
 const SeoArticle = require('../models/SeoArticle');
 const { repairArticle, recheckArticle } = require('../services/seoGenerator');
-const { autoRepairArticle, classifyFailures } = require('../services/seoAutoRepair');
+const { autoRepairArticle, classifyFailures, MAX_AUTO_REPAIR_ATTEMPTS } = require('../services/seoAutoRepair');
 
 const CLEAN_CHECKS = {
   passed: false,
@@ -166,7 +166,8 @@ describe('B. a terminal phase never stands in for a gate result', () => {
   });
 
   test('a blocked failure stops without ever entering a repairing phase', async () => {
-    const doc = makeDoc({ pricingClaims: ['₹1,200'], unverifiedClaims: [blocking('a claim')] });
+    // duplicateSlug, not pricing: pricing is carried now, not blocked.
+    const doc = makeDoc({ duplicateSlug: true, unverifiedClaims: [blocking('a claim')] });
     mockClaim(doc);
 
     const r = await autoRepairArticle(doc._id);
@@ -265,25 +266,107 @@ describe('D. the pricing guard survives a round trip through the schema', () => 
     expect(doc.toObject().checks.pricingClaims).toHaveLength(2);
   });
 
-  test('the loop refuses a priced draft on the FIRST pass, before spending a repair', async () => {
-    const doc = makeDoc({ pricingClaims: ['\u20b91,200'], unverifiedClaims: [blocking('a claim')] });
-    mockClaim(doc);
-
-    const r = await autoRepairArticle(doc._id);
-
-    expect(repairArticle).not.toHaveBeenCalled();
-    expect(r.attempts).toBe(0);
-    expect(r.stoppedReason).toMatch(/fixed price/i);
-    expect(r.stoppedReason).toMatch(/needs a person|human review/i);
-  });
-
-  test('classifyFailures puts a price in blocked, never in repairable', () => {
-    const { repairable, blocked } = classifyFailures({
+  // CONTRACT CHANGE. These two used to assert that an article already carrying
+  // fares was refused before attempt 1. That is the production bug: an article
+  // with eleven fares could not have a single unsupported claim or a broken
+  // title fixed, because the loop declined to start. Existing pricing is
+  // baseline state \u2014 carried, reported, and left exactly as it is.
+  test('classifyFailures carries a price; it is neither blocked nor repairable', () => {
+    const { repairable, blocked, carried } = classifyFailures({
       pricingClaims: ['\u20b91,200'],
       unverifiedClaims: [blocking('a claim')],
       metaLength: 154, titleLength: 57, wordCount: 900,
     });
-    expect(blocked.join(' ')).toMatch(/fixed price/i);
-    expect(repairable.join(' ')).not.toMatch(/price/i);
+    expect(carried.join(' ')).toMatch(/fixed price/i);
+    expect(blocked).toEqual([]);                          // does not stop the loop
+    expect(repairable.join(' ')).not.toMatch(/price/i);   // and is never repaired
+  });
+
+  test('a genuinely blocked failure still refuses to start', () => {
+    const { blocked } = classifyFailures({
+      duplicateSlug: true, metaLength: 154, titleLength: 57, wordCount: 900,
+    });
+    expect(blocked.join(' ')).toMatch(/duplicate slug/i);
+  });
+});
+
+// ============================================================
+describe('E. existing pricing is baseline state, not a preflight failure', () => {
+  // The production report: "Ambulance Service Near Whitefield" stopped before
+  // attempt 1 with "11 fixed price(s) \u2014 a repair must never produce one".
+  const ELEVEN = Array.from({ length: 11 }, (_, i) => `\u20b9${1000 + i * 100}`);
+
+  test('A + G. eleven existing prices do NOT stop the loop before attempt 1', async () => {
+    const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] });
+    mockClaim(doc);
+    repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
+    recheckArticle.mockResolvedValue({ passed: false, failedChecks: ['11 fixed price(s)'] });
+
+    const r = await autoRepairArticle(doc._id);
+
+    // The bug was: attempts === 0 and repairArticle never called.
+    expect(repairArticle).toHaveBeenCalled();
+    expect(r.attempts).toBeGreaterThan(0);
+    expect(r.stoppedReason).not.toMatch(/stopped before attempt/i);
+    expect(r.timeline.join(' ')).not.toMatch(/stopped before attempt 1/i);
+  });
+
+  test('the carried pricing is still reported at the end, so Approve is explained', async () => {
+    const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] });
+    mockClaim(doc);
+    repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
+    recheckArticle.mockResolvedValue({ passed: false, failedChecks: ['11 fixed price(s)'] });
+
+    const r = await autoRepairArticle(doc._id);
+
+    expect(r.timeline.join(' ')).toMatch(/carried, not repaired/i);
+    expect(r.stoppedReason).toMatch(/11 fixed price/i);
+    expect(r.stoppedReason).toMatch(/block approval|a person must remove/i);
+    // Carried or not, it never approves.
+    expect(doc.status).toBe('draft');
+    expect(doc.checks.passed).toBe(false);
+  });
+
+  test('the 2-attempt cap still holds on a priced article', async () => {
+    const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] });
+    mockClaim(doc);
+    repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
+    recheckArticle.mockResolvedValue({ passed: false, failedChecks: ['11 fixed price(s)'] });
+
+    const r = await autoRepairArticle(doc._id);
+
+    expect(r.attempts).toBe(MAX_AUTO_REPAIR_ATTEMPTS);
+    expect(repairArticle).toHaveBeenCalledTimes(MAX_AUTO_REPAIR_ATTEMPTS);
+  });
+
+  test('a repair that keeps all eleven prices is not treated as making things worse', async () => {
+    const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] });
+    mockClaim(doc);
+    repairArticle.mockResolvedValue({ repaired: true, repairedFields: ['content'] });
+    // Same eleven prices before and after: isWorse must not fire.
+    recheckArticle.mockImplementation(async (a) => {
+      a.checks.pricingClaims = [...ELEVEN];
+      a.checks.unverifiedClaims = [];
+      return { passed: false, failedChecks: ['11 fixed price(s)'] };
+    });
+
+    const r = await autoRepairArticle(doc._id);
+
+    expect(r.timeline.join(' ')).not.toMatch(/REVERTED/);
+  });
+
+  test('a TWELFTH price appearing during the loop still triggers a revert', async () => {
+    const doc = makeDoc({ pricingClaims: [...ELEVEN], unverifiedClaims: [blocking('a claim')] }, { content: 'clean' });
+    mockClaim(doc);
+    repairArticle.mockImplementation(async (a) => { a.content = 'rewritten'; return { repaired: true, repairedFields: ['content'] }; });
+    recheckArticle.mockImplementation(async (a) => {
+      a.checks.pricingClaims = [...ELEVEN, '\u20b99,999'];
+      return { passed: false, failedChecks: ['12 fixed price(s)'] };
+    });
+
+    const r = await autoRepairArticle(doc._id);
+
+    expect(r.timeline.join(' ')).toMatch(/REVERTED/);
+    expect(doc.content).toBe('clean');
   });
 });

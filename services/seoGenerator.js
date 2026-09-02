@@ -325,16 +325,105 @@ How to repair:
 - Do not touch the title or meta description unless a flagged claim is inside one. If you do have to rewrite either, its length is a hard gate rather than a preference: the title MUST end up between 55 and 60 characters, and the meta description MUST end up between 150 and 160. Count them before returning. A repair that removes the claim but lands outside the range has traded one failure for another.
 - Keep the existing voice, British-Indian English, Markdown structure and heading order.`;
 
+/**
+ * A failure that came from the Anthropic API itself, rather than from
+ * anything about the article being written.
+ *
+ * The distinction is operational, not academic. An exhausted balance, an
+ * expired key and a rate limit are all things an owner can act on, and each
+ * needs a different action. Collapsing them into a generic 500 makes the
+ * Studio say "Generation failed", which sends somebody to read the draft when
+ * the true answer is "top up the account" -- so the API's own wording is
+ * carried through to the operator intact.
+ *
+ * Carries a status, a coarse code and a sentence saying what to do. It never
+ * carries the key, a header, or any part of the request.
+ */
+class ClaudeApiError extends Error {
+  constructor(message, { status = null, code = null, retryable = false } = {}) {
+    super(message);
+    this.name = 'ClaudeApiError';
+    this.status = status;
+    this.code = code; // billing | auth | rate_limit | overloaded | upstream
+    this.retryable = retryable;
+  }
+}
+
+/**
+ * Translate an SDK throw into something an operator can act on.
+ *
+ * Deliberately shape-tolerant: the SDK exposes `status` and a nested
+ * `error.error.type`, but a DNS failure has neither, and an SDK version bump
+ * must not quietly turn a billing stop back into a stack trace.
+ */
+function toClaudeApiError(err) {
+  const status  = err?.status ?? err?.response?.status ?? null;
+  const apiType = err?.error?.error?.type || err?.error?.type || '';
+  const detail  = err?.error?.error?.message || err?.message || 'no detail given';
+  const lower   = (apiType + ' ' + detail).toLowerCase();
+
+  // An exhausted balance arrives as a 400 invalid_request_error whose message
+  // names the credit balance. There is no dedicated status for it, so the
+  // text is the only signal available.
+  if (status === 402 || lower.includes('credit balance') || lower.includes('billing')) {
+    return new ClaudeApiError(
+      'Anthropic rejected the request: ' + detail
+        + ' Top up at console.anthropic.com/settings/billing and run this again.'
+        + ' Nothing was written to the article.',
+      { status: 402, code: 'billing' },
+    );
+  }
+  if (status === 401 || status === 403 || lower.includes('authentication')) {
+    return new ClaudeApiError(
+      'Anthropic rejected the API key (' + status + '). Check ANTHROPIC_API_KEY in'
+        + ' the Render environment. Nothing was written to the article.',
+      { status: 401, code: 'auth' },
+    );
+  }
+  if (status === 429) {
+    return new ClaudeApiError(
+      'Anthropic rate limit reached. Wait a minute and try again.'
+        + ' Nothing was written to the article.',
+      { status: 429, code: 'rate_limit', retryable: true },
+    );
+  }
+  if (status === 529 || lower.includes('overloaded')) {
+    return new ClaudeApiError(
+      'Anthropic is overloaded right now. Try again shortly.'
+        + ' Nothing was written to the article.',
+      { status: 503, code: 'overloaded', retryable: true },
+    );
+  }
+  if (status && status >= 500) {
+    return new ClaudeApiError(
+      'Anthropic returned a ' + status + '. That is upstream, not your article --'
+        + ' try again shortly. Nothing was written.',
+      { status: 503, code: 'upstream', retryable: true },
+    );
+  }
+  return new ClaudeApiError(
+    'The Anthropic API call failed' + (status ? ' (' + status + ')' : '') + ': ' + detail,
+    { status: status || 503, code: 'upstream' },
+  );
+}
+
 async function callClaude({ system, prompt, schema, maxTokens = 16000 }) {
   const startedAt = Date.now();
-  const res = await getClient().messages.create({
-    model: MODEL,
-    max_tokens: maxTokens,
-    thinking: { type: 'adaptive' },
-    output_config: { effort: EFFORT, format: { type: 'json_schema', schema } },
-    system,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  let res;
+  try {
+    res = await getClient().messages.create({
+      model: MODEL,
+      max_tokens: maxTokens,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: EFFORT, format: { type: 'json_schema', schema } },
+      system,
+      messages: [{ role: 'user', content: prompt }],
+    });
+  } catch (err) {
+    // Nothing has been written at this point. Every caller saves only after a
+    // call returns, so a throw here leaves the article exactly as it was.
+    throw err instanceof ClaudeApiError ? err : toClaudeApiError(err);
+  }
 
   // A safety decline is a 200 with stop_reason 'refusal' — content would be
   // empty and JSON.parse would throw something unhelpful.
@@ -1018,5 +1107,5 @@ module.exports = {
   TITLE_MIN, TITLE_MAX, META_MIN, META_MAX,
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
   evaluateGates, recheckArticle, repairArticle, isBlocking,
-  DuplicateKeywordError, NothingToRepairError,
+  DuplicateKeywordError, NothingToRepairError, ClaudeApiError, toClaudeApiError,
 };

@@ -249,6 +249,17 @@ const seoArticleSchema = new Schema(
       // invalid nodes, so approving one of these ships a page with no
       // structured data and no indication that anything went wrong.
       schemaErrors: { type: [String], default: [] },
+      // Fixed fares found in the text by seoPricingGuard. Blocks approval.
+      //
+      // evaluateGates has always returned this, but the field was missing here,
+      // so strict mode dropped it on every save and it was only ever readable
+      // in the same request that computed it. Approval was never affected --
+      // `passed` is computed in memory with the price included, and `passed`
+      // does persist -- but anything reading checks.pricingClaims off a stored
+      // article saw an empty list. seoAutoRepair.classifyFailures does exactly
+      // that to decide a priced draft needs a person rather than a rewrite,
+      // and was silently reading nothing.
+      pricingClaims: { type: [String], default: [] },
       wordCount: { type: Number, default: 0 },
       passed: { type: Boolean, default: false },
     },
@@ -299,6 +310,19 @@ const seoArticleSchema = new Schema(
         startedAt: { type: Date },
         lastRunAt: { type: Date },
         attempts: { type: Number, default: 0 },
+        // The cap that applied to this run, stored next to the count so the
+        // Studio can render "2/2" without hardcoding a limit that actually
+        // lives in an env var on the server.
+        maxAttempts: { type: Number, default: null },
+        // Where the loop has got to, written as it advances so the Studio can
+        // poll and show real progress instead of a three-minute spinner. The
+        // terminal values survive the run and describe how it ended; `idle` is
+        // an article no loop has touched.
+        phase: {
+          type: String,
+          enum: ['idle', 'repairing', 'rechecking', 'passed', 'stopped'],
+          default: 'idle',
+        },
         // Why it stopped with the article still failing. Null when it stopped
         // because the gates passed.
         stoppedReason: { type: String, default: null },

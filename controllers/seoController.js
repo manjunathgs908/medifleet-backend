@@ -22,6 +22,40 @@ const {
 const { buildFactSheet } = require('../services/seoFacts');
 const { autoRepairArticle, AutoRepairBusyError } = require('../services/seoAutoRepair');
 
+/**
+ * Answer a Claude-side failure in terms the operator can act on.
+ *
+ * Returns a truthy value once it has answered, so a caller writes
+ * `if (claudeFailure(res, err)) return;` and falls through to next(err) for
+ * anything genuinely unexpected.
+ *
+ * Billing, an expired key and a rate limit each keep their own status and the
+ * API's own wording. A generic 500 saying "Generation failed" sends somebody
+ * to read the draft when the real answer is to top up the account.
+ *
+ * The second branch is the pre-existing behaviour for a missing key and a
+ * safety refusal, unchanged: both stay 503.
+ */
+function claudeFailure(res, err) {
+  // Matched on name, not instanceof. This module and seoGenerator are not
+  // guaranteed to hold the same class object -- anything that mocks the
+  // generator gives this file a different one -- and an unrecognised error
+  // here would be reported as a bare 500 with no actionable message, which
+  // is exactly the failure mode this function exists to prevent.
+  if (err?.name === 'ClaudeApiError') {
+    return res.status(err.status || 503).json({
+      success: false,
+      message: err.message,
+      code: err.code,
+      retryable: Boolean(err.retryable),
+    });
+  }
+  if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
+    return res.status(503).json({ success: false, message: err.message });
+  }
+  return null;
+}
+
 // ============================================================
 // @route   POST /api/seo/generate
 // @desc    Keyword in, DRAFT out. Slow by design — two Claude calls and a
@@ -52,9 +86,7 @@ exports.generate = async (req, res, next) => {
     }
     // A missing API key or a Claude refusal is an operator-facing answer,
     // not a 500 with a stack trace.
-    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
-      return res.status(503).json({ success: false, message: err.message });
-    }
+    if (claudeFailure(res, err)) return;
     next(err);
   }
 };
@@ -188,9 +220,7 @@ exports.recheck = async (req, res, next) => {
   } catch (err) {
     // Same operator-facing handling as generate: a missing key or a refusal
     // is an answer, not a stack trace.
-    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
-      return res.status(503).json({ success: false, message: err.message });
-    }
+    if (claudeFailure(res, err)) return;
     next(err);
   }
 };
@@ -241,9 +271,7 @@ exports.repair = async (req, res, next) => {
     if (err instanceof NothingToRepairError) {
       return res.status(422).json({ success: false, message: err.message });
     }
-    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
-      return res.status(503).json({ success: false, message: err.message });
-    }
+    if (claudeFailure(res, err)) return;
     next(err);
   }
 };
@@ -289,9 +317,14 @@ exports.autoRepair = async (req, res, next) => {
     if (err instanceof AutoRepairBusyError) {
       return res.status(409).json({ success: false, message: err.message });
     }
-    if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
-      return res.status(503).json({ success: false, message: err.message });
+    // Asking to repair a clean article is an answer, not a failure -- the same
+    // answer the manual repair route gives. The loop reaches this when the only
+    // repairable failure left is a title length, which repairArticle has no
+    // instruction for; without this it escapes as a 500.
+    if (err instanceof NothingToRepairError) {
+      return res.status(422).json({ success: false, message: err.message });
     }
+    if (claudeFailure(res, err)) return;
     next(err);
   }
 };

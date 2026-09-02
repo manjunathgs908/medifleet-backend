@@ -116,6 +116,33 @@ async function release(article, patch = {}) {
 }
 
 /**
+ * Record where the loop has got to, on the article itself.
+ *
+ * A run is one long HTTP request -- up to four Claude calls -- so without
+ * this the Studio has nothing to show but a spinner for minutes at a time.
+ * The Studio polls the article while `running` is true and renders `phase`
+ * and `timeline`, which is why these are written as the loop advances rather
+ * than assembled at the end.
+ *
+ * Written through the same in-memory document that repairArticle and
+ * recheckArticle save, so their writes and these cannot clobber each other.
+ * It reports progress and nothing else: no gate is evaluated here, and
+ * `passed` is never set from this function.
+ */
+async function progress(article, phase, timeline, attempts, maxAttempts) {
+  article.generation = article.generation || {};
+  article.generation.autoRepair = {
+    ...(article.generation.autoRepair?.toObject?.() || article.generation.autoRepair || {}),
+    running: true,
+    phase,
+    attempts,
+    maxAttempts,
+    timeline: [...timeline],
+  };
+  await article.save();
+}
+
+/**
  * Repair and recheck until the gates pass, the failures stop being
  * repairable, or the attempt cap is reached.
  *
@@ -134,7 +161,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
     // passes is waiting for a human, not for this.
     if (article.checks?.passed) {
       timeline.push('already passing — no repair attempted');
-      await release(article, { attempts: 0, stoppedReason: 'already-passing', timeline });
+      await release(article, { attempts: 0, maxAttempts, stoppedReason: 'already-passing', timeline, phase: 'passed' });
       return { passed: true, attempts: 0, stoppedReason: 'already-passing', timeline, article };
     }
 
@@ -155,6 +182,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       attempts += 1;
       timeline.push(`attempt ${attempts}/${maxAttempts}: repairing — ${repairable.join('; ')}`);
       console.log(`[SEO] auto-repair attempt ${attempts}/${maxAttempts} — slug="${article.slug}" ${repairable.join('; ')}`);
+      await progress(article, 'repairing', timeline, attempts, maxAttempts);
 
       const rep = await repairArticle(article, { attempt: attempts, automatic: true });
       if (!rep.repaired) {
@@ -163,6 +191,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
         break;
       }
       timeline.push(`attempt ${attempts}: rewrote ${rep.repairedFields.join(', ')}`);
+      await progress(article, 'rechecking', timeline, attempts, maxAttempts);
 
       // The existing gate run. Nothing here decides whether it passed.
       const rc = await recheckArticle(article);
@@ -171,7 +200,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       if (rc.passed) {
         // Clean, and that is where it stops. Status is untouched; Approve is
         // still a human pressing a button.
-        await release(article, { attempts, stoppedReason: null, timeline });
+        await release(article, { attempts, maxAttempts, stoppedReason: null, timeline, phase: 'passed' });
         console.log(`[SEO] auto-repair: PASSED after ${attempts} attempt(s) — status=${article.status}, human approval still required`);
         return { passed: true, attempts, stoppedReason: null, timeline, article };
       }
@@ -182,14 +211,27 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
       timeline.push(stoppedReason);
     }
 
-    await release(article, { attempts, stoppedReason, timeline });
+    await release(article, { attempts, maxAttempts, stoppedReason, timeline, phase: 'stopped' });
     console.log(`[SEO] auto-repair stopped — ${stoppedReason}`);
     return { passed: Boolean(article.checks?.passed), attempts, stoppedReason, timeline, article };
   } catch (err) {
     // Fail closed: the lock is released and the reason recorded, so a crashed
     // loop cannot leave an article permanently unrepairable.
+    //
+    // An API-side stop -- an exhausted balance, an expired key, a rate limit --
+    // is recorded in the API's own words. It says nothing about the article,
+    // which is left exactly as the last completed step wrote it: repairArticle
+    // and recheckArticle both save only after their call returns, so a throw
+    // mid-call writes nothing at all.
+    // Matched on name rather than instanceof: this runs inside a catch, and
+    // an `instanceof undefined` here would throw away the very error it is
+    // trying to report.
+    const reason = err?.name === 'ClaudeApiError'
+      ? `stopped by the Anthropic API (${err.code}): ${err.message}`
+      : `error: ${err.message}`;
+    timeline.push(reason);
     try {
-      await release(article, { attempts, stoppedReason: `error: ${err.message}`, timeline });
+      await release(article, { attempts, maxAttempts, stoppedReason: reason, timeline, phase: 'stopped' });
     } catch { /* the original error is the one worth reporting */ }
     throw err;
   }

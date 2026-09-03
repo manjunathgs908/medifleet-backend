@@ -45,6 +45,10 @@ const { findCuratedCoverage, KeywordCoveredError } = require('./seoCoverage');
 // request and the verified fact sheet.
 const { buildContentBrief, renderBriefForPrompt } = require('./seoBrief');
 
+// The media gate. Deterministic and human-supplied: no Claude call, and
+// nothing here can produce an image URL. See services/seoMedia.js.
+const { validateMedia } = require('./seoMedia');
+
 // Never hard-coded. An unset key is a configuration answer, not a crash.
 const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
 const EFFORT = process.env.SEO_CLAUDE_EFFORT || 'high';
@@ -638,6 +642,30 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
   // public page outlives the rules that produced it. See seoPricingGuard.js.
   const pricingClaims = findPricingClaims(article);
 
+  // Images. ADVISORY, and deliberately absent from `passed` below.
+  //
+  // Media is optional: an article with no banner and no in-article images is
+  // a complete article. There is no quota here and there must not be one --
+  // a rule that requires an image is a rule that gets satisfied with a stock
+  // photo, which helps nobody and is not what an image is for. An image goes
+  // in when it genuinely shows the reader something.
+  //
+  // What IS checked is anything actually supplied: a usable URL, alt text
+  // that describes the picture, and a placement the article can honour. Those
+  // problems are reported to the reviewer through checks.mediaErrors and
+  // shown in SEO Studio; they never stop an approval, because a wrong caption
+  // is not the same class of defect as an unverified medical claim or a fare
+  // on a public page.
+  //
+  // The writer is never asked for image URLs. The only URLs it could produce
+  // would be invented, and an invented image is worse than a missing one --
+  // it looks supplied and 404s on the page. Media comes from a person.
+  //
+  // Placements resolve against this article's own headings, so a recheck
+  // judges the images against the edited body rather than against whatever
+  // the body said when the image was added.
+  const mediaErrors = validateMedia(article.media, { content: article.content }).errors;
+
   const passed =
     blockingClaims.length === 0 &&
     pricingClaims.length === 0 &&
@@ -650,7 +678,7 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
     titleOk &&
     metaOk;
 
-  // One entry per failing term, enumerated from the same nine conditions as
+  // One entry per failing term, enumerated from the same conditions as
   // `passed` above. If a gate is added there it must be added here too, or
   // both the log and the recheck response will under-report the reason.
   const failedChecks = [];
@@ -662,6 +690,11 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
   if (schemaErrors.length) failedChecks.push(`${schemaErrors.length} schema error(s)`);
   if (wordCount < MIN_WORDS) failedChecks.push(`${wordCount} words < ${MIN_WORDS}`);
   if (internalLinks.length < 2) failedChecks.push(`${internalLinks.length} valid internal link(s) < 2`);
+  // mediaErrors is NOT listed here. failedChecks enumerates the terms of
+  // `passed`, and recheckArticle stores it beside recheckResult -- a media
+  // note in this list would report an article as failed while passed is true,
+  // and would send the auto-repair loop after a defect it must not touch.
+  // Media reaches the reviewer through checks.mediaErrors instead.
   if (!titleOk) failedChecks.push(`title ${titleLength} chars, want ${TITLE_MIN}-${TITLE_MAX}`);
   if (!metaOk) failedChecks.push(`meta ${metaLength} chars, want ${META_MIN}-${META_MAX}`);
 
@@ -678,6 +711,7 @@ async function evaluateGates(article, { facts, claims, excludeId = null }) {
       intentCollisions,
       schemaErrors,
       pricingClaims,
+      mediaErrors,
       unverifiedClaims, droppedLinks,
       titleLength, metaLength,
       wordCount, passed,

@@ -41,9 +41,16 @@ const CARD_FIELDS = 'slug title metaDescription h1 cluster searchIntent publishe
 
 // One article. `content` and `jsonLd` are the point; `shingles` is select:false
 // already, and nothing else on the document is anyone's business.
+//
+// `media` is here because it renders: a banner and in-article images are
+// part of the page when an article has them. Media is optional, so this
+// is often absent, and anything consuming this route has to render an
+// article perfectly well without it. `generation` stays out -- model,
+// token spend and the content brief are the internal record, which is
+// exactly why media was not put inside it.
 const PAGE_FIELDS =
   'slug title metaDescription h1 content faqs internalLinks jsonLd status ' +
-  'cluster searchIntent keyword publishedAt reviewedAt updatedAt createdAt';
+  'cluster searchIntent keyword publishedAt reviewedAt updatedAt createdAt media';
 
 // Cached at the edge as well as by Next's own revalidate. An approved article
 // changes rarely, and the website is not the only thing that may fetch this.

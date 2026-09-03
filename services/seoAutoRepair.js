@@ -109,6 +109,20 @@ function classifyFailures(checks = {}) {
   if ((checks.similarityScore ?? 0) >= 0.55) blocked.push(`draft similarity ${Number(checks.similarityScore).toFixed(2)} — rewording to dodge a similarity score is not a repair`);
   if ((checks.livePageSimilarity ?? 0) >= 0.55) blocked.push(`live-page similarity ${Number(checks.livePageSimilarity).toFixed(2)} — cannibalisation is an editorial call`);
   if ((checks.schemaErrors || []).length) blocked.push(`${checks.schemaErrors.length} schema error(s) — structural, not wording`);
+  // Media is deliberately absent from BOTH lists.
+  //
+  // Not repairable: the loop's only tool is a Claude call over the text, and
+  // the one thing it could produce for a missing image is an invented URL,
+  // which looks supplied and 404s on the page. Claude must never write an
+  // image into an article.
+  //
+  // Not blocked either: media does not affect checks.passed, so listing it
+  // here would stop the loop before attempt 1 and leave a fixable title or an
+  // unsupported claim unrepaired because a caption was thin. That is exactly
+  // the failure the pricing entry above was moved out of `blocked` to fix.
+  //
+  // Invalid supplied media reaches the reviewer through checks.mediaErrors and
+  // the Media panel in SEO Studio, which is where a person can act on it.
   if ((checks.wordCount ?? 0) < 700) blocked.push(`${checks.wordCount} words — padding to a word count is how unsupported claims get written`);
   if ((checks.internalLinks ?? null) === null && false) { /* links live on the doc, checked by the caller */ }
 

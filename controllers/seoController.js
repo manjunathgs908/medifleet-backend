@@ -21,6 +21,7 @@ const {
 } = require('../services/seoGenerator');
 const { buildFactSheet } = require('../services/seoFacts');
 const { autoRepairArticle, AutoRepairBusyError } = require('../services/seoAutoRepair');
+const { normalizeMedia } = require('../services/seoMedia');
 
 /**
  * Answer a Claude-side failure in terms the operator can act on.
@@ -182,18 +183,37 @@ exports.getById = async (req, res, next) => {
 // ============================================================
 exports.update = async (req, res, next) => {
   try {
-    const EDITABLE = ['title', 'metaDescription', 'h1', 'content', 'faqs', 'internalLinks', 'cluster', 'searchIntent', 'reviewNotes'];
+    const EDITABLE = ['title', 'metaDescription', 'h1', 'content', 'faqs', 'internalLinks', 'cluster', 'searchIntent', 'reviewNotes', 'media'];
     const patch = {};
     for (const k of EDITABLE) if (k in req.body) patch[k] = req.body[k];
 
     const article = await SeoArticle.findById(req.params.id);
     if (!article) return res.status(404).json({ success: false, message: 'Article not found.' });
 
+    // Media is trimmed and coerced into the stored shape before it goes
+    // near the document. Quality is deliberately NOT judged here:
+    // validateMedia inside evaluateGates is the only thing that decides
+    // whether media is good enough, so a reviewer cannot be told one
+    // thing by the save and another by the gate.
+    if ('media' in patch) patch.media = normalizeMedia(patch.media);
+
     const bodyChanged = 'content' in patch && patch.content !== article.content;
+
+    // Images are part of the page, so changing them on an approved
+    // article withdraws the approval exactly as changing the body does.
+    // Without this, media could be approved and then deleted while
+    // checks.passed stayed true -- a hole straight through the gate this
+    // field exists to enforce.
+    //
+    // Compared by value, not by presence: SEO Studio sends the whole
+    // media object on every save, so "the key was in the request" is not
+    // evidence that anything moved.
+    const mediaJson = (m) => JSON.stringify(normalizeMedia(m && typeof m.toObject === 'function' ? m.toObject() : m));
+    const mediaChanged = 'media' in patch && mediaJson(article.media) !== mediaJson(patch.media);
     Object.assign(article, patch);
 
-    if (bodyChanged && article.status === 'approved') {
-      // Approval was granted for text that no longer exists.
+    if ((bodyChanged || mediaChanged) && article.status === 'approved') {
+      // Approval was granted for a page that no longer exists.
       article.status = 'in_review';
       article.checks.passed = false;
     }
@@ -393,6 +413,11 @@ exports.setStatus = async (req, res, next) => {
         reasons.push(`too similar to the live page ${c.similarToLivePage || '(unknown)'} (${Math.round(c.livePageSimilarity * 100)}%)`);
       }
       if (c.schemaErrors?.length) reasons.push(`${c.schemaErrors.length} structured-data error(s)`);
+      // Media is deliberately NOT listed here. It does not feed `passed`,
+      // so it can never be why an approval was refused, and naming it in
+      // this message would send a reviewer off to fix an image that was
+      // not blocking anything. Media findings live in checks.mediaErrors
+      // and are shown in the Media panel instead.
       if ((c.wordCount || 0) < MIN_WORDS) reasons.push(`too short (${c.wordCount} words)`);
       if (c.titleLength < TITLE_MIN || c.titleLength > TITLE_MAX) reasons.push(`title is ${c.titleLength} characters (must be ${TITLE_MIN}-${TITLE_MAX})`);
       if (c.metaLength < META_MIN || c.metaLength > META_MAX) reasons.push(`meta description is ${c.metaLength} characters (must be ${META_MIN}-${META_MAX})`);

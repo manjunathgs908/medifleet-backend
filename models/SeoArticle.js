@@ -140,6 +140,47 @@ const correctionSchema = new Schema(
   { _id: false },
 );
 
+// ── Media ──────────────────────────────────────────────────
+// One banner and one or more in-article images. Nothing here is
+// `required`, deliberately: a draft has to be storable while it fails
+// its checks -- same rule as the quality gates below -- or a reviewer
+// who pastes a URL and forgets the alt text watches the whole image
+// vanish on save instead of being told what is missing. Whether media
+// is good enough is decided in one place, services/seoMedia.js, and
+// the answer is a failed gate rather than a rejected write.
+const mediaBannerSchema = new Schema(
+  {
+    url: { type: String, trim: true },
+    // What is actually in the picture. The only description a screen
+    // reader or an image crawler ever gets, which is why "image" and
+    // "ambulance photo" fail the gate rather than satisfying it.
+    alt: { type: String, trim: true },
+    // Intrinsic pixel size. Optional -- not every source knows it --
+    // but stored when supplied so a renderer can reserve the space and
+    // not shift the layout. Never gated on: a missing width is a
+    // slower page, not a wrong one.
+    width: { type: Number },
+    height: { type: Number },
+  },
+  { _id: false },
+);
+
+const mediaImageSchema = new Schema(
+  {
+    url: { type: String, trim: true },
+    alt: { type: String, trim: true },
+    // Where in the body this image belongs: one of the reserved anchors
+    // (after-intro / before-faqs / end) or the slug of one of this
+    // article's own H2/H3 headings. Not an enum, because the valid set
+    // is derived from the article's text and changes every time the body
+    // is edited -- services/seoMedia.js resolves it against the markdown.
+    placement: { type: String, trim: true },
+    width: { type: Number },
+    height: { type: Number },
+  },
+  { _id: false },
+);
+
 const seoArticleSchema = new Schema(
   {
     // ── Keyword layer ────────────────────────────────────────
@@ -176,6 +217,28 @@ const seoArticleSchema = new Schema(
     content: { type: String, required: true },
     faqs: { type: [faqSchema], default: [] },
     internalLinks: { type: [linkSchema], default: [] },
+
+    // Images. OPTIONAL -- an article with no media is a complete article, and
+    // nothing in the pipeline requires one. There is no quota, no minimum and
+    // no ratio: an image belongs in a guide when it shows the reader
+    // something, not when a threshold demands one.
+    //
+    // Anything supplied is validated strictly by services/seoMedia.js, and
+    // those findings are advisory: see checks.mediaErrors below.
+    //
+    // Top level rather than under `generation` on purpose:
+    // `generation` is provenance and is deliberately absent from the
+    // public projection in controllers/seoPublicController.js, whereas
+    // media renders on the page, exactly like faqs and internalLinks
+    // above. Putting public content inside the internal record would
+    // mean either leaking the rest of it or projecting around it.
+    //
+    // Supplied by a human in SEO Studio. The generator has no image URLs
+    // to give and does not invent any.
+    media: {
+      banner: { type: mediaBannerSchema, default: undefined },
+      images: { type: [mediaImageSchema], default: [] },
+    },
 
     // Article / Service / BreadcrumbList / FAQPage, assembled at generation
     // time so a reviewer sees exactly what would ship.
@@ -260,6 +323,20 @@ const seoArticleSchema = new Schema(
       // that to decide a priced draft needs a person rather than a rewrite,
       // and was silently reading nothing.
       pricingClaims: { type: [String], default: [] },
+      // Problems with media the reviewer SUPPLIED -- a broken URL, alt text
+      // that describes nothing, a placement naming a heading the article no
+      // longer has. From services/seoMedia.js.
+      //
+      // ADVISORY. Unlike every other field in this block, these do not feed
+      // `passed` and cannot stop an approval: media is optional, and an
+      // article with none produces an empty list rather than a complaint.
+      //
+      // Declared here for the same reason pricingClaims had to be: an
+      // undeclared path is dropped by strict mode on every save, and this is
+      // read off a STORED document to render the Media panel. Undeclared, a
+      // reviewer would be shown an empty list on an article that has a
+      // genuinely broken image.
+      mediaErrors: { type: [String], default: [] },
       wordCount: { type: Number, default: 0 },
       passed: { type: Boolean, default: false },
     },

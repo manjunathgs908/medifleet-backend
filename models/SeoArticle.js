@@ -276,6 +276,17 @@ const seoArticleSchema = new Schema(
       model: { type: String },
       effort: { type: String },
       factSheetHash: { type: String },
+      // The content brief the writer was given: primary keyword, intent,
+      // cluster, recommended H1, section outline, secondary keywords, word
+      // floor, FAQ plan, E-E-A-T requirements, internal-link and verification
+      // requirements, and the pricing policy.
+      //
+      // Stored because it is the reviewable half of the decision. Without it a
+      // reviewer can see what the article says but not what it was meant to
+      // accomplish, so "does this do the job" is unanswerable. Built
+      // deterministically by services/seoBrief.js — no Claude call — so an
+      // identical request produces an identical brief.
+      brief: { type: Schema.Types.Mixed },
       // Totals across every Claude call the generation made: the writer, each
       // fact check and each repair. Documents written before the repair loop
       // existed hold the writer call alone, so they under-report by history

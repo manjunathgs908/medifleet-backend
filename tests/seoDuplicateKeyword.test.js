@@ -25,6 +25,14 @@ jest.mock('../services/seoFacts', () => ({
   }),
 }));
 
+// generateDraft now also asks whether a curated page already covers the
+// keyword (services/seoCoverage.js), which reads SeoLivePage. These tests are
+// about the ARTICLE duplicate check, so the page index is stubbed empty —
+// "the site has no page for this" — and the coverage guard has its own suite.
+jest.mock('../models/SeoLivePage', () => ({
+  find: jest.fn(() => ({ select: () => ({ lean: async () => [] }) })),
+}));
+
 const SeoArticle = require('../models/SeoArticle');
 const { buildFactSheet } = require('../services/seoFacts');
 const { generateDraft, DuplicateKeywordError } = require('../services/seoGenerator');

@@ -81,7 +81,36 @@ exports.generate = async (req, res, next) => {
         success: false,
         duplicate: true,
         existing: { id: e._id, slug: e.slug, title: e.title, status: e.status, keyword: e.keyword },
+        // Machine-readable half, alongside the shape the Studio already reads.
+        // Both are emitted so neither side has to guess which one it is.
+        allowed: false,
+        reason: 'already_exists',
+        source: 'seo_article',
+        keyword: e.keyword,
+        existingSlug: e.slug,
+        existingUrl: `/guides/${e.slug}`,
         message: `This keyword already has an article: "${e.title}" (${e.status}). Open it instead of generating another — nothing was generated and nothing was charged.`,
+      });
+    }
+    // The site already has a hand-written page for this topic. Same 409 and
+    // the same shape, because to the operator it is the same answer: it
+    // already exists, open that instead. No Claude call was made.
+    // Matched on name, not instanceof, for the same reason as claudeFailure:
+    // anything that mocks seoGenerator hands this file a different class object,
+    // and an unrecognised error here would become a bare 500.
+    if (err?.name === 'KeywordCoveredError') {
+      const p = err.page;
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+        existing: { slug: p.path.replace(/^\//, ''), title: p.title || p.path, status: 'live', keyword: err.keyword },
+        allowed: false,
+        reason: 'already_exists',
+        source: 'curated_page',
+        keyword: err.keyword,
+        existingSlug: p.path.replace(/^\//, ''),
+        existingUrl: p.path,
+        message: err.message + ' Nothing was generated and nothing was charged.',
       });
     }
     // A missing API key or a Claude refusal is an operator-facing answer,

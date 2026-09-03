@@ -37,6 +37,13 @@ const { validateProposal } = require('./seoRepairGuard');
 // The editorial rule itself, stated once and quoted by every prompt that
 // writes article text, so the writer and the repair cannot drift apart on it.
 const { NO_EXACT_PRICING_RULE, pricingRemovalInstruction } = require('./seoContentPolicy');
+// Pre-generation coverage guard: does the SITE already have a page for this
+// topic? Runs before any Claude call, so a covered keyword costs nothing.
+const { findCuratedCoverage, KeywordCoveredError } = require('./seoCoverage');
+// The content brief: what the page must accomplish, decided deterministically
+// before the writer call. No extra Claude call -- it is derived from the
+// request and the verified fact sheet.
+const { buildContentBrief, renderBriefForPrompt } = require('./seoBrief');
 
 // Never hard-coded. An unset key is a configuration answer, not a crash.
 const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
@@ -703,6 +710,20 @@ async function generateDraft(input, user) {
     throw new DuplicateKeywordError(existing);
   }
 
+  // The other half of "is this already covered". The check above asks whether
+  // an ARTICLE exists; this asks whether the SITE already has a page for the
+  // topic. A guide generated onto a slug the curated registry owns can never
+  // be served — lib/guides.js reserves it — so the draft would be written,
+  // approved and 404. That happened twice for "freezer box in Bangalore".
+  //
+  // Before buildFactSheet and before any Claude call: nothing is spent when
+  // the answer is that the page already exists.
+  const coveredBy = await findCuratedCoverage(keyword);
+  if (coveredBy) {
+    console.log(`[SEO] keyword "${normalizedKeyword}" already covered by curated page ${coveredBy.path} — no generation run`);
+    throw new KeywordCoveredError(coveredBy, normalizedKeyword);
+  }
+
   const startedAt = Date.now();
   const elapsed = () => Date.now() - startedAt;
 
@@ -737,17 +758,26 @@ async function generateDraft(input, user) {
   const factBlock = JSON.stringify(facts, null, 2);
   const writerFactBlock = JSON.stringify(redactPricing(facts), null, 2);
 
+  // The content brief. Decided BEFORE the writer is asked to write, and
+  // decided deterministically: no Claude call, everything derived from the
+  // request plus the verified fact sheet. It replaces the four-line "work
+  // through this in order" instruction the writer used to get, which left the
+  // H1, the section structure, the secondary phrasings and the credibility
+  // signals to the model's improvisation with no way for a reviewer to see
+  // what had been decided.
+  const contentBrief = buildContentBrief({
+    keyword, service, location, notes, facts, minWords: MIN_WORDS,
+  });
+
   const brief = [
     `TARGET KEYWORD: ${keyword}`,
     service ? `SERVICE: ${service}` : null,
     location ? `LOCATION: ${location}` : null,
-    notes ? `EDITOR NOTES: ${notes}` : null,
     '',
-    'Work through this in order, then return the JSON object:',
-    '1. Which keyword cluster does this belong to?',
-    '2. What is the searcher actually trying to do — informational, commercial, transactional or navigational?',
-    '3. What must this page answer for that person to stop searching?',
-    `4. Write the page. At least ${MIN_WORDS} words of substance, 4-6 FAQs a real person would ask.`,
+    renderBriefForPrompt(contentBrief),
+    '',
+    'Now write the page and return the JSON object. `cluster` and `searchIntent` '
+    + 'in your answer should match the brief unless the keyword plainly contradicts it.',
     '',
     'FACT SHEET — the complete set of things you know:',
     // Redacted: the writer is shown no fare figure at all, so it cannot
@@ -883,6 +913,9 @@ async function generateDraft(input, user) {
       model: MODEL,
       effort: EFFORT,
       factSheetHash: facts.hash,
+      // What this article was asked to accomplish. Kept so a reviewer can
+      // judge the draft against its brief rather than against a guess.
+      brief: contentBrief,
       // Every call, not just the writer: a repaired draft costs up to five.
       inputTokens: totals.input,
       outputTokens: totals.output,
@@ -1261,4 +1294,5 @@ module.exports = {
   MAX_FACT_REPAIR_ATTEMPTS, GENERATION_BUDGET_MS,
   evaluateGates, recheckArticle, repairArticle, isBlocking,
   DuplicateKeywordError, NothingToRepairError, ClaudeApiError, toClaudeApiError,
+  KeywordCoveredError,
 };

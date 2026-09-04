@@ -131,7 +131,15 @@ exports.estimateFare = async (params) => {
 // ────────────────────────────────────────────────────────────
 const axios = require('axios');
 
-const sendOtp = async (phone, otp) => {
+// `templateId` selects which DLT-approved template the code is delivered in.
+// Omitted, it stays MSG91_TEMPLATE_ID — the website and driver/owner flows are
+// two-argument callers and are unchanged by this.
+//
+// It exists because the customer app has its own approved template
+// (SaveLife_App_OTP) with different body text from the website's. DLT matches
+// the delivered message against the approved body, so one template cannot
+// serve both: the wrong one is rejected on content, silently, at the operator.
+const sendOtp = async (phone, otp, { templateId } = {}) => {
   if (process.env.NODE_ENV === 'development') {
     console.log(`[SMS Mock] OTP for ${phone}: ${otp}`);
     return { success: true, mock: true };
@@ -145,7 +153,7 @@ const sendOtp = async (phone, otp) => {
     {},
     {
       params: {
-        template_id: process.env.MSG91_TEMPLATE_ID,
+        template_id: templateId || process.env.MSG91_TEMPLATE_ID,
         mobile     : `91${phone}`,
         authkey    : process.env.MSG91_AUTH_KEY,
         sender     : process.env.MSG91_SENDER_ID,

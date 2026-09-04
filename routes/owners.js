@@ -3,10 +3,11 @@ const express   = require('express');
 const router    = express.Router();
 const ownerCtrl = require('../controllers/ownerController');
 const { protect, protectOwner, authorize } = require('../middleware/auth');
+const { sendOtpLimiter, verifyLimiter } = require('../middleware/otpRateLimit');
 
 // Public — registration/login
-router.post('/send-otp',   ownerCtrl.sendOtp);
-router.post('/verify-otp', ownerCtrl.verifyOtp);
+router.post('/send-otp',   sendOtpLimiter, ownerCtrl.sendOtp);
+router.post('/verify-otp', verifyLimiter, ownerCtrl.verifyOtp);
 
 // Private [owner] — the fleet-Owner's own app session (protectOwner).
 // Deliberately ungated on kycStatus: an owner must always be able to log

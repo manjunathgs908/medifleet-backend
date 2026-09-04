@@ -23,7 +23,7 @@ const { User } = require('../models');
 const { sendTokenResponse: sendDriverTokenResponse } = require('./authController');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
-const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { generateOtp, otpExpiryFromNow } = require('../utils/otp');
 
 const ALLOWED_KYC_DOCS = ['aadhaar', 'pan', 'addressProof', 'photo'];
 
@@ -76,7 +76,7 @@ exports.sendOtp = async (req, res, next) => {
     const { phone, name } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
 
-    let owner = await Owner.findOne({ phone }).select('+otp +otpExpiry');
+    let owner = await Owner.findOne({ phone }).select('+otp +otpExpiry +otpAttempts');
     if (!owner) {
       if (!name) {
         return res.status(400).json({ success: false, message: 'Name is required to register a new owner.' });
@@ -84,25 +84,12 @@ exports.sendOtp = async (req, res, next) => {
       owner = new Owner({ phone, name });
     }
 
-    const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const otpExpiry = otpExpiryFromNow();
+    const otp = generateOtp();
 
-    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
-    // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed
-    // OTP with no real SMS attempt — testOtp is echoed back so the app
-    // can show/auto-fill it. Every other number always gets real SMS.
-    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
-      const testOtp = getTestOtpCode();
-      owner.otp       = testOtp;
-      owner.otpExpiry = otpExpiry;
-      await owner.save({ validateBeforeSave: false });
-      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
-    }
-
-    // Generate 4-digit OTP
-    const otp = String(Math.floor(1000 + Math.random() * 9000));
-
-    owner.otp       = otp;
-    owner.otpExpiry = otpExpiry;
+    owner.otp         = otp;
+    owner.otpExpiry   = otpExpiry;
+    owner.otpAttempts = 0;   // a resend is a fresh start
     await owner.save({ validateBeforeSave: false });
 
     // Send SMS via MSG91 (see utils/smsService.js)
@@ -128,15 +115,35 @@ exports.verifyOtp = async (req, res, next) => {
     const { phone, otp } = req.body;
     if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
 
-    const owner = await Owner.findOne({ phone }).select('+otp +otpExpiry +refreshToken');
-    if (!owner) return res.status(404).json({ success: false, message: 'Owner not found.' });
-
-    if (!owner.isOtpValid(otp)) {
-      return res.status(400).json({ success: false, message: 'OTP is invalid or has expired.' });
+    const owner = await Owner.findOne({ phone }).select('+otp +otpExpiry +otpAttempts +refreshToken');
+    if (!owner) {
+      return res.status(400).json({ success: false, code: 'OTP_INVALID', message: 'Incorrect code. Please request a new one.' });
     }
 
-    owner.otp         = undefined;
-    owner.otpExpiry   = undefined;
+    // Distinct answers, because the action each calls for is different:
+    // expired means ask for another, locked means asking again is the only
+    // way forward, invalid means check the SMS and retype.
+    const verdict = owner.checkOtp(otp);
+    if (!verdict.ok) {
+      await owner.save({ validateBeforeSave: false });   // spend the attempt
+      if (verdict.reason === 'expired') {
+        return res.status(410).json({ success: false, code: 'OTP_EXPIRED', message: 'This code has expired. Please request a new one.' });
+      }
+      if (verdict.reason === 'locked') {
+        return res.status(429).json({ success: false, code: 'OTP_LOCKED', message: 'Too many incorrect attempts. Please request a new code.' });
+      }
+      const left = verdict.attemptsRemaining;
+      return res.status(400).json({
+        success: false, code: 'OTP_INVALID', attemptsRemaining: left,
+        message: left > 0
+          ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} remaining.`
+          : 'Incorrect code. Please request a new one.',
+      });
+    }
+
+    // Spent on success, so replaying the same value finds nothing and is
+    // answered as expired rather than issuing a second session.
+    owner.clearOtp();
     owner.otpVerified = true;
 
     return sendTokenResponse(owner, 200, res);

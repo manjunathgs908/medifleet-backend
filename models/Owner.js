@@ -63,4 +63,8 @@ ownerSchema.methods.isOtpValid = function (otp) {
   return this.otp === otp && this.otpExpiry > Date.now();
 };
 
+// Adds otpAttempts plus checkOtp()/clearOtp(). Same rules as User, from the
+// same file, so the two cannot drift — see utils/otp.js.
+require('../utils/otp').applyOtpMethods(ownerSchema);
+
 module.exports = mongoose.model('Owner', ownerSchema);

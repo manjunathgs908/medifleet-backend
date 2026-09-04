@@ -231,9 +231,15 @@ userSchema.methods.comparePin = async function (candidate) {
 };
 
 // â”€â”€ Instance method: check if OTP is valid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Kept for anything still calling it. Expiry only — it does NOT count attempts
+// and never did, which is why login now goes through checkOtp() below.
 userSchema.methods.isOtpValid = function (otp) {
   return this.otp === otp && this.otpExpiry > Date.now();
 };
+
+// Adds otpAttempts plus checkOtp()/clearOtp(). One definition of "is this code
+// acceptable", shared with Owner — see utils/otp.js.
+require('../utils/otp').applyOtpMethods(userSchema);
 
 const User = mongoose.model('User', userSchema);
 

@@ -30,7 +30,6 @@
 const jwt = require('jsonwebtoken');
 const CustomerOtp = require('../models/CustomerOtp');
 const smsService = require('../utils/smsService');
-const { isTestOtpEnabled, isTestOtpNumber, getTestOtpCode } = require('../utils/testOtp');
 
 // Indian mobile numbers: ten digits starting 6-9. The same rule the website
 // booking form is validated against, so a number that works in one works in
@@ -71,20 +70,6 @@ exports.sendOtp = async (req, res, next) => {
     }
 
     const otpExpiry = new Date(Date.now() + OTP_TTL_MS);
-
-    // Test numbers get a fixed code and no SMS, so the flow can be exercised
-    // end to end without spending a message or waiting on a carrier. Governed
-    // by TEST_OTP_ENABLED; every other number always gets real SMS. Same
-    // convention as the driver and website flows — see utils/testOtp.js.
-    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
-      const testOtp = getTestOtpCode();
-      await CustomerOtp.findOneAndUpdate(
-        { phone },
-        { otp: testOtp, otpExpiry, attempts: 0 },
-        { upsert: true, new: true },
-      );
-      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
-    }
 
     const otp = generateOtp();
 

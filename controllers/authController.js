@@ -21,7 +21,7 @@ const GeofenceEvent = require('../models/GeofenceEvent');
 const { haversineKm } = require('../utils/haversine');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
-const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
+const { generateOtp, otpExpiryFromNow } = require('../utils/otp');
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -145,28 +145,24 @@ exports.sendOtp = async (req, res, next) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
 
-    const user = await User.findOne({ phone, isActive: true }).select('+otp +otpExpiry');
-    if (!user) return res.status(404).json({ success: false, message: 'No active account found for this number.' });
-
-    const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
-    // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed
-    // OTP with no real SMS attempt — testOtp is echoed back so the app
-    // can show/auto-fill it. Every other number always gets real SMS.
-    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
-      const testOtp = getTestOtpCode();
-      user.otp       = testOtp;
-      user.otpExpiry = otpExpiry;
-      await user.save({ validateBeforeSave: false });
-      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
+    const user = await User.findOne({ phone, isActive: true }).select('+otp +otpExpiry +otpAttempts');
+    // An unknown number gets the SAME answer a known one does. A 404 here
+    // turned this endpoint into a directory: feed it numbers, keep the ones
+    // that come back 200. Nothing is sent and nothing is stored, but the
+    // caller cannot tell that apart from a delivered SMS.
+    if (!user) {
+      return res.json({ success: true, message: `OTP sent to ${phone}.` });
     }
 
-    // Generate 4-digit OTP
-    const otp = String(Math.floor(1000 + Math.random() * 9000));
+    const otpExpiry = otpExpiryFromNow();
 
-    user.otp       = otp;
-    user.otpExpiry = otpExpiry;
+    const otp = generateOtp();
+
+    user.otp         = otp;
+    user.otpExpiry   = otpExpiry;
+    // A resend is a fresh start, or five wrong guesses would permanently
+    // lock a number that simply never received the first message.
+    user.otpAttempts = 0;
     await user.save({ validateBeforeSave: false });
 
     // Send SMS via MSG91 (see utils/smsService.js)
@@ -192,11 +188,32 @@ exports.verifyOtp = async (req, res, next) => {
     const { phone, otp, deviceId } = req.body;
     if (!phone || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
 
-    const user = await User.findOne({ phone }).select('+otp +otpExpiry +refreshToken');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    const user = await User.findOne({ phone }).select('+otp +otpExpiry +otpAttempts +refreshToken');
+    // Same shape as a wrong code: whether the number exists is not
+    // something an unauthenticated caller gets to learn.
+    if (!user) {
+      return res.status(400).json({ success: false, code: 'OTP_INVALID', message: 'Incorrect code. Please request a new one.' });
+    }
 
-    if (!user.isOtpValid(otp)) {
-      return res.status(400).json({ success: false, message: 'OTP is invalid or has expired.' });
+    // Distinct answers, because the action each calls for is different:
+    // expired means ask for another, locked means asking again is the only
+    // way forward, invalid means check the SMS and retype.
+    const verdict = user.checkOtp(otp);
+    if (!verdict.ok) {
+      await user.save({ validateBeforeSave: false });   // spend the attempt
+      if (verdict.reason === 'expired') {
+        return res.status(410).json({ success: false, code: 'OTP_EXPIRED', message: 'This code has expired. Please request a new one.' });
+      }
+      if (verdict.reason === 'locked') {
+        return res.status(429).json({ success: false, code: 'OTP_LOCKED', message: 'Too many incorrect attempts. Please request a new code.' });
+      }
+      const left = verdict.attemptsRemaining;
+      return res.status(400).json({
+        success: false, code: 'OTP_INVALID', attemptsRemaining: left,
+        message: left > 0
+          ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} remaining.`
+          : 'Incorrect code. Please request a new one.',
+      });
     }
 
     // Driver-only hardening — device binding is meaningless for

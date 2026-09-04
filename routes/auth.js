@@ -11,17 +11,18 @@ const router    = express.Router();
 const authCtrl  = require('../controllers/authController');
 const unifiedAuthCtrl = require('../controllers/unifiedAuthController');
 const { protect, authorize } = require('../middleware/auth');
+const { sendOtpLimiter, verifyLimiter } = require('../middleware/otpRateLimit');
 
 router.post('/register',         protect, authorize('owner'), authCtrl.register);
-router.post('/send-otp',         authCtrl.sendOtp);
-router.post('/verify-otp',       authCtrl.verifyOtp);
+router.post('/send-otp',         sendOtpLimiter, authCtrl.sendOtp);
+router.post('/verify-otp',       verifyLimiter, authCtrl.verifyOtp);
 
 // Unified login — single phone-only flow for the app (replaces the old
 // Driver/Owner tab selection in LoginScreen.js). Additive: the two
 // routes above stay exactly as they were for anything still calling them
 // directly.
-router.post('/unified-send-otp',   unifiedAuthCtrl.sendOtp);
-router.post('/unified-verify-otp', unifiedAuthCtrl.verifyOtp);
+router.post('/unified-send-otp',   sendOtpLimiter, unifiedAuthCtrl.sendOtp);
+router.post('/unified-verify-otp', verifyLimiter, unifiedAuthCtrl.verifyOtp);
 router.post('/login',            authCtrl.loginPassword);
 router.post('/refresh',          authCtrl.refresh);
 router.post('/logout',           protect, authCtrl.logout);

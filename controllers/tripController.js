@@ -23,7 +23,6 @@ const TripCallEvent = require('../models/TripCallEvent');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
 const smsService = require('../utils/smsService');
-const { isTestOtpEnabled, getTestOtpCode, isTestOtpNumber } = require('../utils/testOtp'); // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working
 const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
 const whatsappNotifications = require('../services/whatsappNotifications');
@@ -118,11 +117,8 @@ const GST_RATE = 0;
 // ============================================================
 // @route   POST /api/trips/send-otp
 // @desc    Phone verification for the website booking form — real MSG91
-//          SMS for every number, except the TEST_OTP_NUMBERS allowlist
-//          (see utils/testOtp.js), which gets a fixed code with no real
-//          SMS attempt. Driver/owner login never bypass, only this
-//          customer-facing flow does. Not gated on any account — a
-//          website visitor isn't a User/Owner.
+//          SMS for every number, with no allowlist and no bypass. Not gated
+//          on any account: a website visitor isn't a User/Owner.
 // @access  Public
 // ============================================================
 exports.sendBookingOtp = async (req, res, next) => {
@@ -134,20 +130,6 @@ exports.sendBookingOtp = async (req, res, next) => {
     }
 
     const otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-    // TEMPORARY — REMOVE once real MSG91 SMS is confirmed working. See
-    // utils/testOtp.js. Only numbers in TEST_OTP_NUMBERS get the fixed
-    // OTP with no real SMS attempt — testOtp is echoed back so the site
-    // can show/auto-fill it. Every other number always gets real SMS.
-    if (isTestOtpEnabled() && isTestOtpNumber(phone)) {
-      const testOtp = getTestOtpCode();
-      await BookingOtp.findOneAndUpdate(
-        { phone },
-        { otp: testOtp, otpExpiry },
-        { upsert: true, new: true }
-      );
-      return res.json({ success: true, message: `OTP sent to ${phone}.`, testOtp });
-    }
 
     const otp = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit, website booking OTP only
 

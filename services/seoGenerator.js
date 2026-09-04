@@ -40,6 +40,11 @@ const { NO_EXACT_PRICING_RULE, pricingRemovalInstruction } = require('./seoConte
 // Pre-generation coverage guard: does the SITE already have a page for this
 // topic? Runs before any Claude call, so a covered keyword costs nothing.
 const { findCuratedCoverage, KeywordCoveredError } = require('./seoCoverage');
+
+// The one slug rule, shared with the auto-repair rename and the coverage
+// guard. Reused rather than reimplemented so the slug predicted before spend
+// is built by the same code that builds the real one.
+const { slugify } = require('./seoSlug');
 // The content brief: what the page must accomplish, decided deterministically
 // before the writer call. No extra Claude call -- it is derived from the
 // request and the verified fact sheet.
@@ -133,10 +138,20 @@ function getClient() {
  * saying no.
  */
 class DuplicateKeywordError extends Error {
-  constructor(existing) {
-    super(`This keyword already has an article: "${existing.title}" (${existing.status}).`);
+  // `conflict` says WHICH thing was already taken: 'keyword' (the operator has
+  // asked for this topic before) or 'slug' (a different keyword, but it would
+  // land on a URL an article already owns). The API contract is identical for
+  // both -- same status, same fields, same `source` -- because to the operator
+  // it is the same answer: it already exists, open that one. Only the sentence
+  // differs, and it has to, or a slug collision is reported as a duplicate
+  // keyword and sends somebody looking at the wrong thing.
+  constructor(existing, conflict = 'keyword') {
+    super(conflict === 'slug'
+      ? `The URL this keyword would use is already taken by "${existing.title}" (${existing.status}).`
+      : `This keyword already has an article: "${existing.title}" (${existing.status}).`);
     this.name = 'DuplicateKeywordError';
     this.existing = existing;
+    this.conflict = conflict;
   }
 }
 
@@ -752,10 +767,42 @@ async function generateDraft(input, user) {
   //
   // Before buildFactSheet and before any Claude call: nothing is spent when
   // the answer is that the page already exists.
-  const coveredBy = await findCuratedCoverage(keyword);
+  // The slug this keyword would produce, derived deterministically from the
+  // keyword itself rather than waited for. The writer picks the real slug, so
+  // this is a PREDICTION -- but it is the same prediction every time, and it
+  // is available now, before anything has been spent.
+  const candidateSlug = slugify(keyword);
+
+  const coveredBy = await findCuratedCoverage(keyword, candidateSlug);
   if (coveredBy) {
     console.log(`[SEO] keyword "${normalizedKeyword}" already covered by curated page ${coveredBy.path} — no generation run`);
     throw new KeywordCoveredError(coveredBy, normalizedKeyword);
+  }
+
+  // ── Candidate slug already taken: refuse BEFORE spending ────
+  //
+  // The keyword guard above asks "has this TOPIC been written". This asks
+  // "is the URL free". They are different questions: the slug is derived from
+  // the keyword, but two different keywords routinely reduce to one slug, and
+  // normalizedKeyword cannot see that.
+  //
+  // Until now the answer arrived only from evaluateGates, after the writer,
+  // the fact checker and up to two repairs had all been paid for -- the
+  // article was generated in full and then told its URL was taken.
+  //
+  // This is a HINT, not a guarantee, and is deliberately not treated as one:
+  // the writer may still choose a different slug, and two requests can race.
+  // The post-generation duplicateSlug gate, the auto-repair rename and the
+  // unique index on `slug` all stay exactly as they were. This only stops the
+  // obvious collision early, where it is free.
+  if (candidateSlug) {
+    const slugOwner = await SeoArticle.findOne({ slug: candidateSlug })
+      .select('_id slug title status keyword')
+      .lean();
+    if (slugOwner) {
+      console.log(`[SEO] candidate slug "${candidateSlug}" already owned by ${slugOwner.status} article ${slugOwner._id} — no generation run`);
+      throw new DuplicateKeywordError(slugOwner, 'slug');
+    }
   }
 
   const startedAt = Date.now();

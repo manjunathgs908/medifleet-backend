@@ -68,24 +68,52 @@ function significantTokens(text) {
 
 const sameSet = (a, b) => a.size === b.size && [...a].every((x) => b.has(x));
 
+// A path reduced to the form a slug is written in: no leading or trailing
+// slash, lowercased. '/Freezer-Box-Bangalore/' and 'freezer-box-bangalore'
+// are the same URL and must compare equal.
+const pathSlug = (path) => String(path || '').replace(/^\/+/, '').replace(/\/+$/, '').toLowerCase();
+
 /**
  * The curated page that already covers this keyword, or null.
  *
  * Reads SeoLivePage. Returns the page itself so the caller can tell the
  * operator which page to open rather than only that something exists.
  *
+ * Two independent matches, either of which is coverage:
+ *
+ *   1. EXACT SLUG. The slug this keyword would produce IS a curated page's
+ *      path. "freezer box in bangalore" slugifies to freezer-box-bangalore,
+ *      and /freezer-box-bangalore is a hand-written page — so a guide at
+ *      /guides/freezer-box-bangalore can never be served, because
+ *      lib/guides.js on the website reserves any slug the curated registry
+ *      owns. This is the check that catches it by the URL rather than by the
+ *      wording, and it is why the same collision cannot recur under a
+ *      differently-phrased keyword.
+ *
+ *   2. TOKEN SET, as before. The significant words of the keyword are exactly
+ *      the significant words of the path, in any order. Catches the same topic
+ *      asked for in different words.
+ *
+ * Neither replaces the other: (1) is about the URL, (2) is about the topic, and
+ * a keyword can collide on one without the other.
+ *
+ * @param {string} keyword
+ * @param {string} [candidateSlug]  the slug this keyword would produce.
+ *   Defaults to deriving it, so existing single-argument callers are unchanged.
  * @returns {Promise<{path:string, title?:string}|null>}
  */
-async function findCuratedCoverage(keyword) {
+async function findCuratedCoverage(keyword, candidateSlug = slugify(keyword)) {
   const wanted = significantTokens(keyword);
-  if (!wanted.size) return null;
+  const slug = pathSlug(candidateSlug);
+  if (!wanted.size && !slug) return null;
 
   const pages = await SeoLivePage.find({}).select('path title').lean();
   for (const page of pages) {
     // A guide URL is an article, not a curated page; the article guard owns
     // that case and reports it with the right source.
     if (String(page.path || '').startsWith('/guides/')) continue;
-    if (sameSet(wanted, significantTokens(page.path))) return page;
+    if (slug && pathSlug(page.path) === slug) return page;
+    if (wanted.size && sameSet(wanted, significantTokens(page.path))) return page;
   }
   return null;
 }

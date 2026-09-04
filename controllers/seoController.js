@@ -90,7 +90,12 @@ exports.generate = async (req, res, next) => {
         keyword: e.keyword,
         existingSlug: e.slug,
         existingUrl: `/guides/${e.slug}`,
-        message: `This keyword already has an article: "${e.title}" (${e.status}). Open it instead of generating another — nothing was generated and nothing was charged.`,
+        // Same status, same fields, same source -- only the sentence differs.
+        // A slug collision reported as a duplicate keyword sends the operator
+        // to check a keyword they never typed.
+        message: err.conflict === 'slug'
+          ? `The URL this keyword would use, /guides/${e.slug}, is already taken by "${e.title}" (${e.status}). Choose a different angle or open that article — nothing was generated and nothing was charged.`
+          : `This keyword already has an article: "${e.title}" (${e.status}). Open it instead of generating another — nothing was generated and nothing was charged.`,
       });
     }
     // The site already has a hand-written page for this topic. Same 409 and

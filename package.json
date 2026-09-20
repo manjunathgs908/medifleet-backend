@@ -28,6 +28,7 @@
     "mongoose": "^8.0.0",
     "morgan": "^1.10.0",
     "node-cron": "^3.0.3",
+    "openai": "^6.49.0",
     "razorpay": "^2.9.8"
   },
   "devDependencies": {

@@ -24,6 +24,14 @@ const documentSchema = new Schema(
     publicId  : { type: String }, // Cloudinary public_id — for future delete/replace
     number    : { type: String }, // certificate/document number, optional
     expiryDate: { type: Date },
+
+    // Compliance-alert bookkeeping, written by the daily cron in
+    // jobs/scheduler.js. alertSent stops one expiry being re-announced
+    // every morning; alertSentAt lets the cron make an exception inside
+    // the last three days and chase it daily. Carried over from the
+    // Vehicle schema so the alert behaviour is genuinely the same.
+    alertSent  : { type: Boolean, default: false },
+    alertSentAt: { type: Date },
   },
   { _id: false }
 );

@@ -1121,7 +1121,8 @@ const notificationSchema = new Schema(
     severity: { type: String, enum: ['info', 'warning', 'critical'], default: 'info' },
 
     // â”€â”€ References â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    vehicle  : { type: Schema.Types.ObjectId, ref: 'Vehicle' },
+    vehicle  : { type: Schema.Types.ObjectId, ref: 'Vehicle' },   // historical only
+    ambulance: { type: Schema.Types.ObjectId, ref: 'Ambulance' },
     user     : { type: Schema.Types.ObjectId, ref: 'User' },
     trip     : { type: Schema.Types.ObjectId, ref: 'Trip' },
 

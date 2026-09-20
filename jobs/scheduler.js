@@ -21,7 +21,8 @@
 'use strict';
 
 const cron       = require('node-cron');
-const { Vehicle, Loan, Hospital, Trip, User, Notification, Expense } = require('../models');
+const { Loan, Hospital, Trip, User, Notification, Expense } = require('../models');
+const Ambulance = require('../models/Ambulance');
 const billingController = require('../controllers/billingController');
 const smsService        = require('../utils/smsService');
 
@@ -41,8 +42,21 @@ const mockReqRes = (body = {}, query = {}) => ({
 // ════════════════════════════════════════════════════════════
 // JOB 1 — Document Expiry Compliance Alerts
 // Runs every day at 08:00 AM
-// Checks all vehicle documents expiring within 15 days
+// Checks all ambulance documents expiring within 15 days
 // and sends in-app + SMS notifications.
+//
+// Reads Ambulance, not the retired Vehicle collection. Same thresholds,
+// same severity rules, same once-then-daily-inside-three-days resend
+// behaviour — only the source of the documents changed, and the doc keys
+// with it (Ambulance uses rc/insurance/fitness/permit/pollution).
+//
+// One deliberate difference, and it is not cosmetic: the SMS now goes to
+// the ambulance's OWNER — the partner who actually has to renew the
+// certificate — instead of to every CRM admin. On a single-fleet system
+// those were the same people. On a multi-partner one, telling SaveLife
+// that a partner's insurance has expired while not telling the partner is
+// the wrong way round. The in-app Notification still targets the CRM, so
+// the platform keeps its own view of what is expiring.
 // ════════════════════════════════════════════════════════════
 const runComplianceAlerts = async () => {
   console.log('[Cron] 🔍 Running compliance expiry check...');
@@ -54,18 +68,23 @@ const runComplianceAlerts = async () => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const vehicles = await Vehicle.find({ isActive: true });
-    const docTypes = ['insurance', 'fitnessCertificate', 'rtoPermit', 'pucCertificate'];
+    const ambulances = await Ambulance.find({ isActive: true })
+      .populate('owner', 'name businessName phone');
+
+    // Ambulance's own document keys. 'pollution' is the PUC certificate —
+    // see the note on documentSchema in models/Ambulance.js; only the
+    // label says PUC.
+    const docTypes = ['insurance', 'fitness', 'permit', 'pollution'];
     const docLabels = {
-      insurance          : 'Insurance',
-      fitnessCertificate : 'Fitness Certificate',
-      rtoPermit          : 'RTO Permit',
-      pucCertificate     : 'PUC Certificate',
+      insurance : 'Insurance',
+      fitness   : 'Fitness Certificate',
+      permit    : 'RTO Permit',
+      pollution : 'PUC Certificate',
     };
 
     let alertCount = 0;
 
-    for (const vehicle of vehicles) {
+    for (const vehicle of ambulances) {
       for (const type of docTypes) {
         const doc = vehicle.documents?.[type];
         if (!doc?.expiryDate) continue;
@@ -86,22 +105,31 @@ const runComplianceAlerts = async () => {
           : `expires in ${daysLeft} day(s)`;
 
         // ── Create in-app notification ──────────────────────
+        const partnerLabel = vehicle.owner?.businessName || vehicle.owner?.name || 'Unknown partner';
+
         await Notification.create({
           type       : 'compliance_expiry',
           title      : `⚠️ ${docLabels[type]} Alert — ${vehicle.registrationNumber}`,
-          message    : `${docLabels[type]} for ${vehicle.registrationNumber} ${statusMsg}. Renew immediately.`,
+          // Partner named in the message: on a multi-partner board the
+          // first question about an expiring certificate is whose it is.
+          message    : `${docLabels[type]} for ${vehicle.registrationNumber} (${partnerLabel}) ${statusMsg}. Renew immediately.`,
           severity,
-          vehicle    : vehicle._id,
+          ambulance  : vehicle._id,
           targetRole : 'owner',
         });
 
         // ── Send SMS to Owner ───────────────────────────────
         try {
-          const owners = await User.find({ role: 'owner', isActive: true });
+          // The partner who owns the ambulance, not every CRM admin —
+          // they are the one who renews it. Falls back to nobody rather
+          // than to a broadcast: a missing owner link is a data problem to
+          // fix, not a reason to SMS everyone about a vehicle that is not
+          // theirs.
+          const owners = vehicle.owner?.phone ? [vehicle.owner] : [];
           for (const owner of owners) {
             await smsService.sendAlert(
               owner.phone,
-              `MediFleet Alert: ${docLabels[type]} for vehicle ${vehicle.registrationNumber} ${statusMsg}. Please renew urgently.`
+              `MediFleet Alert: ${docLabels[type]} for ambulance ${vehicle.registrationNumber} ${statusMsg}. Please renew urgently.`
             );
           }
         } catch (smsErr) {
@@ -109,7 +137,7 @@ const runComplianceAlerts = async () => {
         }
 
         // ── Mark alert as sent ──────────────────────────────
-        await Vehicle.findByIdAndUpdate(vehicle._id, {
+        await Ambulance.updateOne({ _id: vehicle._id }, {
           [`documents.${type}.alertSent`]  : true,
           [`documents.${type}.alertSentAt`]: new Date(),
         });

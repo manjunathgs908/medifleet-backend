@@ -143,11 +143,52 @@ exports.getAvailableAmbulances = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Your account is not linked to a fleet owner. Contact your Owner/Admin.' });
     }
 
-    const ambulances = await Ambulance.find({ status: 'available', isActive: true, owner: req.user.owner })
-      .select('registrationNumber serviceType serviceTypeLabel vehicleModel status year')
+    const driverId = req.user._id;
+
+    const ambulances = await Ambulance.find({
+      status  : 'available',
+      isActive: true,
+      owner   : req.user.owner,
+      // A 'locked' ambulance belongs to its rostered driver alone, so it
+      // is not shown to anyone else. Hiding it is presentation only —
+      // startDuty enforces the same rule inside its atomic claim, so
+      // posting the id directly still fails. This exists so a driver is
+      // not offered a vehicle they will then be refused.
+      //
+      // The $or covers the rows a plain { driverLock: { $ne: 'locked' } }
+      // would also match, and is written out so the intent is legible:
+      // anything not locked, plus anything locked to me.
+      $or: [
+        { driverLock: { $ne: 'locked' } },
+        { driverLock: 'locked', defaultDriver: driverId },
+      ],
+    })
+      .select('registrationNumber serviceType serviceTypeLabel vehicleModel status year defaultDriver driverLock')
       .sort({ registrationNumber: 1 });
 
-    return res.json({ success: true, ambulances });
+    // The driver's own ambulance first, then the rest in registration
+    // order. Sorted here rather than in Mongo: "is this mine" is a
+    // comparison against the caller, not a stored field, and the list is
+    // one owner's fleet — tens of rows, not thousands.
+    const shaped = ambulances
+      .map((amb) => {
+        const isMyDefault = String(amb.defaultDriver || '') === String(driverId);
+        return {
+          _id               : amb._id,
+          registrationNumber: amb.registrationNumber,
+          serviceType       : amb.serviceType,
+          serviceTypeLabel  : amb.serviceTypeLabel,
+          vehicleModel      : amb.vehicleModel,
+          status            : amb.status,
+          year              : amb.year,
+          driverLock        : amb.driverLock,
+          isMyDefault,
+        };
+      })
+      .sort((a, b) => (b.isMyDefault - a.isMyDefault)
+        || a.registrationNumber.localeCompare(b.registrationNumber));
+
+    return res.json({ success: true, ambulances: shaped });
   } catch (err) {
     next(err);
   }

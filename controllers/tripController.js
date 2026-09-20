@@ -1642,7 +1642,11 @@ exports.getLiveBoard = async (req, res, next) => {
     // Assignment/Shift system (see ambulanceController.
     // listAmbulancesAdmin for the CRM's own read of this same data).
     const ambulances = await Ambulance.find({ status: 'assigned', isActive: true })
-      .populate('assignedDriver', 'name phone availability');
+      .populate('assignedDriver', 'name phone availability')
+      // Whose unit this is. A dispatcher choosing between two available
+      // ambulances needs to know which is ours and which is a partner's —
+      // it changes who to call if something goes wrong mid-trip.
+      .populate('owner', 'name businessName isPlatformOwner');
     const ambulanceEntries = ambulances
       .filter(a => computeAmbulanceDisplayStatus(a) === 'available')
       .map(a => ({
@@ -1650,6 +1654,11 @@ exports.getLiveBoard = async (req, res, next) => {
         registrationNumber: a.registrationNumber,
         assignedDriver    : a.assignedDriver ? { name: a.assignedDriver.name, phone: a.assignedDriver.phone } : null,
         source            : 'ambulance',
+        partner           : a.owner ? {
+          _id            : a.owner._id,
+          label          : a.owner.businessName || a.owner.name,
+          isPlatformOwner: !!a.owner.isPlatformOwner,
+        } : null,
       }));
 
     const availableVehicles = [...vehicleEntries, ...ambulanceEntries];

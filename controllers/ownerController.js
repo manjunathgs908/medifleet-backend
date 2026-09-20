@@ -19,6 +19,7 @@
 const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
 const Owner  = require('../models/Owner');
+const Ambulance = require('../models/Ambulance');
 const PartnerRegistrationOtp = require('../models/PartnerRegistrationOtp');
 const { User } = require('../models');
 const { sendTokenResponse: sendDriverTokenResponse } = require('./authController');
@@ -481,8 +482,51 @@ exports.listOwners = async (req, res, next) => {
   try {
     const owners = await Owner.find({})
       .select('name phone businessName gstin pan kycStatus kycDocuments kycRejectionReason isPlatformOwner createdAt')
-      .sort({ createdAt: -1 });
-    return res.json({ success: true, owners });
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Three counts per partner, so the review page shows what a partner
+    // actually operates rather than only what they filled in on a form.
+    //
+    // Aggregated in three grouped queries rather than a countDocuments per
+    // owner per metric: that would be 3N round trips on a page whose whole
+    // job is to list every owner. N is small today and this still matters
+    // the first time it is not.
+    const [ambCounts, drvCounts, onDuty] = await Promise.all([
+      Ambulance.aggregate([
+        { $match: { isActive: true } },
+        { $group: { _id: '$owner', n: { $sum: 1 } } },
+      ]),
+      User.aggregate([
+        { $match: { role: 'driver', isActive: true } },
+        { $group: { _id: '$owner', n: { $sum: 1 } } },
+      ]),
+      // "On duty now" is read off Ambulance.status, which start-duty sets
+      // and end-duty clears, so it needs no join with Assignment.
+      Ambulance.aggregate([
+        { $match: { isActive: true, status: 'assigned' } },
+        { $group: { _id: '$owner', n: { $sum: 1 } } },
+      ]),
+    ]);
+
+    const toMap = (rows) => rows.reduce((m, r) => {
+      if (r._id) m[String(r._id)] = r.n;
+      return m;
+    }, {});
+    const ambMap = toMap(ambCounts);
+    const drvMap = toMap(drvCounts);
+    const dutyMap = toMap(onDuty);
+
+    const shaped = owners.map((o) => ({
+      ...o,
+      counts: {
+        ambulances: ambMap[String(o._id)] || 0,
+        drivers   : drvMap[String(o._id)] || 0,
+        onDutyNow : dutyMap[String(o._id)] || 0,
+      },
+    }));
+
+    return res.json({ success: true, owners: shaped });
   } catch (err) {
     next(err);
   }

@@ -338,6 +338,11 @@ exports.listAmbulancesAdmin = async (req, res, next) => {
     const ambulances = await Ambulance.find({ isActive: true })
       .populate('fleet', 'name')
       .populate('assignedDriver', 'name phone availability')
+      .populate('defaultDriver', 'name phone')
+      // The partner this unit belongs to. On a multi-partner board every
+      // row has to say whose vehicle it is, or a dispatcher cannot tell
+      // our own fleet from a partner's when deciding who to send.
+      .populate('owner', 'name businessName isPlatformOwner')
       .sort({ createdAt: -1 });
 
     const shaped = ambulances.map((amb) => ({
@@ -348,10 +353,24 @@ exports.listAmbulancesAdmin = async (req, res, next) => {
       status            : amb.status,
       displayStatus     : exports.computeAmbulanceDisplayStatus(amb),
       source            : 'ambulance',
+      driverLock        : amb.driverLock,
+      partner           : amb.owner ? {
+        _id            : amb.owner._id,
+        // businessName is what a dispatcher recognises; name is the
+        // person who registered and is the fallback for owners created
+        // before businessName existed.
+        label          : amb.owner.businessName || amb.owner.name,
+        isPlatformOwner: !!amb.owner.isPlatformOwner,
+      } : null,
       assignedDriver    : amb.assignedDriver ? {
         _id  : amb.assignedDriver._id,
         name : amb.assignedDriver.name,
         phone: amb.assignedDriver.phone,
+      } : null,
+      defaultDriver     : amb.defaultDriver ? {
+        _id  : amb.defaultDriver._id,
+        name : amb.defaultDriver.name,
+        phone: amb.defaultDriver.phone,
       } : null,
     }));
 

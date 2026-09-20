@@ -3,3 +3,6 @@ node_modules/
 .env.*
 
 body.json
+
+# Local database dumps from scripts/backup-db.js — never commit production data.
+backups/

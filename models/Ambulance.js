@@ -61,8 +61,43 @@ const ambulanceSchema = new Schema(
 
     photos: [photoSchema],
 
-    // Existing driver User doc — read-only reference, User model untouched.
+    // WHO IS ON DUTY RIGHT NOW. Transient, and owned entirely by the duty
+    // lifecycle: written by assignmentController.startDuty inside its
+    // atomic claim, cleared by endDuty/forceEndDuty. Null whenever nobody
+    // is on shift. Trip dispatch reads it to find someone to send.
+    //
+    // Not settable by an owner — updateAmbulance/createAmbulance refuse it.
+    // The roster answer is defaultDriver below.
     assignedDriver: { type: Schema.Types.ObjectId, ref: 'User' },
+
+    // WHO USUALLY DRIVES THIS. Durable, and owned entirely by the owner,
+    // set through PUT /api/ambulances/:id/default-driver.
+    //
+    // Deliberately a separate field rather than a reuse of assignedDriver.
+    // The two answer different questions and change on different clocks —
+    // one per shift, one per roster decision — and the earlier attempt to
+    // express both in one field failed because the transient writer runs
+    // every shift and always wins.
+    defaultDriver: { type: Schema.Types.ObjectId, ref: 'User' },
+
+    // How hard defaultDriver is enforced at start-duty:
+    //   open      — anyone in the fleet may claim it; defaultDriver is
+    //               only a label.
+    //   preferred — anyone may claim it, but the rostered driver sees it
+    //               first in their picker. The default, because it is the
+    //               one setting that cannot strand an ambulance.
+    //   locked    — only defaultDriver may claim it. Enforced inside
+    //               startDuty's atomic filter, so the guarantee is the
+    //               same single write as the availability check.
+    //
+    // 'locked' with no defaultDriver would make an ambulance unclaimable
+    // by anyone; the endpoint refuses that combination rather than letting
+    // a vehicle be bricked by a dropdown.
+    driverLock: {
+      type   : String,
+      enum   : ['open', 'preferred', 'locked'],
+      default: 'preferred',
+    },
 
     deviceId: { type: String, trim: true }, // GPS/telematics hardware ID
 

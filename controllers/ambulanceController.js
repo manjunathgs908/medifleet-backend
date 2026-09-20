@@ -13,6 +13,7 @@
 const Ambulance  = require('../models/Ambulance');
 const Assignment = require('../models/Assignment');
 const Fleet      = require('../models/Fleet');
+const { User }   = require('../models');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { byServiceType } = require('../utils/ambulanceServiceTypes');
 
@@ -356,6 +357,128 @@ exports.listAmbulancesAdmin = async (req, res, next) => {
     }));
 
     return res.json({ success: true, ambulances: shaped });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// DEFAULT DRIVER — the owner's roster decision.
+//
+// Separate from assignedDriver on purpose. See the field comments in
+// models/Ambulance.js: assignedDriver says who is on shift right now and
+// belongs to the duty lifecycle; defaultDriver says who usually drives
+// this and belongs to the owner. Nothing here writes assignedDriver.
+// ============================================================
+
+const DRIVER_LOCKS = ['open', 'preferred', 'locked'];
+
+// ============================================================
+// @route   PUT /api/ambulances/:id/default-driver
+// @desc    Assign (or re-assign) the rostered driver, and set how hard
+//          that is enforced at start-duty.
+// @access  Private [owner]
+// ============================================================
+exports.setDefaultDriver = async (req, res, next) => {
+  try {
+    const { driverId, driverLock } = req.body;
+
+    if (!driverId) {
+      return res.status(400).json({ success: false, message: 'driverId is required.' });
+    }
+    if (driverLock !== undefined && !DRIVER_LOCKS.includes(driverLock)) {
+      return res.status(400).json({
+        success: false,
+        message: `driverLock must be one of: ${DRIVER_LOCKS.join(', ')}.`,
+      });
+    }
+
+    const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+
+    // Scoped to this owner's own drivers. Without the owner filter an
+    // owner could roster another partner's driver onto their vehicle by
+    // posting a raw id — the same cross-tenant hole startDuty closes with
+    // owner:req.user.owner on its claim.
+    const driver = await User.findOne({ _id: driverId, role: 'driver', owner: req.user._id });
+    if (!driver) {
+      // Same answer whether the driver belongs to another owner or does
+      // not exist, so this cannot be used to probe for driver ids.
+      return res.status(404).json({ success: false, message: 'Driver not found in your fleet.' });
+    }
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(409).json({
+        success: false,
+        code   : 'DRIVER_NOT_APPROVED',
+        message: `${driver.name} is not approved yet. Approve them before assigning an ambulance.`,
+      });
+    }
+
+    // One ambulance per driver. 409 rather than silently clearing the
+    // other one, deliberately:
+    //
+    // Clearing is a destructive edit to a vehicle the owner is not
+    // looking at. If that other ambulance was 'locked' to this driver, a
+    // silent clear leaves it locked to nobody — unclaimable by the whole
+    // fleet — and the owner finds out when a driver cannot go on duty.
+    // Naming the conflict lets them decide which vehicle this driver
+    // should be on, and costs one tap on Remove.
+    //
+    // It also matches how startDuty already refuses a second concurrent
+    // duty ("end your current duty first") rather than ending the first.
+    const clash = await Ambulance.findOne({
+      owner        : req.user._id,
+      defaultDriver: driver._id,
+      isActive     : true,
+      _id          : { $ne: ambulance._id },
+    }).select('registrationNumber');
+    if (clash) {
+      return res.status(409).json({
+        success: false,
+        code   : 'DRIVER_ALREADY_ASSIGNED',
+        message: `${driver.name} is already the assigned driver of ${clash.registrationNumber}. Remove them from that ambulance first.`,
+        conflict: { ambulanceId: clash._id, registrationNumber: clash.registrationNumber },
+      });
+    }
+
+    ambulance.defaultDriver = driver._id;
+    if (driverLock !== undefined) ambulance.driverLock = driverLock;
+    await ambulance.save();
+
+    await ambulance.populate('defaultDriver', 'name phone');
+    return res.json({
+      success  : true,
+      message  : `${driver.name} is now the assigned driver of ${ambulance.registrationNumber}.`,
+      ambulance,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   DELETE /api/ambulances/:id/default-driver
+// @desc    Clear the rostered driver.
+// @access  Private [owner]
+// ============================================================
+exports.clearDefaultDriver = async (req, res, next) => {
+  try {
+    const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
+    if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+
+    // Dropping the lock along with the driver is not a convenience, it is
+    // required: 'locked' with no defaultDriver is an ambulance nobody in
+    // the fleet can claim, including the owner. Anything else would let
+    // Remove brick a vehicle.
+    ambulance.defaultDriver = null;
+    ambulance.driverLock    = 'open';
+    await ambulance.save();
+
+    return res.json({
+      success  : true,
+      message  : `Assigned driver removed from ${ambulance.registrationNumber}.`,
+      ambulance,
+    });
   } catch (err) {
     next(err);
   }

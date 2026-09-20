@@ -21,4 +21,10 @@ router.delete('/:id',           ambulanceCtrl.deleteAmbulance);
 router.put   ('/:id/document',  ambulanceCtrl.updateDocument);
 router.post  ('/:id/photos',    ambulanceCtrl.addPhoto);
 
+// The owner's roster decision — who usually drives this ambulance, and how
+// hard that is enforced at start-duty. Distinct from assignedDriver, which
+// the duty system owns and PUT /:id refuses to touch.
+router.put   ('/:id/default-driver', ambulanceCtrl.setDefaultDriver);
+router.delete('/:id/default-driver', ambulanceCtrl.clearDefaultDriver);
+
 module.exports = router;

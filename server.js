@@ -94,7 +94,7 @@ app.use('/api/call',      require('./routes/callRoutes'));
 app.use('/api/sos',       sosRoutes);
 app.use('/api/whatsapp',  whatsappRoutes);
 app.use('/api/whatsapp-leads', whatsappLeadRoutes);
-app.use('/api/ai', require('./routes/aiTest'));
+
 app.use('/api/app/auth',  require('./routes/appAuth'));   // customer app phone login
 app.use('/api/seo',       require('./routes/seo'));       // owner-only
 app.use('/api/guides',    require('./routes/seoPublic'));  // public, approved articles only
@@ -111,3 +111,5 @@ app.listen(PORT, () => {
     console.log(`🚀 MEDIFLEET BACKEND RUNNING SUCCESSFULLY ON PORT: ${PORT}`);
     console.log(`==================================================`);
 });
+
+app.use('/api/ai', require('./routes/aiChat'));

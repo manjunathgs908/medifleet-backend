@@ -429,7 +429,8 @@ exports.getFleetShiftStatus = async (req, res, next) => {
 
     const ambulances = await Ambulance.find({ owner: ownerId, isActive: true })
       .populate('fleet', 'name')
-      .populate('assignedDriver', 'name phone employeeId availability');
+      .populate('assignedDriver', 'name phone employeeId availability')
+      .populate('defaultDriver', 'name phone');
 
     const fleet = await Promise.all(ambulances.map(async (amb) => {
       const assignment = amb.status === 'assigned'
@@ -476,6 +477,18 @@ exports.getFleetShiftStatus = async (req, res, next) => {
           status            : amb.status,
           displayStatus,
           fleet             : amb.fleet,
+          // The rostered driver, and how hard that roster is enforced.
+          // Sits beside assignedDriver rather than replacing it: this is
+          // who usually drives the vehicle, that is who is on it now, and
+          // on a live dashboard the gap between the two is the interesting
+          // part — a locked ambulance sitting idle means its driver has
+          // not come on duty.
+          driverLock        : amb.driverLock,
+          defaultDriver     : amb.defaultDriver ? {
+            id   : amb.defaultDriver._id,
+            name : amb.defaultDriver.name,
+            phone: amb.defaultDriver.phone,
+          } : null,
           assignedDriver    : amb.assignedDriver ? {
             id      : amb.assignedDriver._id,
             name    : amb.assignedDriver.name,

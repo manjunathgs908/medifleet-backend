@@ -121,7 +121,11 @@ exports.getAmbulances = async (req, res, next) => {
 
     const ambulances = await Ambulance.find(filter)
       .populate('fleet', 'name')
+      // Both, and they mean different things — assignedDriver is who is on
+      // duty right now, defaultDriver is who the owner rostered. The app
+      // shows them as two separate lines for exactly that reason.
       .populate('assignedDriver', 'name phone')
+      .populate('defaultDriver', 'name phone')
       .sort({ createdAt: -1 });
 
     return res.json({ success: true, ambulances });
@@ -138,7 +142,8 @@ exports.getAmbulanceById = async (req, res, next) => {
   try {
     const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id })
       .populate('fleet', 'name')
-      .populate('assignedDriver', 'name phone');
+      .populate('assignedDriver', 'name phone')
+      .populate('defaultDriver', 'name phone');
     if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
     return res.json({ success: true, ambulance });
   } catch (err) {

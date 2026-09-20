@@ -10,12 +10,17 @@
  */
 'use strict';
 
-const Ambulance = require('../models/Ambulance');
-const Fleet     = require('../models/Fleet');
+const Ambulance  = require('../models/Ambulance');
+const Assignment = require('../models/Assignment');
+const Fleet      = require('../models/Fleet');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { byServiceType } = require('../utils/ambulanceServiceTypes');
 
 const DOC_TYPES = ['rc', 'insurance', 'fitness', 'permit', 'pollution'];
+
+// The only two an owner may set. 'assigned' is the duty system's — see the
+// comment in updateAmbulance.
+const OWNER_SETTABLE_STATUSES = ['available', 'maintenance'];
 
 // Shared by the owner's own live dashboard (assignmentController.
 // getFleetShiftStatus) and the CRM-admin ambulance list below — a
@@ -56,6 +61,20 @@ exports.createAmbulance = async (req, res, next) => {
   try {
     const { fleetId, registrationNumber, serviceType, year, deviceId, assignedDriverId } = req.body;
 
+    // Same rule as updateAmbulance, at the other door. A new ambulance
+    // cannot have an active Assignment, but seeding assignedDriver here
+    // would still hand trip dispatch a driver with no open Shift, and
+    // startDuty would later overwrite it anyway. Nothing sends this — the
+    // owner app has never had an assignedDriverId field — so refusing it
+    // costs nothing and keeps one rule instead of two.
+    if (assignedDriverId !== undefined) {
+      return res.status(400).json({
+        success: false,
+        code   : 'ASSIGNED_DRIVER_READ_ONLY',
+        message: 'assignedDriver is set by the duty system when a driver starts duty. Add the ambulance first, then choose its assigned driver.',
+      });
+    }
+
     if (!registrationNumber || !serviceType) {
       return res.status(400).json({ success: false, message: 'registrationNumber and serviceType are required.' });
     }
@@ -80,7 +99,6 @@ exports.createAmbulance = async (req, res, next) => {
       vehicleModel    : typeInfo.vehicleModel,
       year: year || undefined,
       deviceId,
-      assignedDriver: assignedDriverId || undefined,
     });
 
     return res.status(201).json({ success: true, ambulance });
@@ -135,8 +153,59 @@ exports.updateAmbulance = async (req, res, next) => {
   try {
     const { registrationNumber, serviceType, year, deviceId, assignedDriverId, status, fleetId } = req.body;
 
+    // ── assignedDriver belongs to the duty lifecycle, not the owner ──
+    //
+    // It is written by startDuty and cleared by endDuty/forceEndDuty, and
+    // `status` is the latch those use to claim an ambulance atomically:
+    // startDuty's findOneAndUpdate filters on status:'available', which is
+    // the ONLY thing stopping two drivers claiming the same vehicle.
+    //
+    // This endpoint used to set both, unconditionally and with no check for
+    // an active Assignment. An owner flipping status back to 'available'
+    // mid-shift let a second driver claim an ambulance that was already
+    // out, and writing assignedDriverId pointed trip dispatch at a driver
+    // with no open Shift.
+    //
+    // The roster-level answer to "who usually drives this" is
+    // defaultDriver, set through PUT /api/ambulances/:id/default-driver.
+    if (assignedDriverId !== undefined) {
+      return res.status(400).json({
+        success: false,
+        code   : 'ASSIGNED_DRIVER_READ_ONLY',
+        message: 'assignedDriver is set by the duty system when a driver starts duty. To choose who usually drives this ambulance, set its assigned driver instead.',
+      });
+    }
+
     const ambulance = await Ambulance.findOne({ _id: req.params.id, owner: req.user._id });
     if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+
+    // The owner's one legitimate reason to touch status is taking a vehicle
+    // off the road and putting it back. Everything else is the duty system's.
+    if (status !== undefined) {
+      if (!OWNER_SETTABLE_STATUSES.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          code   : 'STATUS_NOT_OWNER_SETTABLE',
+          message: `status can only be set to ${OWNER_SETTABLE_STATUSES.join(' or ')}. 'assigned' is set by the duty system when a driver starts duty.`,
+        });
+      }
+
+      // Refuse while someone is actually on duty on it, in either
+      // direction. Sending it to maintenance would strand a driver
+      // mid-shift; sending it to available would unlatch the claim and let
+      // a second driver take a vehicle that is already out.
+      const active = await Assignment.findOne({ ambulance: ambulance._id, active: true })
+        .populate('driver', 'name');
+      if (active) {
+        return res.status(409).json({
+          success: false,
+          code   : 'AMBULANCE_ON_DUTY',
+          message: `${active.driver?.name || 'A driver'} is on duty on this ambulance. Ask them to end duty first.`,
+        });
+      }
+
+      ambulance.status = status;
+    }
 
     if (fleetId) {
       const fleet = await Fleet.findOne({ _id: fleetId, owner: req.user._id });
@@ -156,10 +225,8 @@ exports.updateAmbulance = async (req, res, next) => {
       ambulance.serviceTypeLabel = typeInfo.label;
       ambulance.vehicleModel     = typeInfo.vehicleModel;
     }
-    if (year !== undefined)             ambulance.year = year;
-    if (deviceId !== undefined)         ambulance.deviceId = deviceId;
-    if (assignedDriverId !== undefined) ambulance.assignedDriver = assignedDriverId || null;
-    if (status)                         ambulance.status = status;
+    if (year !== undefined)     ambulance.year = year;
+    if (deviceId !== undefined) ambulance.deviceId = deviceId;
 
     await ambulance.save();
     return res.json({ success: true, ambulance });

@@ -561,9 +561,25 @@ exports.createDriverAccount = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
     }
 
+    // Phone stays globally unique — one driver belongs to one partner, so a
+    // number already driving for someone else must not be addable here.
+    //
+    // The message deliberately does not say why. The old wording ("A driver
+    // with this phone number already exists") told any owner, for any number
+    // they cared to type, whether that number drives for a competitor: a
+    // roster-enumeration oracle handed out one 409 at a time. The owner
+    // could not act on the real reason in any case — they are not permitted
+    // to see another partner's driver, and only support can move one.
+    //
+    // Same answer whether the number belongs to this owner's own driver, a
+    // competitor's, or a CRM staff user. One wording, no inference.
     const existing = await User.findOne({ phone });
     if (existing) {
-      return res.status(409).json({ success: false, message: 'A driver with this phone number already exists.' });
+      return res.status(409).json({
+        success: false,
+        code   : 'DRIVER_PHONE_UNAVAILABLE',
+        message: "This number can't be added. Please contact SaveLife support.",
+      });
     }
 
     const existingIds = await User.find({ employeeId: /^DRV-\d+$/ }).select('employeeId').lean();

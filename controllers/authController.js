@@ -22,6 +22,7 @@ const { haversineKm } = require('../utils/haversine');
 const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { generateOtp, otpExpiryFromNow } = require('../utils/otp');
+const { isPlatformDriver } = require('../utils/platformOwner');
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -356,7 +357,22 @@ exports.getMe = async (req, res) => {
   // Check / pre-go-online gate need assignedAmbulanceId's registrationNumber,
   // not just its raw id.
   const user = await req.user.populate('assignedAmbulanceId', 'registrationNumber status');
-  return res.json({ success: true, user });
+
+  // What this session is allowed to see, resolved server-side.
+  //
+  // The app must not work this out for itself: it has no way to read the
+  // driver's Owner, and hardcoding "hide My Pay unless..." in the client
+  // would put the rule in two places and let them disagree after one
+  // release. The endpoints stay authoritative either way — payroll already
+  // filters and getPayslip already 404s — so this only decides whether a
+  // partner driver is shown a tab that would be empty.
+  const ours = req.user.role === 'driver' ? await isPlatformDriver(req.user) : false;
+
+  return res.json({
+    success : true,
+    user,
+    features: { attendance: ours, salary: ours },
+  });
 };
 
 

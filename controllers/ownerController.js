@@ -173,7 +173,17 @@ exports.verifyOtp = async (req, res, next) => {
 // @access  Private [owner]
 // ============================================================
 exports.getMe = async (req, res) => {
-  return res.json({ success: true, owner: req.user });
+  // Same contract as the driver's /me: the server says what this session
+  // may see. For an owner the flags describe their whole fleet — a partner
+  // owner has no SaveLife payroll to show for any of their drivers, and
+  // SaveLife's own owner does.
+  const ours = Boolean(req.user.isPlatformOwner);
+
+  return res.json({
+    success : true,
+    owner   : req.user,
+    features: { attendance: ours, salary: ours },
+  });
 };
 
 

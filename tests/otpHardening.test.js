@@ -181,11 +181,47 @@ describe('E. send-otp answers unknown and known numbers identically', () => {
     expect(verifyBody('ownerController.js')).toContain('OTP_INVALID');
   });
 
-  test('owner onboarding is untouched — an unknown number can still register', () => {
-    // Deliberately NOT hidden: this is the documented owner sign-up path and
-    // changing it would break onboarding.
-    expect(read('ownerController.js')).toContain('Name is required to register a new owner.');
-    expect(read('unifiedAuthController.js')).toContain('Name is required to register a new owner.');
+  test('no login path registers an Owner any more', () => {
+    // This used to assert the opposite — that send-otp would register an
+    // unknown number, described here as the documented sign-up path and
+    // deliberately exempt from the directory rule.
+    //
+    // It was the exemption that was wrong, not the rule. Registering on
+    // send-otp meant an Owner row was written for any number anyone typed,
+    // BEFORE a code was verified, and it made an unknown number answer
+    // differently from a known one — the very oracle the rest of this file
+    // exists to close.
+    //
+    // Sign-up did not go away; it moved somewhere it can be done properly.
+    // POST /api/owners/register verifies possession of the phone first and
+    // is the only writer of an Owner. See tests/partnerOnboarding.test.js.
+    const owner   = read('ownerController.js');
+    const unified = read('unifiedAuthController.js');
+
+    expect(owner).not.toContain('Name is required to register a new owner.');
+    expect(unified).not.toContain('Name is required to register a new owner.');
+
+    // Scoped to the sendOtp bodies: register() below them legitimately
+    // constructs an Owner, and that is the whole point.
+    //
+    // Comments are stripped first. Both handlers now carry a note explaining
+    // what they used to do, quoting `new Owner({ phone, name })` verbatim,
+    // and an assertion that cannot tell running code from a description of
+    // deleted code would fail on the documentation of its own fix.
+    const sendOtpBody = (src) => {
+      const at = src.indexOf('exports.sendOtp');
+      expect(at).toBeGreaterThan(-1);
+      return src
+        .slice(at, src.indexOf('\nexports.', at + 1))
+        .split('\n')
+        .filter((l) => !l.trim().startsWith('//'))
+        .join('\n');
+    };
+    expect(sendOtpBody(owner)).not.toContain('new Owner(');
+    expect(sendOtpBody(unified)).not.toContain('new Owner(');
+
+    // ...and the replacement genuinely exists.
+    expect(owner).toContain('exports.register');
   });
 });
 

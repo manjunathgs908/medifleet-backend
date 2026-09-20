@@ -85,6 +85,15 @@ const protect = async (req, res, next) => {
 
     // 6. Attach user to request for downstream middleware
     req.user = user;
+    // WHICH KIND OF ACTOR THIS IS.
+    //
+    // `authorize('owner')` passes for two completely different subjects: a
+    // CRM admin (a User with role 'owner') and a fleet Owner (an Owner doc
+    // whose role is synthesized in protectOwner). The only thing that ever
+    // distinguished them was which middleware happened to run, which is
+    // invisible from inside a controller. Anything that must treat them
+    // differently reads this instead of guessing.
+    req.actorType = 'user';
     next();
 
   } catch (err) {
@@ -134,6 +143,7 @@ const protectOwner = async (req, res, next) => {
 
     owner.role = 'owner'; // synthesized for authorize() — not a schema field, not persisted
     req.user = owner;
+    req.actorType = 'owner';   // see the note in protect()
     next();
 
   } catch (err) {
@@ -221,4 +231,78 @@ const requireKycApproved = (req, res, next) => {
 };
 
 
-module.exports = { protect, protectOwner, authorize, driverSelfOnly, requireKycApproved };
+/**
+ * protectUserOrOwner — accepts EITHER actor on a single route.
+ *
+ * Deliberately not a change to protect(). Widening protect() itself would
+ * make every route already using it reachable by a fleet Owner, which is
+ * the opposite of what this exists for. This is opt-in, currently used
+ * only by the two trip-read routes an owner legitimately needs.
+ *
+ * Tries User first, then Owner, mirroring the priority unifiedAuth uses.
+ * Sets req.actorType so the controller can scope the answer: a CRM admin
+ * sees every trip, a fleet Owner sees only trips on their own ambulances.
+ * A controller behind this middleware MUST branch on req.actorType — it
+ * is the whole reason the middleware exists.
+ */
+const protectUserOrOwner = async (req, res, next) => {
+  let token;
+
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'Not authorised. No token provided.' });
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    const message = err.name === 'TokenExpiredError'
+      ? 'Session expired. Please log in again.'
+      : 'Invalid token. Please log in again.';
+    return res.status(401).json({ success: false, message });
+  }
+
+  try {
+    const user = await User.findById(decoded.id).select('-password -otp -otpExpiry -refreshToken');
+    if (user) {
+      if (!user.isActive) {
+        return res.status(403).json({ success: false, message: 'Account is deactivated. Contact admin.' });
+      }
+      // Same one-active-device rule protect() enforces — a driver reaching
+      // a shared route must not sidestep it by coming through here.
+      if (decoded.deviceId !== user.deviceId) {
+        return res.status(401).json({
+          success: false,
+          code   : 'DEVICE_MISMATCH',
+          message: 'Logged in on another device. Please log in again.',
+        });
+      }
+      req.user = user;
+      req.actorType = 'user';
+      return next();
+    }
+
+    const owner = await Owner.findById(decoded.id);
+    if (owner) {
+      if (!owner.isActive) {
+        return res.status(403).json({ success: false, message: 'Account is deactivated. Contact admin.' });
+      }
+      owner.role = 'owner';
+      req.user = owner;
+      req.actorType = 'owner';
+      return next();
+    }
+
+    return res.status(401).json({ success: false, message: 'Account not found. Token may be stale.' });
+  } catch (err) {
+    return next(err);
+  }
+};
+
+
+module.exports = {
+  protect, protectOwner, protectUserOrOwner, authorize, driverSelfOnly, requireKycApproved,
+};

@@ -3,7 +3,11 @@ const express = require('express');
 const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
 const paymentCtrl = require('../controllers/paymentController');
-const { protect, authorize } = require('../middleware/auth');
+// protectUserOrOwner on the two read routes only — a fleet Owner needs to
+// see their own trips, and protect() alone cannot serve them because it
+// looks subjects up in the User collection. Every other route here stays
+// on protect(). See middleware/auth.js.
+const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
 router.post('/send-otp',   tripCtrl.sendBookingOtp);
 router.post('/verify-otp', tripCtrl.verifyBookingOtp);
@@ -24,8 +28,8 @@ router.post('/:id/payment/order',  paymentCtrl.createOrder);
 router.post('/:id/payment/verify', paymentCtrl.verifyPayment);
 router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
 router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
-router.get('/', protect, tripCtrl.getTrips);
-router.get('/:id', protect, tripCtrl.getTripById);
+router.get('/', protectUserOrOwner, tripCtrl.getTrips);
+router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);
 router.put('/:id/assign', protect, authorize('owner'), tripCtrl.assignVehicle);
 router.put('/:id/status', protect, tripCtrl.updateStatus);
 router.put('/:id/arrive-pickup', protect, tripCtrl.arrivePickup);

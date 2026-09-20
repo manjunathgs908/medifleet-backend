@@ -1546,9 +1546,27 @@ exports.getTrips = async (req, res, next) => {
 
     const filter = {};
 
-    // Drivers are restricted to their own trips
+    // Three actors, three different answers. See middleware/auth.js's
+    // note on req.actorType: role alone cannot tell a CRM admin from a
+    // fleet Owner, because authorize('owner') passes for both.
     if (req.user.role === 'driver') {
+      // Drivers are restricted to their own trips.
       filter.driver = req.user._id;
+    } else if (req.actorType === 'owner') {
+      // A fleet Owner sees only trips run on their own ambulances.
+      //
+      // Keyed on Trip.ambulance rather than Trip.driver: a trip belongs to
+      // the vehicle it was dispatched to, and a driver can be moved
+      // between owners, which would otherwise retroactively move their
+      // trip history with them. Trips with no ambulance at all — the
+      // legacy Vehicle dispatch path — are correctly invisible here, since
+      // Vehicle has no owner field and cannot be attributed to a partner.
+      const ownAmbulances = await Ambulance.find({ owner: req.user._id }).select('_id').lean();
+      filter.ambulance = { $in: ownAmbulances.map((a) => a._id) };
+
+      // The CRM's cross-tenant filters are ignored for an Owner rather
+      // than merged, so a crafted ?driverId= cannot widen the scope.
+      if (hospitalId) filter.dropHospital = hospitalId;
     } else {
       if (driverId)   filter.driver       = driverId;
       if (vehicleId)  filter.vehicle      = vehicleId;
@@ -1676,6 +1694,15 @@ exports.getTripById = async (req, res, next) => {
     // Driver guard
     if (req.user.role === 'driver' && trip.driver?._id?.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'Access denied.' });
+    }
+
+    // Fleet-Owner guard — only trips on their own ambulances. 404, not
+    // 403: a partner has no business learning that a given trip id exists
+    // at all, and "not found" is the same answer a bad id gets.
+    if (req.actorType === 'owner') {
+      const mine = trip.ambulance
+        && await Ambulance.exists({ _id: trip.ambulance, owner: req.user._id });
+      if (!mine) return res.status(404).json({ success: false, message: 'Trip not found.' });
     }
 
     const tripObj = trip.toObject();

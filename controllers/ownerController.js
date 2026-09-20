@@ -471,7 +471,7 @@ exports.register = async (req, res, next) => {
 exports.listOwners = async (req, res, next) => {
   try {
     const owners = await Owner.find({})
-      .select('name phone kycStatus kycDocuments kycRejectionReason createdAt')
+      .select('name phone businessName gstin pan kycStatus kycDocuments kycRejectionReason isPlatformOwner createdAt')
       .sort({ createdAt: -1 });
     return res.json({ success: true, owners });
   } catch (err) {
@@ -520,6 +520,51 @@ exports.rejectOwner = async (req, res, next) => {
       success: true,
       message: 'Owner rejected.',
       owner  : { id: owner._id, name: owner.name, phone: owner.phone, kycStatus: owner.kycStatus, kycRejectionReason: owner.kycRejectionReason },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   PUT /api/owners/:id/platform-owner
+// @desc    Mark an Owner as SaveLife's own (or unmark it).
+// @access  Private [CRM owner/admin]
+//
+// This decides whether the Owner's drivers are OUR employees. Attendance
+// rows and payroll are written only for drivers under a platform Owner, so
+// this flag is the difference between a driver we pay and a driver a
+// partner pays.
+//
+// It lives here, behind `protect` (the CRM User session), and is reachable
+// from nowhere else: it is not in the register handler's input list, and no
+// protectOwner route writes it. An owner who could set it on themselves
+// could move their own drivers onto SaveLife's payroll, which is why the
+// check is structural — the field simply has no owner-session write path —
+// rather than a validation somewhere that could be forgotten.
+// ============================================================
+exports.setPlatformOwner = async (req, res, next) => {
+  try {
+    const { isPlatformOwner } = req.body;
+    if (typeof isPlatformOwner !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'isPlatformOwner must be true or false.' });
+    }
+
+    const owner = await Owner.findByIdAndUpdate(
+      req.params.id,
+      { isPlatformOwner },
+      { new: true },
+    );
+    if (!owner) return res.status(404).json({ success: false, message: 'Owner not found.' });
+
+    return res.json({
+      success: true,
+      message: isPlatformOwner
+        ? 'Marked as a SaveLife-owned fleet. Its drivers now get attendance and payroll.'
+        : 'Unmarked. Its drivers no longer get attendance or payroll.',
+      owner: {
+        id: owner._id, name: owner.name, phone: owner.phone, isPlatformOwner: owner.isPlatformOwner,
+      },
     });
   } catch (err) {
     next(err);

@@ -31,5 +31,9 @@ router.post('/act-as-driver', protectOwner, authorize('owner'), ownerCtrl.actAsD
 router.get ('/',             protect, authorize('owner'), ownerCtrl.listOwners);
 router.put ('/:id/approve',  protect, authorize('owner'), ownerCtrl.approveOwner);
 router.put ('/:id/reject',   protect, authorize('owner'), ownerCtrl.rejectOwner);
+// Deliberately on the `protect` (CRM User) side of this file, never the
+// protectOwner side — see setPlatformOwner's comment. An owner must not be
+// able to put their own drivers on SaveLife's payroll.
+router.put ('/:id/platform-owner', protect, authorize('owner'), ownerCtrl.setPlatformOwner);
 
 module.exports = router;

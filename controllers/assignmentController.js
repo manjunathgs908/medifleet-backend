@@ -17,6 +17,7 @@ const Assignment = require('../models/Assignment');
 const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
 const { Trip, User, Attendance } = require('../models');
+const { isPlatformDriver } = require('../utils/platformOwner');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 
 function toLocation(lat, lng) {
@@ -254,7 +255,17 @@ exports.endDuty = async (req, res, next) => {
     // Bucketed under shiftStart's calendar date even for an overnight/24h
     // shift — "which day did he report for duty" is the record, not which
     // day it happened to end.
-    if (!req.user.shiftHours) {
+    //
+    // Gated on the driver's Owner being SaveLife's own. A partner employs
+    // and pays their own drivers; an Attendance row for one of them is a
+    // record of work we did not buy, and it is what payroll reads. The
+    // Shift itself is still written for everyone — that is operational
+    // history the partner's own dashboard needs, and it carries no pay.
+    const ours = await isPlatformDriver(req.user);
+
+    if (!ours) {
+      console.log(`[attendance] Skipping auto-attendance for driver ${driverId} — partner driver, not SaveLife-employed.`);
+    } else if (!req.user.shiftHours) {
       console.log(`[attendance] Skipping auto-attendance for driver ${driverId} — shiftHours not configured.`);
     } else {
       try {
@@ -547,6 +558,19 @@ exports.forceEndDuty = async (req, res, next) => {
     shift.totalWorkingMinutes = Math.round((workingMs / 60000) * 100) / 100;
     await shift.save();
 
+    // No auto-attendance here, deliberately — and this is not an oversight
+    // the isPlatformOwner gate introduced; forceEndDuty has never written
+    // one.
+    //
+    // This is the escape hatch for a driver stuck on duty with no live app
+    // session: a lost or reinstalled phone. The shift has been open for
+    // however long it took someone to notice, so its duration is an artefact
+    // of the fault, not hours worked. Turning that into an Attendance row
+    // would feed a fabricated number straight into payroll, for exactly the
+    // drivers whose records are already broken.
+    //
+    // A real day's work force-ended this way is corrected by hand in the
+    // CRM, where a person can see what actually happened.
     assignment.active  = false;
     assignment.endTime = now;
     await assignment.save();

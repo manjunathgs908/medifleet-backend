@@ -70,31 +70,6 @@ async function verifyRoadDistanceKm(originLat, originLng, destLat, destLng) {
 }
 exports.verifyRoadDistanceKm = verifyRoadDistanceKm; // reused by whatsappFlow.js for the same Google-Directions-verified billing distance
 
-// ── Phase 6 light bridge: best-effort Vehicle -> Ambulance match by
-// registrationNumber. Both schemas already normalize to uppercase+trim
-// on save, so an exact match covers the common case cheaply; the
-// fallback strips all non-alphanumeric characters before comparing, to
-// catch the same physical plate entered differently in the two systems
-// (e.g. "KA01AB1234" in the CRM vs "KA-01-AB-1234" in Add Ambulance).
-// Never throws, never returns anything but a doc or null — a miss must
-// not block dispatch.
-const normalizePlate = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-
-async function findMatchingAmbulance(registrationNumber) {
-  try {
-    const exact = await Ambulance.findOne({ registrationNumber });
-    if (exact) return exact;
-
-    const target = normalizePlate(registrationNumber);
-    if (!target) return null;
-    const candidates = await Ambulance.find({}, 'registrationNumber');
-    const fuzzy = candidates.find(a => normalizePlate(a.registrationNumber) === target);
-    return fuzzy || null;
-  } catch (err) {
-    return null;
-  }
-}
-
 // GST is ZERO on every fare this controller computes. That is an
 // exemption, not an oversight, and not a value waiting to be filled in.
 // Please do not "restore" it to 5.
@@ -281,7 +256,6 @@ exports.createTrip = async (req, res, next) => {
       patientName, patientPhone, emergencyType,
       pickupAddress, pickupLat, pickupLng,
       dropHospitalId, dropAddress,
-      vehicleId,
       leadId,
       // Customer app fields
       pickupLabel, dropLabel, dist, effectiveDist,
@@ -368,19 +342,28 @@ exports.createTrip = async (req, res, next) => {
       await Lead.findByIdAndUpdate(leadId, { status: 'converted', convertedTrip: trip._id });
     }
 
-    // ── Auto-assign if no vehicle specified ───────────────────
-    let assignedVehicle = null;
-    if (vehicleId) {
-      assignedVehicle = await Vehicle.findById(vehicleId);
-    } else {
-      assignedVehicle = await autoAssign(trip);
-    }
-
-    if (assignedVehicle) {
-      await assignTripToVehicle(trip, assignedVehicle);
-    }
-
-    // Populate references for response
+    // ── No auto-assign. Dispatch is a human decision. ─────────
+    //
+    // A new trip is created 'booked' and unassigned, and waits on the CRM
+    // dispatch board for an operator to choose a unit.
+    //
+    // This is a deliberate product decision, not an omission. The previous
+    // code called autoAssign() here, which searched the legacy Vehicle
+    // collection — empty in production, so it returned null every time and
+    // nothing was ever auto-assigned. Repointing it at Ambulance would not
+    // have restored old behaviour; it would have started new behaviour, on
+    // a patient-critical path: a trip booked from the website, the app or
+    // WhatsApp would instantly claim the nearest on-duty ambulance and fire
+    // the driver push, the full-screen call intent, the WhatsApp notice and
+    // the customer's tracking SMS with nobody in the loop.
+    //
+    // The dispatcher gets help choosing instead, not a choice made for
+    // them: GET /api/trips/:id/suggested-ambulances ranks the on-duty units
+    // by distance and the board shows them at the top of the assign list.
+    //
+    // 'vehicle' is still populated for the response shape, and is null on
+    // every new trip — it only ever resolves for the historical trips that
+    // predate the Ambulance system.
     await trip.populate(['dropHospital', 'vehicle', 'driver']);
 
     return res.status(201).json({ success: true, trip });
@@ -389,27 +372,6 @@ exports.createTrip = async (req, res, next) => {
   }
 };
 
-
-// ── Auto-assign: find closest Available ambulance ────────────
-const autoAssign = async (trip) => {
-  const available = await Vehicle.find({ status: 'available' })
-    .populate('assignedDriver', 'name phone availability');
-
-  if (!available.length) return null;
-
-  // If we have pickup coordinates, sort by GPS distance
-  if (trip.pickup.lat && trip.pickup.lng) {
-    available.sort((a, b) => {
-      const distA = (a.gps?.lat && a.gps?.lng)
-        ? haversineKm(trip.pickup.lat, trip.pickup.lng, a.gps.lat, a.gps.lng) : Infinity;
-      const distB = (b.gps?.lat && b.gps?.lng)
-        ? haversineKm(trip.pickup.lat, trip.pickup.lng, b.gps.lat, b.gps.lng) : Infinity;
-      return distA - distB;
-    });
-  }
-
-  return available[0];
-};
 
 
 // ── Shared tail: notify the driver + flip their availability to
@@ -477,15 +439,6 @@ const dispatchTripToDriver = async (trip, driverId) => {
     .catch((err) => console.error('[trackingNotifications] notifyTrackingLink failed:', err.message));
 };
 
-// ── Helper: assign trip to a specific vehicle (legacy Vehicle-sourced
-//    path) ──────────────────────────────────────────────────────────
-const assignTripToVehicle = async (trip, vehicle) => {
-  trip.vehicle   = vehicle._id;
-  trip.ambulance = (await findMatchingAmbulance(vehicle.registrationNumber))?._id || undefined;
-  await Vehicle.findByIdAndUpdate(vehicle._id, { status: 'on_trip' });
-  await dispatchTripToDriver(trip, vehicle.assignedDriver);
-};
-
 // ── Helper: assign trip to an on-duty Ambulance operator (owner or
 //    driver — same "someone is on shift on this Ambulance" shape either
 //    way). No Ambulance.status change needed: 'assigned' already covers
@@ -506,9 +459,9 @@ const assignTripToAmbulance = async (trip, ambulance) => {
 // ============================================================
 exports.assignVehicle = async (req, res, next) => {
   try {
-    const { vehicleId, ambulanceId } = req.body;
-    if (!vehicleId && !ambulanceId) {
-      return res.status(400).json({ success: false, message: 'vehicleId or ambulanceId is required.' });
+    const { ambulanceId } = req.body;
+    if (!ambulanceId) {
+      return res.status(400).json({ success: false, message: 'ambulanceId is required.' });
     }
 
     const trip = await Trip.findById(req.params.id);
@@ -517,30 +470,22 @@ exports.assignVehicle = async (req, res, next) => {
       return res.status(400).json({ success: false, message: `Cannot reassign a ${trip.status} trip.` });
     }
 
-    // Release previous vehicle if any — no equivalent release needed on
-    // the Ambulance side even when reassigning away from one: Ambulance.
-    // status stays 'assigned' for the whole duty shift regardless of
-    // individual trips (see assignTripToAmbulance's comment).
-    if (trip.vehicle) {
-      await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
+    // No release step when reassigning. Ambulance.status stays 'assigned'
+    // for the whole duty shift regardless of individual trips (see
+    // assignTripToAmbulance), and the old `if (trip.vehicle) release it`
+    // branch was a no-op: trip.vehicle is null on every trip created since
+    // the Ambulance system, and on the historical ones it points at a
+    // Vehicle document that no longer exists.
+    const ambulance = await Ambulance.findById(ambulanceId).populate('assignedDriver', 'availability');
+    if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
+    if (computeAmbulanceDisplayStatus(ambulance) !== 'available') {
+      return res.status(400).json({ success: false, message: 'Selected ambulance is not available.' });
     }
+    await assignTripToAmbulance(trip, ambulance);
 
-    if (ambulanceId) {
-      const ambulance = await Ambulance.findById(ambulanceId).populate('assignedDriver', 'availability');
-      if (!ambulance) return res.status(404).json({ success: false, message: 'Ambulance not found.' });
-      if (computeAmbulanceDisplayStatus(ambulance) !== 'available') {
-        return res.status(400).json({ success: false, message: 'Selected ambulance is not available.' });
-      }
-      await assignTripToAmbulance(trip, ambulance);
-    } else {
-      const vehicle = await Vehicle.findById(vehicleId);
-      if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found.' });
-      if (vehicle.status !== 'available') {
-        return res.status(400).json({ success: false, message: 'Selected vehicle is not available.' });
-      }
-      await assignTripToVehicle(trip, vehicle);
-    }
-
+    // 'vehicle' stays in the populate list so the response shape is
+    // unchanged for the CRM; it resolves to null for anything but a
+    // historical trip.
     await trip.populate(['vehicle', 'ambulance', 'driver', 'dropHospital']);
 
     return res.json({ success: true, trip });

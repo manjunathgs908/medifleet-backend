@@ -14,7 +14,10 @@
 
 'use strict';
 
-const { Trip, Vehicle, User, Bill, Income, Notification, Hospital, Lead, ChatMessage, computeSegmentAmount } = require('../models');
+// No Vehicle here any more. Trip.vehicle is still read (populated on
+// trips old enough to predate the Ambulance system) but nothing in this
+// controller writes the Vehicle collection.
+const { Trip, User, Bill, Income, Notification, Hospital, Lead, ChatMessage, computeSegmentAmount } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 const { sendPush } = require('../utils/pushService');
@@ -1101,9 +1104,6 @@ exports.completeTrip = async (req, res, next) => {
     });
 
     // ── 5. Release vehicle & driver ───────────────────────────
-    if (trip.vehicle) {
-      await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
-    }
     if (trip.driver) {
       await User.findByIdAndUpdate(trip.driver, {
         $set: {
@@ -1194,7 +1194,6 @@ exports.declineTrip = async (req, res, next) => {
       return res.status(400).json({ success: false, message: `Cannot decline a trip with status '${trip.status}'.` });
     }
 
-    const previousVehicle = trip.vehicle;
     const previousDriver  = trip.driver;
 
     TripCallEvent.create({
@@ -1211,9 +1210,6 @@ exports.declineTrip = async (req, res, next) => {
     trip.driverConfirmed = false; // defensive — trip is unassigned again anyway
     await trip.save();
 
-    if (previousVehicle) {
-      await Vehicle.findByIdAndUpdate(previousVehicle, { status: 'available' });
-    }
     if (previousDriver) {
       await User.findByIdAndUpdate(previousDriver, {
         'availability.status'   : 'available',
@@ -1249,9 +1245,6 @@ exports.cancelTrip = async (req, res, next) => {
     await trip.save();
 
     // Release vehicle
-    if (trip.vehicle) {
-      await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
-    }
     if (trip.driver) {
       await User.findByIdAndUpdate(trip.driver, { 'availability.status': 'available' });
     }
@@ -1298,9 +1291,6 @@ exports.customerCancelTrip = async (req, res, next) => {
     trip.cancellationReason = reason || 'Cancelled by customer';
     await trip.save();
 
-    if (trip.vehicle) {
-      await Vehicle.findByIdAndUpdate(trip.vehicle, { status: 'available' });
-    }
     if (trip.driver) {
       await User.findByIdAndUpdate(trip.driver, { 'availability.status': 'available' });
     }
@@ -1572,20 +1562,10 @@ exports.getLiveBoard = async (req, res, next) => {
       .populate('dropHospital', 'name address')
       .sort({ createdAt: 1 });
 
-    const vehicles = await Vehicle.find({ status: 'available' })
-      .populate('assignedDriver', 'name phone');
-    const vehicleEntries = vehicles.map(v => ({
-      _id               : v._id,
-      registrationNumber: v.registrationNumber,
-      assignedDriver    : v.assignedDriver,
-      source            : 'vehicle',
-    }));
-
-    // Merge in on-duty, not-currently-mid-trip Ambulances — the same
-    // "someone I can dispatch to" concept the legacy Vehicle list
-    // already represents, just sourced from the newer Ambulance/
-    // Assignment/Shift system (see ambulanceController.
-    // listAmbulancesAdmin for the CRM's own read of this same data).
+    // On-duty, not-currently-mid-trip Ambulances. This used to be merged
+    // with a Vehicle.find({status:'available'}) list; that half is gone
+    // with the rest of the legacy path, and could not match anything
+    // anyway.
     const ambulances = await Ambulance.find({ status: 'assigned', isActive: true })
       .populate('assignedDriver', 'name phone availability')
       // Whose unit this is. A dispatcher choosing between two available
@@ -1606,7 +1586,7 @@ exports.getLiveBoard = async (req, res, next) => {
         } : null,
       }));
 
-    const availableVehicles = [...vehicleEntries, ...ambulanceEntries];
+    const availableVehicles = ambulanceEntries;
 
     // Drivers get masked calling (POST /api/call/connect) instead of the
     // customer's raw number — owner/CRM still sees it for support/dispatch.

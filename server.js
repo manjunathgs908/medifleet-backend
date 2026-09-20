@@ -48,7 +48,6 @@ mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.error('Database connection error:', err));
 
 const authRoutes     = require('./routes/auth');
-const vehicleRoutes  = require('./routes/vehicles');
 const billingRoutes  = require('./routes/billing');
 const tripRoutes     = require('./routes/trips');
 const hospitalRoutes = require('./routes/hospitals');
@@ -72,7 +71,6 @@ const sosRoutes = require('./routes/sos');
 const whatsappRoutes = require('./routes/whatsappRoutes');
 const whatsappLeadRoutes = require('./routes/whatsappLeads');
 app.use('/api/auth',      authRoutes);
-app.use('/api/vehicles',  vehicleRoutes);
 app.use('/api/billing',   billingRoutes);
 app.use('/api/trips',     tripRoutes);
 app.use('/api/hospitals', hospitalRoutes);

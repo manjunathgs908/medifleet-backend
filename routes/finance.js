@@ -20,7 +20,7 @@ router.post('/income', protect, authorize('owner'), async (req, res, next) => {
 });
 
 router.get('/loans', protect, authorize('owner'), async (req, res, next) => {
-  try { const loans = await Loan.find().populate('vehicle'); res.json({ success: true, loans }); } catch(err) { next(err); }
+  try { const loans = await Loan.find(); res.json({ success: true, loans }); } catch(err) { next(err); }
 });
 
 router.post('/loans', protect, authorize('owner'), async (req, res, next) => {

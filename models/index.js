@@ -1022,7 +1022,11 @@ const Income = mongoose.model('Income', incomeSchema);
 // ============================================================
 const loanSchema = new Schema(
   {
-    vehicle     : { type: Schema.Types.ObjectId, ref: 'Vehicle', required: true },
+    // No vehicle ref. It was `ref:'Vehicle', required:true`, which tied
+    // every loan to a collection that is now empty and has no routes. The
+    // collection is empty too (loans = 0), so nothing is orphaned by
+    // dropping it. If vehicle finance is wanted again it should be
+    // modelled against Ambulance from scratch rather than inheriting this.
     lenderName  : { type: String, required: true },
     accountNumber: String,
 
@@ -1100,49 +1104,6 @@ const salaryRecordSchema = new Schema(
 salaryRecordSchema.index({ driver: 1, month: 1, year: 1 }, { unique: true });
 
 const SalaryRecord = mongoose.model('SalaryRecord', salaryRecordSchema);
-
-
-// ============================================================
-// 13. SERVICE LOG MODEL
-// ============================================================
-const serviceLogSchema = new Schema(
-  {
-    vehicle     : { type: Schema.Types.ObjectId, ref: 'Vehicle', required: true },
-    serviceType : {
-      type    : String,
-      enum    : ['oil_change', 'tyre_replacement', 'oxygen_refill', 'battery', 'brake', 'general_service', 'other'],
-      required: true,
-    },
-
-    date          : { type: Date, required: true, default: Date.now },
-    odometerReading: { type: Number },
-    vendor        : { type: String },
-    cost          : { type: Number },
-    description   : { type: String },
-    receiptUrl    : { type: String },
-
-    // â”€â”€ Tyre-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    tyre: {
-      position: { type: String, enum: ['FL', 'FR', 'RL', 'RR', 'spare'] },
-      brand   : String,
-    },
-
-    // â”€â”€ O2 Cylinder-specific â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    oxygen: {
-      cylinderId  : String,
-      fillLevelPct: Number,
-    },
-
-    // â”€â”€ Next service reminder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    nextServiceDate  : Date,
-    nextServiceOdoKm : Number,
-
-    loggedBy : { type: Schema.Types.ObjectId, ref: 'User' },
-  },
-  { timestamps: true }
-);
-
-const ServiceLog = mongoose.model('ServiceLog', serviceLogSchema);
 
 
 // ============================================================
@@ -1281,7 +1242,6 @@ module.exports = {
   Income,
   Loan,
   SalaryRecord,
-  ServiceLog,
   Notification,
   Advance,
   Pricing,

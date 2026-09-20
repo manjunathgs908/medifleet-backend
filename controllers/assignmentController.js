@@ -68,20 +68,62 @@ exports.startDuty = async (req, res, next) => {
     // is the actual cross-tenant guard — without it, a driver could POST
     // any ambulanceId directly (bypassing available-ambulances' listing
     // entirely) and start duty on another owner's ambulance.
+    // The driverLock clause rides INSIDE this same filter on purpose. A
+    // separate "is it locked to me?" read before the update would be a
+    // check-then-act: the lock could change between the two, and more to
+    // the point it would turn one atomic write into two round trips and
+    // reintroduce exactly the race this findOneAndUpdate exists to avoid.
+    // One write still decides both questions — is it free, and may I have
+    // it — so the concurrency guarantee is unchanged.
     const ambulance = await Ambulance.findOneAndUpdate(
-      { _id: ambulanceId, status: 'available', owner: req.user.owner },
+      {
+        _id   : ambulanceId,
+        status: 'available',
+        owner : req.user.owner,
+        $or: [
+          { driverLock: { $ne: 'locked' } },
+          { driverLock: 'locked', defaultDriver: driverId },
+        ],
+      },
       { status: 'assigned', assignedDriver: driverId },
       { new: true }
     );
     if (!ambulance) {
-      // Scoped by owner too, so a foreign ambulance reports "not found"
-      // rather than confirming it exists under someone else's fleet.
-      const exists = await Ambulance.exists({ _id: ambulanceId, owner: req.user.owner });
+      // Three reasons the claim can miss, and the driver can act on each
+      // differently: someone else is on it, it is reserved for another
+      // driver, or it is not theirs to see. Scoped by owner throughout, so
+      // a foreign ambulance still reports "not found" rather than
+      // confirming it exists under someone else's fleet.
+      const amb = await Ambulance.findOne({ _id: ambulanceId, owner: req.user.owner })
+        .select('registrationNumber status driverLock defaultDriver')
+        .populate('defaultDriver', 'name');
+
+      if (!amb) {
+        return res.status(409).json({ success: false, message: 'Ambulance not found.' });
+      }
+
+      if (amb.driverLock === 'locked' && String(amb.defaultDriver?._id || amb.defaultDriver || '') !== String(driverId)) {
+        return res.status(409).json({
+          success: false,
+          code   : 'AMBULANCE_LOCKED',
+          message: amb.defaultDriver?.name
+            ? `${amb.registrationNumber} is reserved for ${amb.defaultDriver.name}. Please pick a different ambulance.`
+            : `${amb.registrationNumber} is reserved for another driver. Please pick a different ambulance.`,
+        });
+      }
+
+      if (amb.status === 'maintenance') {
+        return res.status(409).json({
+          success: false,
+          code   : 'AMBULANCE_MAINTENANCE',
+          message: `${amb.registrationNumber} is marked for maintenance. Please pick a different ambulance.`,
+        });
+      }
+
       return res.status(409).json({
         success: false,
-        message: exists
-          ? 'This ambulance was just taken by another driver. Please pick a different one.'
-          : 'Ambulance not found.',
+        code   : 'AMBULANCE_TAKEN',
+        message: 'This ambulance was just taken by another driver. Please pick a different one.',
       });
     }
 

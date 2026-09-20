@@ -67,9 +67,8 @@ exports.issueOwnerSession = sendTokenResponse;
 
 // ============================================================
 // @route   POST /api/owners/send-otp
-// @desc    Register a new Owner (first call for a phone) or resend an
-//          OTP to an existing one. `name` is required only when the
-//          phone hasn't been seen before.
+// @desc    Send a login OTP to an Owner that already exists. Creates
+//          nothing — registration is POST /api/owners/register.
 // @access  Public
 // ============================================================
 exports.sendOtp = async (req, res, next) => {

@@ -1932,3 +1932,93 @@ exports.trackTrip = async (req, res, next) => {
     next(err);
   }
 };
+
+// ============================================================
+// @route   GET /api/trips/:id/suggested-ambulances
+// @desc    On-duty, free ambulances ranked by how close their driver is
+//          to this trip's pickup point.
+// @access  Private [CRM owner/admin]
+//
+// A ranking, not a decision. Dispatch stays manual (see createTrip) — this
+// exists so the operator picks from a sorted list instead of scanning an
+// unordered one, and still clicks to assign.
+//
+// Distance is straight-line from the DRIVER's last reported position, not
+// the ambulance's. Ambulance has no location of its own; the live fix
+// comes from User.availability, written by the driver app's periodic
+// location ping. That also means it is only ever as good as the last ping,
+// which is why every row carries how old it is and the caller is expected
+// to show it.
+// ============================================================
+exports.getSuggestedAmbulances = async (req, res, next) => {
+  try {
+    const trip = await Trip.findById(req.params.id).select('pickup');
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    const pickup = trip.pickup || {};
+    const havePickup = pickup.lat != null && pickup.lng != null;
+
+    // status:'assigned' means somebody is on duty on it. The
+    // displayStatus filter then drops the ones already mid-trip, so what
+    // is left is "on duty and free right now" — the same definition
+    // getLiveBoard uses for its dispatchable list.
+    const ambulances = await Ambulance.find({ status: 'assigned', isActive: true })
+      .populate('assignedDriver', 'name phone availability')
+      .populate('owner', 'name businessName isPlatformOwner');
+
+    const now = Date.now();
+
+    const suggestions = ambulances
+      .filter((a) => computeAmbulanceDisplayStatus(a) === 'available')
+      .map((a) => {
+        const av = a.assignedDriver?.availability;
+        const hasFix = havePickup && av?.lat != null && av?.lng != null;
+
+        return {
+          _id               : a._id,
+          registrationNumber: a.registrationNumber,
+          serviceType       : a.serviceType,
+          serviceTypeLabel  : a.serviceTypeLabel,
+          source            : 'ambulance',
+          partner           : a.owner ? {
+            _id            : a.owner._id,
+            label          : a.owner.businessName || a.owner.name,
+            isPlatformOwner: !!a.owner.isPlatformOwner,
+          } : null,
+          driver            : a.assignedDriver ? {
+            _id  : a.assignedDriver._id,
+            name : a.assignedDriver.name,
+            phone: a.assignedDriver.phone,
+          } : null,
+          // null, not Infinity or 0: "we do not know" has to survive
+          // serialisation, and a 0 would sort this unit to the top as
+          // though it were on the doorstep.
+          distanceKm        : hasFix
+            ? Math.round(haversineKm(pickup.lat, pickup.lng, av.lat, av.lng) * 10) / 10
+            : null,
+          locationAgeSec    : av?.updatedAt ? Math.max(0, Math.round((now - new Date(av.updatedAt).getTime()) / 1000)) : null,
+          locationAccuracyM : av?.accuracy ?? null,
+          hasLocation       : !!hasFix,
+        };
+      })
+      // Units with no usable fix go last, flagged, rather than being
+      // hidden: they are still dispatchable, the operator just has no
+      // distance to judge them by and should be told so.
+      .sort((x, y) => {
+        if (x.hasLocation !== y.hasLocation) return x.hasLocation ? -1 : 1;
+        if (!x.hasLocation) return x.registrationNumber.localeCompare(y.registrationNumber);
+        return x.distanceKm - y.distanceKm;
+      });
+
+    return res.json({
+      success: true,
+      // Told plainly rather than implied by every row having a null
+      // distance — without pickup coordinates there is nothing to rank by
+      // and the order below is alphabetical.
+      pickupHasCoordinates: havePickup,
+      suggestions,
+    });
+  } catch (err) {
+    next(err);
+  }
+};

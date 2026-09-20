@@ -30,6 +30,9 @@ router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
 router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
 router.get('/', protectUserOrOwner, tripCtrl.getTrips);
 router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);
+// Ranked list to help the dispatcher choose. CRM admin only (protect),
+// like the assign call it feeds.
+router.get('/:id/suggested-ambulances', protect, authorize('owner'), tripCtrl.getSuggestedAmbulances);
 router.put('/:id/assign', protect, authorize('owner'), tripCtrl.assignVehicle);
 router.put('/:id/status', protect, tripCtrl.updateStatus);
 router.put('/:id/arrive-pickup', protect, tripCtrl.arrivePickup);

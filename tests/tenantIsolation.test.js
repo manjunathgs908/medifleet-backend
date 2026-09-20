@@ -75,7 +75,6 @@ const ambulanceCtrl  = require('../controllers/ambulanceController');
 const assignmentCtrl = require('../controllers/assignmentController');
 const authCtrl       = require('../controllers/authController');
 const tripCtrl       = require('../controllers/tripController');
-const fleetCtrl      = require('../controllers/fleetController');
 const auth           = require('../middleware/auth');
 
 // ── the two tenants ──────────────────────────────────────────
@@ -344,12 +343,9 @@ describe("F. and the same in reverse — A cannot reach B", () => {
     expect(User.findOneAndUpdate.mock.calls[0][0]).toEqual({ _id: B.driver, role: 'driver', owner: A.owner });
   });
 
-  test("A cannot read B's fleet", async () => {
-    Fleet.findOne = jest.fn().mockReturnValue(chain(null));
-    const res = await call(fleetCtrl.getFleetById, asA({ params: { id: 'fleetB' } }));
-    expect(res.statusCode).toBe(404);
-    expectScopedTo(Fleet.findOne, A.owner);
-  });
+  // The Fleet read/write API is gone (Phase 4) — Fleet is now an internal
+  // detail of Ambulance.fleet with no route of its own, so there is
+  // nothing left for one owner to reach on another's.
 });
 
 // ============================================================

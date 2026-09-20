@@ -38,15 +38,16 @@ exports.computeAmbulanceDisplayStatus = (amb) => {
   return 'off';
 };
 
-// No Fleet-management UI exists yet (deliberately out of scope — Fleet
-// stays an invisible implementation detail for now). If the owner didn't
-// pass a fleetId, reuse their one auto-provisioned default Fleet, or
-// create it on first use.
-async function resolveFleet(ownerId, fleetId) {
-  if (fleetId) {
-    const fleet = await Fleet.findOne({ _id: fleetId, owner: ownerId });
-    return fleet || null;
-  }
+// One implicit Fleet per owner, created on first use and never shown to
+// anyone. Fleet is now purely an implementation detail of Ambulance.fleet,
+// which is required:true on the schema and so cannot simply be dropped —
+// the field stays, the concept is gone from the API.
+//
+// No longer takes a fleetId. The user-facing Fleet concept is removed:
+// nothing in the app or CRM ever sent one (verified by grep across both
+// repos), and accepting it kept an owner-supplied id on a path that had to
+// be ownership-checked for no benefit.
+async function resolveFleet(ownerId) {
   let fleet = await Fleet.findOne({ owner: ownerId, isActive: true }).sort({ createdAt: 1 });
   if (!fleet) {
     fleet = await Fleet.create({ owner: ownerId, name: 'My Fleet' });
@@ -60,7 +61,7 @@ async function resolveFleet(ownerId, fleetId) {
 // ============================================================
 exports.createAmbulance = async (req, res, next) => {
   try {
-    const { fleetId, registrationNumber, serviceType, year, deviceId, assignedDriverId } = req.body;
+    const { registrationNumber, serviceType, year, deviceId, assignedDriverId } = req.body;
 
     // Same rule as updateAmbulance, at the other door. A new ambulance
     // cannot have an active Assignment, but seeding assignedDriver here
@@ -88,8 +89,7 @@ exports.createAmbulance = async (req, res, next) => {
       });
     }
 
-    const fleet = await resolveFleet(req.user._id, fleetId);
-    if (!fleet) return res.status(404).json({ success: false, message: 'Fleet not found for this owner.' });
+    const fleet = await resolveFleet(req.user._id);
 
     const ambulance = await Ambulance.create({
       owner : req.user._id,
@@ -109,15 +109,14 @@ exports.createAmbulance = async (req, res, next) => {
 };
 
 // ============================================================
-// @route   GET /api/ambulances?fleetId=&status=
+// @route   GET /api/ambulances?status=
 // @access  Private [owner]
 // ============================================================
 exports.getAmbulances = async (req, res, next) => {
   try {
-    const { fleetId, status } = req.query;
+    const { status } = req.query;
     const filter = { owner: req.user._id, isActive: true };
-    if (fleetId) filter.fleet = fleetId;
-    if (status)  filter.status = status;
+    if (status) filter.status = status;
 
     const ambulances = await Ambulance.find(filter)
       .populate('fleet', 'name')
@@ -157,7 +156,7 @@ exports.getAmbulanceById = async (req, res, next) => {
 // ============================================================
 exports.updateAmbulance = async (req, res, next) => {
   try {
-    const { registrationNumber, serviceType, year, deviceId, assignedDriverId, status, fleetId } = req.body;
+    const { registrationNumber, serviceType, year, deviceId, assignedDriverId, status } = req.body;
 
     // ── assignedDriver belongs to the duty lifecycle, not the owner ──
     //
@@ -213,11 +212,6 @@ exports.updateAmbulance = async (req, res, next) => {
       ambulance.status = status;
     }
 
-    if (fleetId) {
-      const fleet = await Fleet.findOne({ _id: fleetId, owner: req.user._id });
-      if (!fleet) return res.status(404).json({ success: false, message: 'Fleet not found for this owner.' });
-      ambulance.fleet = fleet._id;
-    }
     if (registrationNumber)             ambulance.registrationNumber = registrationNumber;
     if (serviceType) {
       const typeInfo = byServiceType[serviceType];

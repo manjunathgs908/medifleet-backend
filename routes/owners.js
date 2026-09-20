@@ -9,6 +9,14 @@ const { sendOtpLimiter, verifyLimiter } = require('../middleware/otpRateLimit');
 router.post('/send-otp',   sendOtpLimiter, ownerCtrl.sendOtp);
 router.post('/verify-otp', verifyLimiter, ownerCtrl.verifyOtp);
 
+// Public — partner registration. The only path that creates an Owner.
+// Same limiters as login and for the same reason: /register/send-otp
+// spends an SMS per call, and /register is the endpoint an attacker would
+// pound to guess a code, so it gets verifyLimiter rather than the looser
+// send limiter.
+router.post('/register/send-otp', sendOtpLimiter, ownerCtrl.sendRegistrationOtp);
+router.post('/register',          verifyLimiter,  ownerCtrl.register);
+
 // Private [owner] — the fleet-Owner's own app session (protectOwner).
 // Deliberately ungated on kycStatus: an owner must always be able to log
 // in, check their own status/rejection reason, and upload/re-upload KYC

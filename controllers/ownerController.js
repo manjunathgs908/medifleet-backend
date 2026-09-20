@@ -19,6 +19,7 @@
 const jwt    = require('jsonwebtoken');
 const crypto = require('crypto');
 const Owner  = require('../models/Owner');
+const PartnerRegistrationOtp = require('../models/PartnerRegistrationOtp');
 const { User } = require('../models');
 const { sendTokenResponse: sendDriverTokenResponse } = require('./authController');
 const smsService = require('../utils/smsService');
@@ -289,6 +290,163 @@ exports.actAsDriver = async (req, res, next) => {
     shadowDriver.deviceId = deviceId;
 
     return sendDriverTokenResponse(shadowDriver, 200, res, deviceId);
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// PARTNER REGISTRATION — the only place an Owner is ever created.
+//
+// Two steps on purpose. There is no Owner document yet, so the code cannot
+// be stored on the account the way a returning owner's is; it lives in
+// PartnerRegistrationOtp until it is spent. The Owner is written only after
+// the code is proven, which is what stops an unverified row being created
+// for a number the caller does not control — the bug this replaces.
+// ============================================================
+
+const PHONE_RE = /^[6-9]\d{9}$/;
+
+// ============================================================
+// @route   POST /api/owners/register/send-otp
+// @desc    Send a verification code to a phone that wants to register.
+// @access  Public (rate limited — sendOtpLimiter)
+// ============================================================
+exports.sendRegistrationOtp = async (req, res, next) => {
+  try {
+    const { phone } = req.body;
+    if (!phone || !PHONE_RE.test(phone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
+    }
+
+    // An already-registered number is answered exactly like a new one, and
+    // no code is sent to it. Saying "already registered" here would hand
+    // back the directory lookup /send-otp was just cleaned of — this
+    // endpoint is reachable by anyone. A partner who already has an account
+    // gets where they are going by logging in.
+    const existing = await Owner.findOne({ phone }).select('_id');
+    if (existing) {
+      return res.json({ success: true, message: `OTP sent to ${phone}.` });
+    }
+
+    const otp = generateOtp();
+
+    // One live code per number: a resend replaces the previous record
+    // rather than leaving several valid codes outstanding, and resets
+    // attempts so a mistyped first code cannot lock a fresh one.
+    await PartnerRegistrationOtp.findOneAndUpdate(
+      { phone },
+      { phone, otp, otpExpiry: otpExpiryFromNow(), attempts: 0 },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+
+    await smsService.sendOtp(phone, otp);
+
+    const devPayload = process.env.NODE_ENV === 'development' ? { otp } : {};
+    return res.json({ success: true, message: `OTP sent to ${phone}.`, ...devPayload });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/owners/register
+// @desc    Verify the code and create the Owner at kycStatus 'pending'.
+// @access  Public (rate limited — verifyLimiter)
+// ============================================================
+exports.register = async (req, res, next) => {
+  try {
+    const { phone, otp, name, businessName, gstin, pan, bankDetails } = req.body;
+
+    if (!phone || !otp) {
+      return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
+    }
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Name is required.' });
+    }
+    if (!businessName || !businessName.trim()) {
+      return res.status(400).json({ success: false, message: 'Business name is required.' });
+    }
+
+    const record = await PartnerRegistrationOtp.findOne({ phone }).select('+otp');
+    if (!record) {
+      return res.status(400).json({ success: false, code: 'OTP_INVALID', message: 'Incorrect code. Please request a new one.' });
+    }
+    if (record.isExpired()) {
+      return res.status(410).json({ success: false, code: 'OTP_EXPIRED', message: 'This code has expired. Please request a new one.' });
+    }
+    if (record.isLocked()) {
+      return res.status(429).json({ success: false, code: 'OTP_LOCKED', message: 'Too many incorrect attempts. Please request a new code.' });
+    }
+    if (!record.matches(otp)) {
+      record.attempts += 1;
+      await record.save();
+      const left = Math.max(0, PartnerRegistrationOtp.MAX_ATTEMPTS - record.attempts);
+      return res.status(400).json({
+        success: false,
+        code   : 'OTP_INVALID',
+        attemptsRemaining: left,
+        message: left > 0
+          ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} remaining.`
+          : 'Incorrect code. Please request a new one.',
+      });
+    }
+
+    // Code proven. Note what is NOT read out of req.body: kycStatus and
+    // isPlatformOwner. Both are a CRM admin's decision, never the
+    // registrant's — spreading req.body here would let anyone register
+    // themselves pre-approved and onto SaveLife's payroll.
+    let owner;
+    try {
+      owner = await Owner.create({
+        phone,
+        name        : name.trim(),
+        businessName: businessName.trim(),
+        gstin       : gstin || undefined,
+        pan         : pan || undefined,
+        bankDetails : bankDetails ? {
+          accountName  : bankDetails.accountName,
+          accountNumber: bankDetails.accountNumber,
+          ifsc         : bankDetails.ifsc,
+          bankName     : bankDetails.bankName,
+        } : undefined,
+        kycStatus: 'pending',
+      });
+    } catch (err) {
+      // phone carries a unique index, so two registrations racing the same
+      // number end up here rather than creating a duplicate.
+      if (err.code === 11000) {
+        return res.status(409).json({ success: false, message: 'This number is already registered. Please log in instead.' });
+      }
+      // A bad GSTIN/PAN/IFSC shape arrives as a ValidationError. Report it
+      // as a 400 naming the field rather than a 500.
+      if (err.name === 'ValidationError') {
+        const first = Object.values(err.errors)[0];
+        return res.status(400).json({ success: false, message: first ? first.message : 'Invalid registration details.' });
+      }
+      throw err;
+    }
+
+    // Spend the code only once the Owner exists, so a failed create leaves
+    // the partner able to retry with the same SMS.
+    await PartnerRegistrationOtp.deleteOne({ _id: record._id });
+
+    // No session is issued here. kycStatus is 'pending' and every owner
+    // route worth reaching sits behind requireKycApproved anyway — the
+    // partner logs in normally once an admin approves them, and sees their
+    // own status through /api/owners/me until then.
+    return res.status(201).json({
+      success: true,
+      message: 'Registration submitted. SaveLife will review and approve your account.',
+      owner  : {
+        id          : owner._id,
+        name        : owner.name,
+        businessName: owner.businessName,
+        phone       : owner.phone,
+        kycStatus   : owner.kycStatus,
+      },
+    });
   } catch (err) {
     next(err);
   }

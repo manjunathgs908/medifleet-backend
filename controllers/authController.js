@@ -26,6 +26,10 @@ const { isPlatformDriver } = require('../utils/platformOwner');
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
+// Mirrors the enum on User.shiftHours. A fixed posting length, not a
+// schedule — see the field's comment in models/index.js.
+const SHIFT_HOURS = [8, 12, 24];
+
 // ── Logout safety rule — ambulance operations, not a generic nicety.
 // Live-checked every call (never a cached/stale flag): a driver on duty
 // or mid-trip must not be logged out, voluntarily or by an owner's
@@ -545,7 +549,9 @@ exports.listDrivers = async (req, res, next) => {
     if (approvalStatus) filter.approvalStatus = approvalStatus;
 
     const drivers = await User.find(filter)
-      .select('name employeeId phone deviceId approvalStatus rejectionReason driverDocuments')
+      // shiftHours included so the owner's driver list can show which
+      // drivers are configured for attendance and which silently are not.
+      .select('name employeeId phone deviceId approvalStatus rejectionReason driverDocuments shiftHours')
       .sort({ name: 1 });
     return res.json({ success: true, drivers });
   } catch (err) {
@@ -569,7 +575,7 @@ exports.listDrivers = async (req, res, next) => {
 // ============================================================
 exports.createDriverAccount = async (req, res, next) => {
   try {
-    const { name, phone, assignedAmbulanceId } = req.body;
+    const { name, phone, assignedAmbulanceId, shiftHours } = req.body;
     if (!name || !phone) {
       return res.status(400).json({ success: false, message: 'name and phone are required.' });
     }
@@ -598,6 +604,18 @@ exports.createDriverAccount = async (req, res, next) => {
       });
     }
 
+    // Optional, and only meaningful for a SaveLife-employed driver: the
+    // auto-attendance write in endDuty skips a driver whose shiftHours is
+    // unset rather than guessing a threshold, so a driver added without it
+    // silently never accrues attendance. Collecting it here is what stops
+    // that being a surprise found at payroll time.
+    if (shiftHours !== undefined && !SHIFT_HOURS.includes(Number(shiftHours))) {
+      return res.status(400).json({
+        success: false,
+        message: `shiftHours must be one of: ${SHIFT_HOURS.join(', ')}.`,
+      });
+    }
+
     const existingIds = await User.find({ employeeId: /^DRV-\d+$/ }).select('employeeId').lean();
     const maxNum = existingIds.reduce((max, d) => {
       const n = parseInt(d.employeeId.split('-')[1], 10);
@@ -613,6 +631,10 @@ exports.createDriverAccount = async (req, res, next) => {
       approvalStatus     : 'pending',
       owner              : req.user._id, // links this driver to the Owner creating them (Phase 4 ambulance-picker scoping)
       assignedAmbulanceId: assignedAmbulanceId || undefined,
+      // undefined, not 0 or a default — the schema has no default on
+      // shiftHours on purpose, and "unset" is the value endDuty and the
+      // geofence check both read as "not configured, skip".
+      shiftHours         : shiftHours !== undefined ? Number(shiftHours) : undefined,
     });
 
     return res.status(201).json({
@@ -625,6 +647,57 @@ exports.createDriverAccount = async (req, res, next) => {
         phone         : user.phone,
         approvalStatus: user.approvalStatus,
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/driver-auth/:id/shift-hours
+// @desc    Set or clear a driver's fixed posting length.
+// @access  Private [owner] (protectOwner)
+//
+// Exists because shiftHours is what gates the auto-attendance write in
+// endDuty: a driver whose shiftHours is unset never accrues an Attendance
+// row, silently, and the owner has no other way to fix that after the
+// driver was added. Pass null to clear it back to "not configured".
+//
+// Scoped by owner:req.user._id like every other driver-management route
+// here, so one partner cannot reconfigure another's driver.
+// ============================================================
+exports.setDriverShiftHours = async (req, res, next) => {
+  try {
+    const { shiftHours } = req.body;
+
+    if (shiftHours !== null && !SHIFT_HOURS.includes(Number(shiftHours))) {
+      return res.status(400).json({
+        success: false,
+        message: `shiftHours must be one of: ${SHIFT_HOURS.join(', ')}, or null to clear it.`,
+      });
+    }
+
+    // $unset rather than setting null: the enum would reject null, and
+    // "absent" is the exact state endDuty and the geofence check read as
+    // "not configured, skip".
+    const update = shiftHours === null
+      ? { $unset: { shiftHours: '' } }
+      : { shiftHours: Number(shiftHours) };
+
+    const user = await User.findOneAndUpdate(
+      { _id: req.params.id, role: 'driver', owner: req.user._id },
+      update,
+      { new: true, runValidators: true },
+    );
+    if (!user) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+    return res.json({
+      success: true,
+      message: shiftHours === null
+        ? `Shift hours cleared for ${user.name}.`
+        : `${user.name} is now on a ${shiftHours}-hour shift.`,
+      driver : { id: user._id, name: user.name, shiftHours: user.shiftHours ?? null },
     });
   } catch (err) {
     next(err);

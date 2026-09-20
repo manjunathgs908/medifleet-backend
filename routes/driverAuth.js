@@ -30,5 +30,8 @@ router.post('/register',           protectOwner, authorize('owner'), requireKycA
 router.put ('/:id/approve',        protectOwner, authorize('owner'), requireKycApproved, authCtrl.approveDriver);
 router.put ('/:id/reject',         protectOwner, authorize('owner'), requireKycApproved, authCtrl.rejectDriver);
 router.put ('/:id/unbind-device',  protectOwner, authorize('owner'), requireKycApproved, authCtrl.unbindDevice);
+// Fixed posting length. Gates the auto-attendance write in endDuty, so a
+// driver added without it accrues no attendance until this is set.
+router.put ('/:id/shift-hours',    protectOwner, authorize('owner'), requireKycApproved, authCtrl.setDriverShiftHours);
 
 module.exports = router;

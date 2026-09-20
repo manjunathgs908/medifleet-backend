@@ -34,6 +34,7 @@
 'use strict';
 
 const { SalaryRecord, Attendance, Trip, User, Expense, Notification } = require('../models');
+const { isPlatformDriver, platformDriverIds } = require('../utils/platformOwner');
 
 // ── Count working days in a given month (Mon–Sat, no Sundays) ─
 const getWorkingDays = (month, year) => {
@@ -68,7 +69,12 @@ exports.calculateSalaries = async (req, res, next) => {
     }
 
     // ── All active drivers ────────────────────────────────────
-    const drivers = await User.find({ role: 'driver', isActive: true });
+    // Payroll considers SaveLife's own drivers only. A partner employs and
+    // pays theirs; computing a salary for someone we do not employ invents a
+    // liability that approveSalary/markSalaryPaid would then act on.
+    // platformDriverIds fails closed — an unlinked driver is not ours.
+    const ourDriverIds = await platformDriverIds();
+    const drivers = await User.find({ role: 'driver', isActive: true, _id: { $in: ourDriverIds } });
     if (!drivers.length) {
       return res.status(404).json({ success: false, message: 'No active drivers found.' });
     }
@@ -189,6 +195,14 @@ exports.getPayslip = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Access denied.' });
     }
 
+    // Partner drivers have no SaveLife payslip. 404, not 403: "no salary
+    // record for this period" is the literal truth and is the same answer a
+    // platform driver gets for a month that was never run, so this cannot be
+    // used to sort drivers into ours and theirs.
+    if (!await isPlatformDriver(driverId)) {
+      return res.status(404).json({ success: false, message: 'No salary record found for this period.' });
+    }
+
     const record = await SalaryRecord.findOne({
       driver: driverId,
       month : Number(month),
@@ -215,7 +229,12 @@ exports.getPayrollSummary = async (req, res, next) => {
   try {
     const { month, year } = req.params;
 
-    const records = await SalaryRecord.find({ month: Number(month), year: Number(year) })
+    // Same population as calculateSalaries. Records for partner drivers
+    // should not exist at all after this change, but historical rows written
+    // before it do — filtering here keeps them off the summary rather than
+    // relying on the table being clean.
+    const ourDriverIds = await platformDriverIds();
+    const records = await SalaryRecord.find({ month: Number(month), year: Number(year), driver: { $in: ourDriverIds } })
       .populate('driver', 'name phone');
 
     const summary = {

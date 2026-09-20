@@ -73,15 +73,28 @@ exports.issueOwnerSession = sendTokenResponse;
 // ============================================================
 exports.sendOtp = async (req, res, next) => {
   try {
-    const { phone, name } = req.body;
+    const { phone } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
 
-    let owner = await Owner.findOne({ phone }).select('+otp +otpExpiry +otpAttempts');
+    const owner = await Owner.findOne({ phone }).select('+otp +otpExpiry +otpAttempts');
+
+    // An unknown number gets the SAME answer a known one does, and nothing
+    // is created. Two separate reasons, both load-bearing:
+    //
+    //  1. Directory. A distinguishable response here turns this endpoint
+    //     into a lookup: feed it numbers, keep the ones that come back
+    //     different. authController.sendOtp already refuses to do that and
+    //     this must match it.
+    //  2. This used to `new Owner({ phone, name })` and save it below,
+    //     BEFORE any code was verified — so anyone who could reach this
+    //     route could mint a real Owner row for a number they do not own.
+    //     Registration is now an explicit, OTP-verified act:
+    //     POST /api/owners/register.
+    //
+    // The app never learns "not registered" from here. It shows Register as
+    // Partner unconditionally, which needs no server signal at all.
     if (!owner) {
-      if (!name) {
-        return res.status(400).json({ success: false, message: 'Name is required to register a new owner.' });
-      }
-      owner = new Owner({ phone, name });
+      return res.json({ success: true, message: `OTP sent to ${phone}.` });
     }
 
     const otpExpiry = otpExpiryFromNow();

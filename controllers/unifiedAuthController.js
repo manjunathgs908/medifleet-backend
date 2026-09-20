@@ -6,7 +6,9 @@
  * collection a phone belongs to:
  *   - Owner exists                    -> owner session
  *   - No Owner, active driver exists  -> driver session
- *   - Neither exists                  -> register a new Owner (name required)
+ *   - Neither exists                  -> nothing. Answered exactly like a
+ *     number that was sent a code, and no account is created. Registration
+ *     is an explicit, OTP-verified act: POST /api/owners/register.
  *   - Both exist                      -> Owner wins (they can still act as
  *     their own driver via the existing actAsDriver flow)
  *
@@ -18,9 +20,10 @@
  * reuses their existing token-issuing functions instead of reimplementing
  * them; the send-otp/verify-otp bodies below intentionally mirror
  * authController.sendOtp/verifyOtp and ownerController.sendOtp/verifyOtp
- * almost line-for-line so behavior (test-OTP allowlist, device-binding,
- * new-owner registration) stays identical to those two untouched
- * endpoints — only the "which collection" decision is new.
+ * almost line-for-line so behavior (test-OTP allowlist, device-binding)
+ * stays identical to those two untouched endpoints — only the "which
+ * collection" decision is new. The new-owner branch the three of them once
+ * shared is gone from all of them.
  * ============================================================
  */
 'use strict';
@@ -70,11 +73,16 @@ async function sendOtpFor(doc, phone, res) {
 
   await smsService.sendOtp(phone, otp);
 
+  // No `role` here, deliberately. It named the collection the number was
+  // found in, which made the three outcomes (owner / driver / unknown)
+  // tell themselves apart in the response body — the same directory leak
+  // the neutral unknown-number branch below exists to close. Nothing reads
+  // it: LoginScreen only acts on the verify response, and App.js branches
+  // on user.role from there.
   const devPayload = process.env.NODE_ENV === 'development' ? { otp } : {};
   return res.json({
     success: true,
     message: `OTP sent to ${phone}.`,
-    role: doc.constructor.modelName === 'Owner' ? 'owner' : 'driver',
     ...devPayload,
   });
 }
@@ -85,7 +93,7 @@ async function sendOtpFor(doc, phone, res) {
 // ============================================================
 exports.sendOtp = async (req, res, next) => {
   try {
-    const { phone, name } = req.body;
+    const { phone } = req.body;
     if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
     if (!PHONE_RE.test(phone)) {
       return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
@@ -98,13 +106,19 @@ exports.sendOtp = async (req, res, next) => {
     const driver = await User.findOne({ phone, isActive: true }).select('+otp +otpExpiry +otpAttempts');
     if (driver) return sendOtpFor(driver, phone, res);
 
-    // Neither exists — same "brand new -> register as Owner" path
-    // ownerController.sendOtp already has, just reached without a tab.
-    if (!name) {
-      return res.status(400).json({ success: false, message: 'Name is required to register a new owner.' });
-    }
-    const newOwner = new Owner({ phone, name });
-    return sendOtpFor(newOwner, phone, res);
+    // Neither exists. Answer exactly as though a code had been sent, and
+    // create nothing.
+    //
+    // This branch used to `new Owner({ phone, name })` and save it inside
+    // sendOtpFor — an unverified Owner row for any number anyone typed.
+    // Owners are now created only by POST /api/owners/register, which
+    // verifies possession of the phone first.
+    //
+    // No `role` in this response: the field tells the caller which
+    // collection the number was found in, so returning one here would leak
+    // the very fact this branch exists. An unknown number is
+    // indistinguishable from a driver who was sent a code.
+    return res.json({ success: true, message: `OTP sent to ${phone}.` });
   } catch (err) {
     next(err);
   }

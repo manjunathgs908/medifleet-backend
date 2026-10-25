@@ -289,4 +289,37 @@ async function notifyTrackingLink(trip, url) {
   return res;
 }
 
-module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted, notifyTrackingLink };
+// ============================================================
+// @desc  A "Quote & Confirm" link from the CRM (controllers/
+//        quoteController.js). The customer has usually not messaged us in
+//        the last 24h -- the operator is on a phone call with them -- so a
+//        plain text would be dropped and this has to be a template.
+//
+//        Template booking_quote_link (Utility, body-only, one variable):
+//          🚑 SaveLife Ambulance
+//          Please confirm your ambulance booking. Set your pickup
+//          location, check the fare and confirm here:
+//          {{1}} quote URL
+//
+//        Same contract as tracking_link: must be approved in Meta Business
+//        Manager under exactly this name before it delivers, and a send
+//        before then comes back as a skip with a reason, not a crash.
+//
+// @param phone  10-digit number, already normalised by the caller.
+// ============================================================
+async function notifyQuoteLink(phone, url) {
+  if (!phone) return { skipped: true, reason: 'no phone' };
+  if (!url)   return { skipped: true, reason: 'no quote url' };
+
+  const res = await whatsapp.sendTemplate(
+    `91${phone}`,
+    'booking_quote_link',
+    TEMPLATE_LANG,
+    bodyComponents(url),
+  );
+
+  if (!res) return { skipped: true, reason: 'WhatsApp send failed — is the booking_quote_link template approved?' };
+  return res;
+}
+
+module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted, notifyTrackingLink, notifyQuoteLink };

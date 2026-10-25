@@ -193,54 +193,61 @@ exports.verifyBookingOtp = async (req, res, next) => {
 //          writes nothing.
 // @access  Private [all CRM staff]
 // ============================================================
+// The quote itself, shared by estimateTrip and the customer's public quote
+// page (controllers/quoteController.js) so both read out the same number
+// createTrip will book. Returns null when no route can be found.
+async function quoteTrip({ pickupLat, pickupLng, dropLat, dropLng, selectedType, tripType, acEnabled, helperEnabled }) {
+  const route = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
+  if (!route) return null;
+
+  // Round trip bills the road distance both ways -- identical to
+  // createTrip, not a rule re-invented here.
+  const isRound    = tripType === 'round_trip';
+  const distanceKm = isRound ? route.distanceKm * 2 : route.distanceKm;
+
+  const quote = {
+    tripType  : isRound ? 'round_trip' : 'one_way',
+    oneWayKm  : route.distanceKm,
+    distanceKm,
+    // Duration stays one-way: it is how long until the ambulance
+    // reaches the drop, which is what dispatch actually needs.
+    durationSec: route.durationSec,
+    polyline   : route.polyline,
+    fare       : null,
+  };
+
+  if (!selectedType) return quote;
+
+  try {
+    quote.fare = await fareCalculator.compute({
+      selectedType,
+      distanceKm,
+      oneWayKm : route.distanceKm,
+      tripType : isRound ? 'round_trip' : 'one_way',
+      acEnabled: !!acEnabled,
+      helperEnabled: !!helperEnabled,
+      gstRate  : GST_RATE,
+    });
+  } catch (fareErr) {
+    // A missing Pricing doc is a configuration answer, not a crash: the
+    // route is still valid and the map should still draw.
+    quote.fareError = fareErr.message;
+  }
+
+  return quote;
+}
+exports.quoteTrip = quoteTrip;
+
 exports.estimateTrip = async (req, res, next) => {
   try {
-    const { pickupLat, pickupLng, dropLat, dropLng, selectedType, tripType, acEnabled, helperEnabled } = req.body;
-
-    const route = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
-    if (!route) {
+    const quote = await quoteTrip(req.body);
+    if (!quote) {
       return res.status(422).json({
         success: false,
         message: 'Could not calculate a route between these locations. Check both pins and try again.',
       });
     }
-
-    // Round trip bills the road distance both ways -- identical to
-    // createTrip, not a rule re-invented here.
-    const isRound    = tripType === 'round_trip';
-    const distanceKm = isRound ? route.distanceKm * 2 : route.distanceKm;
-
-    const payload = {
-      success   : true,
-      tripType  : isRound ? 'round_trip' : 'one_way',
-      oneWayKm  : route.distanceKm,
-      distanceKm,
-      // Duration stays one-way: it is how long until the ambulance
-      // reaches the drop, which is what dispatch actually needs.
-      durationSec: route.durationSec,
-      polyline   : route.polyline,
-      fare       : null,
-    };
-
-    if (!selectedType) return res.json(payload);
-
-    try {
-      payload.fare = await fareCalculator.compute({
-        selectedType,
-        distanceKm,
-        oneWayKm : route.distanceKm,
-        tripType : isRound ? 'round_trip' : 'one_way',
-        acEnabled: !!acEnabled,
-        helperEnabled: !!helperEnabled,
-        gstRate  : GST_RATE,
-      });
-    } catch (fareErr) {
-      // A missing Pricing doc is a configuration answer, not a crash: the
-      // route is still valid and the map should still draw.
-      payload.fareError = fareErr.message;
-    }
-
-    return res.json(payload);
+    return res.json({ success: true, ...quote });
   } catch (err) {
     next(err);
   }
@@ -254,126 +261,141 @@ exports.estimateTrip = async (req, res, next) => {
 // ============================================================
 exports.createTrip = async (req, res, next) => {
   try {
-    const {
-      // Internal (owner/CRM) fields
-      patientName, patientPhone, emergencyType,
-      pickupAddress, pickupLat, pickupLng,
-      dropHospitalId, dropAddress,
-      leadId,
-      // Customer app fields
-      pickupLabel, dropLabel, dist, effectiveDist,
-      dropLat, dropLng,
-      scheduleType, scheduleDate, selectedType,
-      tripType, returnAddress, acEnabled, helperEnabled,
-      paymentPreference,
-    } = req.body;
-
-    // Never let a bad/missing value block booking — falls back to the
-    // schema default ('cash') exactly as if the field were omitted.
-    const PAYMENT_PREFS = ['cash', 'upi', 'card'];
-    const validPaymentPreference = PAYMENT_PREFS.includes(paymentPreference) ? paymentPreference : undefined;
-
-    // Authoritative distance for billing — never trust the client-submitted
-    // dist/effectiveDist outright. Independently re-verify the real road
-    // distance via Google Directions from the trip's own coordinates; only
-    // fall back to the client-submitted figure if verification isn't
-    // possible (client not yet sending dropLat/dropLng, or the Google call
-    // itself fails) so a booking never hard-blocks on that.
-    const verifiedRoute    = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
-    const verifiedOneWayKm = verifiedRoute ? verifiedRoute.distanceKm : null;
-    const distanceKm = verifiedOneWayKm != null
-      ? (tripType === 'round_trip' ? verifiedOneWayKm * 2 : verifiedOneWayKm)
-      : (effectiveDist ?? dist ?? 0);
-
-    // ── Compute the authoritative fare server-side from MongoDB Pricing —
-    //    never trust a client-supplied baseFare/perKmRate/totalFare. ──────
-    let fare;
-    try {
-      fare = await fareCalculator.compute({
-        selectedType,
-        distanceKm,
-        // Null when Google could not be reached and distanceKm fell back to
-        // the client figure; compute() then derives the leg itself.
-        oneWayKm : verifiedOneWayKm ?? undefined,
-        tripType : tripType === 'round_trip' ? 'round_trip' : 'one_way',
-        acEnabled: !!acEnabled,
-        helperEnabled: !!helperEnabled,
-        gstRate  : GST_RATE,
-      });
-    } catch (fareErr) {
-      return res.status(400).json({ success: false, message: fareErr.message });
-    }
-
-    // ── Build trip document ───────────────────────────────────
-    const tripData = {
-      patientName   : patientName   || 'Customer Booking',
-      patientPhone  : patientPhone  || 'N/A',
-      emergencyType : emergencyType || 'general',
-      pickup        : { address: pickupAddress || pickupLabel, lat: pickupLat, lng: pickupLng },
-      dropHospital  : dropHospitalId || undefined,
-      dropAddress   : dropAddress   || dropLabel,
-      // Additive — already received above (used transiently for
-      // verifyRoadDistanceKm), just never stored until now. Undefined on
-      // trips from a client that doesn't send them, same as pickupLat/Lng.
-      dropLat       : dropLat,
-      dropLng       : dropLng,
-      selectedType,
-      tripType      : tripType || 'one_way',
-      returnAddress : tripType === 'round_trip' ? returnAddress : undefined,
-      scheduleType  : scheduleType || 'now',
-      scheduleDate  : scheduleType === 'later' && scheduleDate ? new Date(scheduleDate) : undefined,
-      acEnabled     : !!acEnabled,
-      helperEnabled : !!helperEnabled,
-      baseFare      : fare.baseFare,
-      distanceKm    : fare.distanceKm,
-      additionalCharges: fare.additionalCharges,
-      // Estimate snapshot — preserved as-is even after distanceKm/baseFare/
-      // grandTotal get recomputed at completion (see Trip schema comment).
-      estimatedDistanceKm: fare.distanceKm,
-      estimatedFare      : fare.grandTotal,
-      estimatedDurationSec: verifiedRoute?.durationSec ?? undefined,
-      bookedBy      : req.user?._id || undefined,
-      leadId,
-      paymentPreference: validPaymentPreference,
-      status        : 'booked',
-    };
-
-    const trip = await Trip.create(tripData);
-
-    // Mark lead as converted if applicable
-    if (leadId) {
-      await Lead.findByIdAndUpdate(leadId, { status: 'converted', convertedTrip: trip._id });
-    }
-
-    // ── No auto-assign. Dispatch is a human decision. ─────────
-    //
-    // A new trip is created 'booked' and unassigned, and waits on the CRM
-    // dispatch board for an operator to choose a unit.
-    //
-    // This is a deliberate product decision, not an omission. The previous
-    // code called autoAssign() here, which searched the legacy Vehicle
-    // collection — empty in production, so it returned null every time and
-    // nothing was ever auto-assigned. Repointing it at Ambulance would not
-    // have restored old behaviour; it would have started new behaviour, on
-    // a patient-critical path: a trip booked from the website, the app or
-    // WhatsApp would instantly claim the nearest on-duty ambulance and fire
-    // the driver push, the full-screen call intent, the WhatsApp notice and
-    // the customer's tracking SMS with nobody in the loop.
-    //
-    // The dispatcher gets help choosing instead, not a choice made for
-    // them: GET /api/trips/:id/suggested-ambulances ranks the on-duty units
-    // by distance and the board shows them at the top of the assign list.
-    //
-    // 'vehicle' is still populated for the response shape, and is null on
-    // every new trip — it only ever resolves for the historical trips that
-    // predate the Ambulance system.
-    await trip.populate(['dropHospital', 'vehicle', 'driver']);
-
+    const trip = await createBookedTrip(req.body, { bookedBy: req.user?._id });
     return res.status(201).json({ success: true, trip });
   } catch (err) {
+    if (err.isFareError) return res.status(400).json({ success: false, message: err.message });
     next(err);
   }
 };
+
+// The booking itself, shared by createTrip and a confirmed customer quote
+// (controllers/quoteController.js), so a quoted booking is created through
+// exactly the same distance check and fare engine as every other one.
+// Throws an error flagged isFareError when the fare cannot be computed.
+// bookingSource is set only by callers that know it; createTrip leaves the
+// schema default alone, as it always has.
+async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
+  const {
+    // Internal (owner/CRM) fields
+    patientName, patientPhone, emergencyType,
+    pickupAddress, pickupLat, pickupLng,
+    dropHospitalId, dropAddress,
+    leadId,
+    // Customer app fields
+    pickupLabel, dropLabel, dist, effectiveDist,
+    dropLat, dropLng,
+    scheduleType, scheduleDate, selectedType,
+    tripType, returnAddress, acEnabled, helperEnabled,
+    paymentPreference,
+  } = body;
+
+  // Never let a bad/missing value block booking — falls back to the
+  // schema default ('cash') exactly as if the field were omitted.
+  const PAYMENT_PREFS = ['cash', 'upi', 'card'];
+  const validPaymentPreference = PAYMENT_PREFS.includes(paymentPreference) ? paymentPreference : undefined;
+
+  // Authoritative distance for billing — never trust the client-submitted
+  // dist/effectiveDist outright. Independently re-verify the real road
+  // distance via Google Directions from the trip's own coordinates; only
+  // fall back to the client-submitted figure if verification isn't
+  // possible (client not yet sending dropLat/dropLng, or the Google call
+  // itself fails) so a booking never hard-blocks on that.
+  const verifiedRoute    = await verifyRoute(pickupLat, pickupLng, dropLat, dropLng);
+  const verifiedOneWayKm = verifiedRoute ? verifiedRoute.distanceKm : null;
+  const distanceKm = verifiedOneWayKm != null
+    ? (tripType === 'round_trip' ? verifiedOneWayKm * 2 : verifiedOneWayKm)
+    : (effectiveDist ?? dist ?? 0);
+
+  // ── Compute the authoritative fare server-side from MongoDB Pricing —
+  //    never trust a client-supplied baseFare/perKmRate/totalFare. ──────
+  let fare;
+  try {
+    fare = await fareCalculator.compute({
+      selectedType,
+      distanceKm,
+      // Null when Google could not be reached and distanceKm fell back to
+      // the client figure; compute() then derives the leg itself.
+      oneWayKm : verifiedOneWayKm ?? undefined,
+      tripType : tripType === 'round_trip' ? 'round_trip' : 'one_way',
+      acEnabled: !!acEnabled,
+      helperEnabled: !!helperEnabled,
+      gstRate  : GST_RATE,
+    });
+  } catch (fareErr) {
+    fareErr.isFareError = true;
+    throw fareErr;
+  }
+
+  // ── Build trip document ───────────────────────────────────
+  const tripData = {
+    patientName   : patientName   || 'Customer Booking',
+    patientPhone  : patientPhone  || 'N/A',
+    emergencyType : emergencyType || 'general',
+    pickup        : { address: pickupAddress || pickupLabel, lat: pickupLat, lng: pickupLng },
+    dropHospital  : dropHospitalId || undefined,
+    dropAddress   : dropAddress   || dropLabel,
+    // Additive — already received above (used transiently for
+    // verifyRoadDistanceKm), just never stored until now. Undefined on
+    // trips from a client that doesn't send them, same as pickupLat/Lng.
+    dropLat       : dropLat,
+    dropLng       : dropLng,
+    selectedType,
+    tripType      : tripType || 'one_way',
+    returnAddress : tripType === 'round_trip' ? returnAddress : undefined,
+    scheduleType  : scheduleType || 'now',
+    scheduleDate  : scheduleType === 'later' && scheduleDate ? new Date(scheduleDate) : undefined,
+    acEnabled     : !!acEnabled,
+    helperEnabled : !!helperEnabled,
+    baseFare      : fare.baseFare,
+    distanceKm    : fare.distanceKm,
+    additionalCharges: fare.additionalCharges,
+    // Estimate snapshot — preserved as-is even after distanceKm/baseFare/
+    // grandTotal get recomputed at completion (see Trip schema comment).
+    estimatedDistanceKm: fare.distanceKm,
+    estimatedFare      : fare.grandTotal,
+    estimatedDurationSec: verifiedRoute?.durationSec ?? undefined,
+    bookedBy      : bookedBy || undefined,
+    leadId,
+    paymentPreference: validPaymentPreference,
+    status        : 'booked',
+    ...(bookingSource ? { bookingSource } : {}),
+  };
+
+  const trip = await Trip.create(tripData);
+
+  // Mark lead as converted if applicable
+  if (leadId) {
+    await Lead.findByIdAndUpdate(leadId, { status: 'converted', convertedTrip: trip._id });
+  }
+
+  // ── No auto-assign. Dispatch is a human decision. ─────────
+  //
+  // A new trip is created 'booked' and unassigned, and waits on the CRM
+  // dispatch board for an operator to choose a unit.
+  //
+  // This is a deliberate product decision, not an omission. The previous
+  // code called autoAssign() here, which searched the legacy Vehicle
+  // collection — empty in production, so it returned null every time and
+  // nothing was ever auto-assigned. Repointing it at Ambulance would not
+  // have restored old behaviour; it would have started new behaviour, on
+  // a patient-critical path: a trip booked from the website, the app or
+  // WhatsApp would instantly claim the nearest on-duty ambulance and fire
+  // the driver push, the full-screen call intent, the WhatsApp notice and
+  // the customer's tracking SMS with nobody in the loop.
+  //
+  // The dispatcher gets help choosing instead, not a choice made for
+  // them: GET /api/trips/:id/suggested-ambulances ranks the on-duty units
+  // by distance and the board shows them at the top of the assign list.
+  //
+  // 'vehicle' is still populated for the response shape, and is null on
+  // every new trip — it only ever resolves for the historical trips that
+  // predate the Ambulance system.
+  await trip.populate(['dropHospital', 'vehicle', 'driver']);
+
+  return trip;
+}
+exports.createBookedTrip = createBookedTrip;
 
 
 

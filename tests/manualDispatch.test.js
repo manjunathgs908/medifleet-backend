@@ -83,6 +83,7 @@ const pushService = require('../utils/pushService');
 const fcmService  = require('../utils/fcmService');
 const whatsappNotifications = require('../services/whatsappNotifications');
 const trackingNotifications = require('../services/trackingNotifications');
+const fareCalculator = require('../utils/fareCalculator');
 
 const tripCtrl = require('../controllers/tripController');
 
@@ -176,6 +177,40 @@ describe('A. createTrip never assigns', () => {
     expect(Trip.create.mock.calls[0][0].vehicle).toBeUndefined();
     expect(created.vehicle).toBeUndefined();
     noOneNotified();
+  });
+
+  // createTrip is a thin wrapper over createBookedTrip, which the quote
+  // confirm path also uses. Its HTTP contract must not move.
+  test('a fare failure is still a 400 with the fare message, and nothing is created', async () => {
+    setup();
+    fareCalculator.compute.mockRejectedValueOnce(new Error('No active pricing found for vehicle type "x"'));
+
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'crm1', role: 'owner' } });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual({ success: false, message: 'No active pricing found for vehicle type "x"' });
+    expect(Trip.create).not.toHaveBeenCalled();
+  });
+
+  test('bookedBy comes from the session, and bookingSource is left to the schema default', async () => {
+    setup();
+    await call(tripCtrl.createTrip, { body, user: { _id: 'crm1', role: 'owner' } });
+
+    const data = Trip.create.mock.calls[0][0];
+    expect(data.bookedBy).toBe('crm1');
+    expect(data).not.toHaveProperty('bookingSource');
+  });
+
+  test('createBookedTrip sets bookingSource only when its caller names one', async () => {
+    setup();
+    await tripCtrl.createBookedTrip(body, { bookedBy: 'crm1', bookingSource: 'crm' });
+    expect(Trip.create.mock.calls[0][0].bookingSource).toBe('crm');
+  });
+
+  test('estimateTrip still answers 422 when no route can be found', async () => {
+    const res = await call(tripCtrl.estimateTrip, { body: { pickupLat: 12.9 } });
+    expect(res.statusCode).toBe(422);
+    expect(res.body.success).toBe(false);
   });
 });
 

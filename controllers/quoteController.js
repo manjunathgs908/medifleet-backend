@@ -67,6 +67,26 @@ function cleanServiceId(v) {
   return SERVICE_ID_RE.test(id) ? id : '';
 }
 
+// What the operator set when creating the quote is fixed: the customer's
+// page shows it read-only, and these resolve it from the stored quote
+// rather than from the request, so a hand-made request cannot change it
+// either. The service and its AC choice lock together — the operator chose
+// AC for that service. Pickup is never locked: it is the customer's own
+// location. Only meaningful before confirm; confirm overwrites these fields
+// with what was booked.
+const lockedDrop    = (quote) => cleanPlace(quote.drop);
+const lockedService = (quote) => cleanServiceId(quote.selectedType);
+
+function resolveChoices(quote, body) {
+  const drop    = lockedDrop(quote);
+  const service = lockedService(quote);
+  return {
+    drop        : drop || cleanPlace(body.drop),
+    selectedType: service || cleanServiceId(body.selectedType),
+    acEnabled   : service ? !!quote.acEnabled : !!body.acEnabled,
+  };
+}
+
 const isExpired = (quote) => !!quote.expiresAt && quote.expiresAt.getTime() <= Date.now();
 
 // 'confirming' is an internal claim, not something the operator acts on.
@@ -115,6 +135,10 @@ function publicView(quote, extra = {}) {
     status      : quote.status === 'confirmed' ? 'confirmed' : 'open',
     expired     : quote.status !== 'confirmed' && isExpired(quote),
     expiresAt   : quote.expiresAt,
+    // Which fields the page must show read-only (see resolveChoices).
+    locked      : quote.status === 'confirmed'
+      ? { drop: true, service: true }
+      : { drop: !!lockedDrop(quote), service: !!lockedService(quote) },
     supportPhone: supportPhone(),
     ...extra,
   };
@@ -267,18 +291,17 @@ exports.estimatePublicQuote = async (req, res, next) => {
     if (isExpired(quote)) return expiredResponse(res);
 
     const pickup = cleanPlace(req.body.pickup);
-    const drop   = cleanPlace(req.body.drop);
+    const { drop, selectedType, acEnabled } = resolveChoices(quote, req.body);
     if (!pickup || !drop) {
       return res.status(400).json({ success: false, message: 'Choose both a pickup and a drop location.' });
     }
-    const selectedType = cleanServiceId(req.body.selectedType);
 
     const result = await quoteTrip({
       pickupLat: pickup.lat, pickupLng: pickup.lng,
       dropLat  : drop.lat,   dropLng  : drop.lng,
       selectedType: selectedType || undefined,
       tripType : 'one_way',
-      acEnabled: !!req.body.acEnabled,
+      acEnabled,
     });
     if (!result) {
       return res.status(422).json({
@@ -321,9 +344,7 @@ exports.confirmPublicQuote = async (req, res, next) => {
 
     const patientName  = cleanName(req.body.patientName) || existing.patientName || '';
     const pickup       = cleanPlace(req.body.pickup);
-    const drop         = cleanPlace(req.body.drop);
-    const selectedType = cleanServiceId(req.body.selectedType);
-    const acEnabled    = !!req.body.acEnabled;
+    const { drop, selectedType, acEnabled } = resolveChoices(existing, req.body);
 
     if (!patientName)   return res.status(400).json({ success: false, message: 'Enter the patient name.' });
     if (!pickup)        return res.status(400).json({ success: false, message: 'Set the pickup location.' });

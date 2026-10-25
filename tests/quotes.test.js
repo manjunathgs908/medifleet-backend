@@ -195,6 +195,71 @@ describe('estimatePublicQuote', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
+describe('operator-set fields are locked', () => {
+  const OTHER = { address: 'Somewhere else', lat: 13.1, lng: 77.7 };
+
+  it('tells the page which fields are read-only', async () => {
+    Quote.findOne.mockResolvedValue(quoteDoc({ status: 'viewed', drop: DROP, selectedType: 'bls' }));
+    const res = await run(ctrl.getPublicQuote, { params: { token: TOKEN } });
+    expect(res.json.mock.calls[0][0].quote.locked).toEqual({ drop: true, service: true });
+  });
+
+  it('leaves fields the operator did not set editable', async () => {
+    Quote.findOne.mockResolvedValue(quoteDoc({ status: 'viewed' }));
+    const res = await run(ctrl.getPublicQuote, { params: { token: TOKEN } });
+    expect(res.json.mock.calls[0][0].quote.locked).toEqual({ drop: false, service: false });
+  });
+
+  it('prices the operator\'s drop, service and AC, whatever the request says', async () => {
+    Quote.findOne.mockResolvedValue(quoteDoc({ status: 'viewed', drop: DROP, selectedType: 'bls', acEnabled: true }));
+    quoteTrip.mockResolvedValue({ distanceKm: 6, durationSec: 900, fare: { grandTotal: 1200 } });
+
+    await run(ctrl.estimatePublicQuote, {
+      params: { token: TOKEN },
+      body: { pickup: PICKUP, drop: OTHER, selectedType: 'hearse', acEnabled: false },
+    });
+
+    expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({
+      dropLat: DROP.lat, dropLng: DROP.lng, selectedType: 'bls', acEnabled: true,
+    }));
+  });
+
+  it('books the operator\'s drop, service and AC, and the customer\'s own pickup', async () => {
+    Quote.findOne.mockResolvedValue(quoteDoc({ status: 'viewed', drop: DROP, selectedType: 'bls', acEnabled: false, patientName: 'Ravi' }));
+    Quote.findOneAndUpdate
+      .mockResolvedValueOnce(quoteDoc({ status: 'confirming' }))
+      .mockResolvedValueOnce(quoteDoc({ status: 'confirmed', trip: 't1' }));
+    quoteTrip.mockResolvedValue({ distanceKm: 6, oneWayKm: 6, durationSec: 900, fare: { grandTotal: 1200 } });
+    createBookedTrip.mockResolvedValue({ _id: 't1', tripNumber: 'TRP-1' });
+
+    await run(ctrl.confirmPublicQuote, {
+      params: { token: TOKEN },
+      body: { pickup: PICKUP, drop: OTHER, selectedType: 'hearse', acEnabled: true },
+    });
+
+    const tripBody = createBookedTrip.mock.calls[0][0];
+    expect(tripBody.dropLabel).toBe(DROP.address);
+    expect(tripBody.pickupLabel).toBe(PICKUP.address);
+    expect(tripBody.selectedType).toBe('bls');
+    expect(tripBody.acEnabled).toBe(false);
+  });
+
+  it('uses the customer\'s drop, service and AC where the operator left them empty', async () => {
+    Quote.findOne.mockResolvedValue(quoteDoc({ status: 'viewed' }));
+    quoteTrip.mockResolvedValue({ distanceKm: 9, durationSec: 900, fare: { grandTotal: 1500 } });
+
+    await run(ctrl.estimatePublicQuote, {
+      params: { token: TOKEN },
+      body: { pickup: PICKUP, drop: OTHER, selectedType: 'hearse', acEnabled: true },
+    });
+
+    expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({
+      dropLat: OTHER.lat, selectedType: 'hearse', acEnabled: true,
+    }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
 describe('confirmPublicQuote', () => {
   const body = { patientName: 'Ravi', pickup: PICKUP, drop: DROP, selectedType: 'bls', acEnabled: false, patientPhone: '9000000000' };
 

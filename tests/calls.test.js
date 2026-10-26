@@ -928,7 +928,23 @@ describe('busy / leg-release investigation', () => {
     expect(res.body).not.toContain('<User>');
     expect(res.body).toContain('stage=phone');
     expect(res.body).toContain('timeout="40"');
-    expect(CallLog.create.mock.calls[0][0].routing.decision).toBe('phone');
+    const { routing } = CallLog.create.mock.calls[0][0];
+    expect(routing.decision).toBe('phone');
+    // What was dialled, so "phone busy" can be told from "never dialled".
+    expect(routing.phoneTargets).toEqual(['••••••4442']);
+    expect(routing.dutyUsers).toEqual([expect.objectContaining({ name: 'Me', callMode: 'phone', ringPhone: '••••••4442', ringPhoneValid: true })]);
+    expect(JSON.stringify(routing)).not.toMatch(/9986844442|9000000001/);
+  });
+
+  it('records Plivo\'s verdict on the phone <Dial> (e.g. the phone was busy)', async () => {
+    const log = logDoc({ direction: 'inbound', status: 'ringing', routing: { decision: 'phone' } });
+    CallLog.findById.mockResolvedValue(log);
+    await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'phone' },
+      body: { DialStatus: 'busy', DialHangupCause: 'USER_BUSY', DialBLegTo: '919986844442' },
+    });
+    expect(log.phoneLeg).toEqual(expect.objectContaining({ DialStatus: 'busy', DialHangupCause: 'USER_BUSY', DialBLegTo: '••••••4442' }));
+    expect(log.status).toBe('missed');
   });
 
   it('a call placed FROM a browser endpoint is hung up, not routed to staff', async () => {

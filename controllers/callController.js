@@ -418,6 +418,17 @@ exports.incoming = async (req, res, next) => {
       decidedAt: new Date(),
       onDuty   : onDuty.length,
       phones   : agentPhones.length,
+      // The phones the phone <Dial> rings (masked) — now, or after the app
+      // stage. With phoneLeg's DialStatus/DialHangupCause this tells
+      // "the phone was busy" apart from "the phone was never dialled".
+      phoneTargets: agentPhones.map(maskPhone),
+      dutyUsers   : onDuty.map((u) => ({
+        user          : u._id,
+        name          : u.name,
+        callMode      : u.callMode || 'phone',
+        ringPhone     : maskPhone(ringPhoneOf(u)),
+        ringPhoneValid: isMobile(ringPhoneOf(u)),
+      })),
       appUsers : onDuty.filter((u) => u.callMode === 'app').map((u) => ({
         user          : u._id,
         name          : u.name,

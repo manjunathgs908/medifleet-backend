@@ -44,7 +44,17 @@ jest.mock('../models/CallLog', () => ({
 jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
 jest.mock('../models/WebrtcDebugEvent', () => ({
   insertMany: jest.fn(async (docs) => docs),
+  create    : jest.fn(async (doc) => doc),
   find      : jest.fn(),
+}));
+jest.mock('../models/WebrtcEndpoint', () => ({
+  find          : jest.fn(),
+  findOne       : jest.fn(),
+  create        : jest.fn(),
+  updateOne     : jest.fn(),
+  updateMany    : jest.fn(),
+  deleteOne     : jest.fn(),
+  countDocuments: jest.fn(),
 }));
 // Only .get is replaced: the real Plivo SDK (kept for its signature check)
 // configures axios when it loads.
@@ -102,6 +112,10 @@ beforeEach(() => {
   jest.clearAllMocks();
   CallLog.create.mockImplementation(async (data) => logDoc(data));
   mockCreateCall.mockResolvedValue({ requestUuid: 'req-1' });
+  // No per-device endpoints unless a test sets some up.
+  const WebrtcEndpoint = require('../models/WebrtcEndpoint');
+  WebrtcEndpoint.find.mockReturnValue(chain([]));
+  WebrtcEndpoint.countDocuments.mockResolvedValue(0);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -1060,4 +1074,121 @@ describe('recordings only for answered calls; call flow trail', () => {
     await run(ctrl.events, { method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'phone' }, body: { DialStatus: 'busy' } });
     expect(log.flow).toEqual(['app:15s', 'app:no-answer→phones:1:40s', 'phone:busy→sorry_message']);
   });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('per-device endpoints (one registration per device)', () => {
+  const WebrtcEndpoint = require('../models/WebrtcEndpoint');
+  const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
+  const USER = { _id: '64b0000000000000000000aa', name: 'Desk', phone: '9000000001' };
+  const headers = (h) => (k) => h[k];
+
+  it('rings ALL of an in-app user\'s online devices at once, then phones', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([{ ...USER, callMode: 'app' }]));
+    WebrtcEndpoint.find.mockReturnValue(chain([
+      { user: USER._id, username: 'sldesktop1', device: 'browser-tab · Chrome', onlineAt: new Date(), deviceKey: 'd1' },
+      { user: USER._id, username: 'slphone2', device: 'installed-app · Android', onlineAt: new Date(), deviceKey: 'd2' },
+    ]));
+
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'multi' } });
+
+    expect(res.body).toContain('<User>sip:sldesktop1@phone.plivo.com</User><User>sip:slphone2@phone.plivo.com</User>');
+    expect(res.body).toContain('timeout="15"');
+    const { routing } = CallLog.create.mock.calls[0][0];
+    expect(routing.appUsers[0].devices).toEqual([
+      expect.objectContaining({ device: 'browser-tab · Chrome', dialled: true }),
+      expect.objectContaining({ device: 'installed-app · Android', dialled: true }),
+    ]);
+    expect(WebrtcDebugEvent.create).toHaveBeenCalledWith(expect.objectContaining({ event: 'server:incoming_routed' }));
+  });
+
+  it('a device that stopped checking in is not rung; the user falls to their phone', () => {
+    const { sipUsers, phones } = ctrl.routeIncoming(
+      [{ ...USER, callMode: 'app' }],
+      [{ user: USER._id, username: 'slold', onlineAt: new Date(Date.now() - 10 * 60 * 1000) }],
+    );
+    expect(sipUsers).toEqual([]);
+    expect(phones).toEqual(['9000000001']);
+  });
+
+  it('login with a device key gets that device\'s own endpoint and credentials', async () => {
+    fakePlivoDevice();
+    WebrtcEndpoint.findOne.mockReturnValue(chain(null));
+    WebrtcEndpoint.find.mockReturnValue(chain([]));
+    const saved = { save: jest.fn() };
+    WebrtcEndpoint.create.mockImplementation(async (d) => Object.assign(saved, d));
+
+    const { res } = await run(ctrl.webrtcLogin, {
+      user: USER, query: {}, get: headers({ 'X-Device-Key': 'aaaabbbb-cccc-dddd', 'X-Device-Label': 'browser-tab · Chrome' }),
+    });
+
+    const created = axios.request.mock.calls.map(([c]) => c).find((c) => c.method === 'post' && c.url.endsWith('/Endpoint/'));
+    expect(created.data.alias).toBe(`savelife-${USER._id}-aaaabbbbcccc`);
+    expect(created.data.alias).toMatch(/^[A-Za-z0-9.+@_-]+$/);
+    expect(created.data.username).toMatch(/^sl[a-z0-9]+$/);
+    expect(created.data.username.length).toBeLessThanOrEqual(25);
+    expect(res.body).toEqual(expect.objectContaining({ mode: 'password', perDevice: true, username: saved.username, password: saved.password }));
+    expect(saved.device).toBe('browser-tab · Chrome');
+  });
+
+  it('the same device logging in again reuses its endpoint', async () => {
+    fakePlivoDevice();
+    const doc = { user: USER._id, deviceKey: 'aaaabbbb-cccc-dddd', endpointId: 'epd', username: 'sldev123', password: 'pw', save: jest.fn() };
+    WebrtcEndpoint.findOne.mockReturnValue(chain(doc));
+    const { res } = await run(ctrl.webrtcLogin, { user: USER, query: {}, get: headers({ 'X-Device-Key': 'aaaabbbb-cccc-dddd' }) });
+    expect(axios.request.mock.calls.some(([c]) => c.method === 'post' && c.url.endsWith('/Endpoint/'))).toBe(false);
+    expect(res.body.username).toBe('sldev123');
+  });
+
+  it('a sixth device retires the least recently used endpoint', async () => {
+    fakePlivoDevice();
+    WebrtcEndpoint.findOne.mockReturnValue(chain(null));
+    WebrtcEndpoint.find.mockReturnValue(chain([1, 2, 3, 4, 5].map((i) => ({ _id: `e${i}`, endpointId: `ep${i}` }))));
+    WebrtcEndpoint.create.mockImplementation(async (d) => ({ ...d, save: jest.fn() }));
+    await run(ctrl.webrtcLogin, { user: USER, query: {}, get: headers({ 'X-Device-Key': 'newdevice-0001' }) });
+    expect(axios.request.mock.calls.some(([c]) => c.method === 'delete' && c.url.endsWith('/Endpoint/ep1/'))).toBe(true);
+    expect(WebrtcEndpoint.deleteOne).toHaveBeenCalledWith({ _id: 'e1' });
+  });
+
+  it('presence with a device key marks only that device', async () => {
+    await run(ctrl.webrtcPresence, { user: USER, body: { online: true }, get: headers({ 'X-Device-Key': 'aaaabbbb-cccc-dddd' }) });
+    expect(WebrtcEndpoint.updateOne).toHaveBeenCalledWith({ user: USER._id, deviceKey: 'aaaabbbb-cccc-dddd' }, { $set: { onlineAt: expect.any(Date) } });
+    expect(User.updateOne).not.toHaveBeenCalled();
+  });
+
+  it('the call trail says, per device, whether the call arrived and the Answer screen showed', async () => {
+    const logId = '64b000000000000000000001';
+    CallLog.findById.mockReturnValue(chain({ _id: logId, startedAt: new Date(), status: 'missed', routing: { decision: 'app_then_phone' } }));
+    WebrtcDebugEvent.find.mockReturnValue(chain([
+      { event: 'server:incoming_routed', detail: { logId }, at: new Date() },
+      { event: 'onIncomingCall', sessionId: 'phone-s', device: 'installed-app · Android', detail: [{ 'X-PH-logId': logId }], at: new Date() },
+      { event: 'ui:incoming_shown', sessionId: 'phone-s', device: 'installed-app · Android', detail: [{ logId }], at: new Date() },
+      { event: 'state', sessionId: 'desk-s', device: 'browser-tab · Chrome', at: new Date() },
+      { event: 'onLogin', sessionId: 'desk-s', device: 'browser-tab · Chrome', at: new Date() },
+    ]));
+
+    const { res } = await run(ctrl.getCallTrail, { params: { id: logId } });
+
+    const phone = res.body.sessions.find((s) => s.sessionId === 'phone-s');
+    const desk = res.body.sessions.find((s) => s.sessionId === 'desk-s');
+    expect(phone).toEqual(expect.objectContaining({ gotIncoming: true, gotThisCall: true, answerScreenShown: true }));
+    expect(desk).toEqual(expect.objectContaining({ gotIncoming: false, answerScreenShown: false }));
+    expect(res.body.events.map((e) => e.event)).not.toContain('state');
+  });
+
+  // Plivo REST for device endpoints: list (none), create, get (matches), link, password, delete.
+  function fakePlivoDevice() {
+    axios.request.mockImplementation(async ({ method, url, data }) => {
+      const path = url.replace('https://api.plivo.com/v1/Account/MAXXXXXXXXXXXXXXXXXX', '');
+      if (method === 'get' && path === '/Number/918065591088/') return { data: { application: '/v1/Account/MAXXXXXXXXXXXXXXXXXX/Application/29986316244302815/' } };
+      if (method === 'get' && path.startsWith('/Endpoint/?')) return { data: { meta: { next: null }, objects: [] } };
+      if (method === 'post' && path === '/Endpoint/') return { data: { endpoint_id: 'epnew', username: `${data.username}777` } };
+      const one = path.match(/^\/Endpoint\/([^/?]+)\/$/);
+      if (method === 'get' && one) return { data: { username: one[1] === 'epd' ? 'sldev123' : `${'x'}`, application: '/v1/Account/MAXXXXXXXXXXXXXXXXXX/Application/29986316244302815/' } };
+      if ((method === 'post' || method === 'delete') && one) return { data: {} };
+      throw new Error(`unexpected Plivo call ${method} ${path}`);
+    });
+  }
 });

@@ -45,6 +45,7 @@ router.post('/webrtc/presence', protect, authorize('owner'), ctrl.webrtcPresence
 router.post('/webrtc/debug',    protect, authorize('owner'), ctrl.postWebrtcDebug);
 router.get ('/webrtc/debug',    protect, authorize('owner'), ctrl.getWebrtcDebug);
 router.get ('/:id',             protect, authorize('owner'), ctrl.getCall);
+router.get ('/:id/trail',       protect, authorize('owner'), ctrl.getCallTrail);
 router.post('/:id/answered',    protect, authorize('owner'), ctrl.markAnswered);
 // Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
 // sent to the browser).

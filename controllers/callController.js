@@ -40,6 +40,7 @@ const Quote        = require('../models/Quote');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
 const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
+const WebrtcEndpoint   = require('../models/WebrtcEndpoint');
 const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
@@ -75,17 +76,50 @@ function agentOf(req) {
 const APP_ONLINE_WINDOW_MS = 75 * 1000;
 const isAppOnline = (u) => !!u.appOnlineAt && Date.now() - new Date(u.appOnlineAt).getTime() < APP_ONLINE_WINDOW_MS;
 
+const isFresh = (at) => !!at && Date.now() - new Date(at).getTime() < APP_ONLINE_WINDOW_MS;
+
+// The in-app endpoints to ring for one user: every one of their devices
+// that is online (WebrtcEndpoint, one per device), plus the older shared
+// per-user endpoint while a not-yet-updated CRM is still using it.
+function appEndpointsOf(u, devices = []) {
+  const own = devices
+    .filter((d) => String(d.user) === String(u._id) && isFresh(d.onlineAt))
+    .map((d) => d.username);
+  if (u.plivoEndpointUsername && isAppOnline(u)) own.push(u.plivoEndpointUsername);
+  return [...new Set(own)];
+}
+
 // Splits on-duty users into in-app endpoints to ring and phones to ring.
-function routeIncoming(users) {
+// An in-app user with several devices online is rung on ALL of them at
+// once, so whichever screen they are at shows the Answer screen.
+function routeIncoming(users, devices = []) {
   const sipUsers = [];
   const phones = [];
   for (const u of users) {
-    if (u.callMode === 'app' && u.plivoEndpointUsername && isAppOnline(u)) sipUsers.push(u.plivoEndpointUsername);
+    const own = u.callMode === 'app' ? appEndpointsOf(u, devices) : [];
+    if (own.length) sipUsers.push(...own);
     else if (isMobile(ringPhoneOf(u))) phones.push(ringPhoneOf(u));
   }
-  return { sipUsers, phones };
+  return { sipUsers: [...new Set(sipUsers)], phones };
 }
 exports.routeIncoming = routeIncoming;
+
+// Online device endpoints for the in-app users among `users`.
+const loadOnlineDevices = (users) => {
+  const ids = users.filter((u) => u.callMode === 'app').map((u) => u._id);
+  if (!ids.length) return Promise.resolve([]);
+  return WebrtcEndpoint.find({ user: { $in: ids }, onlineAt: { $gte: new Date(Date.now() - APP_ONLINE_WINDOW_MS) } })
+    .select('user username device onlineAt deviceKey').lean();
+};
+
+// TEMPORARY: server-side steps of a call's delivery, stored with the
+// browsers' own events so GET /api/calls/:id/trail can show one timeline.
+// Never allowed to break routing: any failure, sync or async, is dropped.
+const serverTrail = (event, detail) => {
+  try {
+    Promise.resolve(WebrtcDebugEvent.create({ event, detail, at: new Date() })).catch(() => {});
+  } catch { /* diagnostics only */ }
+};
 
 // Every on-duty user's phone — in-app users included — for when nobody
 // answers in the app. Then PLIVO_FALLBACK_AGENTS if nobody has one.
@@ -408,7 +442,8 @@ exports.incoming = async (req, res, next) => {
     // With nobody online in the app, stage 2 runs straight away. All legs
     // show PLIVO_NUMBER as the caller and are recorded.
     const onDuty = await loadOnDuty();
-    const { sipUsers } = routeIncoming(onDuty);
+    const devices = await loadOnlineDevices(onDuty);
+    const { sipUsers } = routeIncoming(onDuty, devices);
     const agentPhones = fallbackPhones(onDuty);
     const ringing = agentPhones.length + sipUsers.length;
 
@@ -432,11 +467,20 @@ exports.incoming = async (req, res, next) => {
       appUsers : onDuty.filter((u) => u.callMode === 'app').map((u) => ({
         user          : u._id,
         name          : u.name,
-        appOnline     : isAppOnline(u),
+        appOnline     : appEndpointsOf(u, devices).length > 0,
         appOnlineAt   : u.appOnlineAt || null,
         hasEndpoint   : !!u.plivoEndpointUsername,
+        // The older shared endpoint (only rung while a not-yet-updated CRM
+        // checks in on it).
         sipUri        : u.plivoEndpointUsername ? plivo.sipUri(u.plivoEndpointUsername) : null,
         dialled       : sipUsers.includes(u.plivoEndpointUsername),
+        // Each of this user's devices online right now — all rung together.
+        devices       : devices.filter((d) => String(d.user) === String(u._id)).map((d) => ({
+          device  : d.device,
+          sipUri  : plivo.sipUri(d.username),
+          onlineAt: d.onlineAt,
+          dialled : sipUsers.includes(d.username),
+        })),
       })),
     };
 
@@ -455,6 +499,13 @@ exports.incoming = async (req, res, next) => {
       endedAt      : ringing ? undefined : new Date(),
     });
     plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
+    serverTrail('server:incoming_routed', {
+      logId   : String(log._id),
+      decision: routing.decision,
+      appEndpoints: devices.filter((d) => sipUsers.includes(d.username)).map((d) => ({ device: d.device, deviceKey: d.deviceKey }))
+        .concat(onDuty.filter((u) => u.plivoEndpointUsername && sipUsers.includes(u.plivoEndpointUsername)).map((u) => ({ device: 'shared endpoint (older CRM build)', user: u.name }))),
+      phones  : agentPhones.length,
+    });
 
     if (!ringing) return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
     if (sipUsers.length) {
@@ -507,6 +558,7 @@ exports.events = async (req, res, next) => {
             ...dialResult(b),
             fellBackToPhones: phones.length,
           };
+          serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, DialHangupCause: b.DialHangupCause || b.DialBLegHangupCause || null, fellBackToPhones: phones.length });
           log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : 'busy_message'}`];
           log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
@@ -522,6 +574,7 @@ exports.events = async (req, res, next) => {
         // TEMPORARY diagnostic: Plivo's verdict on whichever stage this was.
         if (req.query.stage === 'app') {
           log.appLeg = { sipUris: (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri), ...dialResult(b) };
+          serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, answered: dialStatus === 'completed' });
         } else if (req.query.stage === 'phone') {
           log.phoneLeg = dialResult(b);
         }
@@ -790,6 +843,7 @@ exports.setDuty = async (req, res, next) => {
     await User.updateOne({ _id: req.user._id }, onDuty
       ? { $set: { callDuty: true } }
       : { $set: { callDuty: false }, $unset: { appOnlineAt: 1 } });
+    if (!onDuty) await WebrtcEndpoint.updateMany({ user: req.user._id }, { $unset: { onlineAt: 1 } });
     return res.json({ success: true, onDuty });
   } catch (err) {
     next(err);
@@ -818,7 +872,21 @@ const meView = (u) => ({
 //          login number).
 // @access  Private [owner]
 // ============================================================
-exports.getMe = async (req, res) => res.json({ success: true, me: meView(req.user) });
+exports.getMe = async (req, res, next) => {
+  try {
+    const me = meView(req.user);
+    // Online counts any of the user's devices checking in, not just the
+    // older shared endpoint.
+    const devicesOnline = await WebrtcEndpoint.countDocuments({
+      user: req.user._id, onlineAt: { $gte: new Date(Date.now() - APP_ONLINE_WINDOW_MS) },
+    });
+    me.appOnline = me.appOnline || devicesOnline > 0;
+    me.devicesOnline = devicesOnline;
+    return res.json({ success: true, me });
+  } catch (err) {
+    next(err);
+  }
+};
 
 // Body may carry callPhone, callMode, or both; whatever is absent is left
 // as it is.
@@ -840,7 +908,10 @@ exports.setMe = async (req, res, next) => {
         return res.status(400).json({ success: false, message: 'callMode must be "app" or "phone".' });
       }
       update.$set.callMode = req.body.callMode;
-      if (req.body.callMode === 'phone') update.$unset.appOnlineAt = 1;
+      if (req.body.callMode === 'phone') {
+        update.$unset.appOnlineAt = 1;
+        await WebrtcEndpoint.updateMany({ user: req.user._id }, { $unset: { onlineAt: 1 } });
+      }
     }
     if (!Object.keys(update.$set).length) delete update.$set;
     if (!Object.keys(update.$unset).length) delete update.$unset;
@@ -987,6 +1058,65 @@ exports.postWebrtcDebug = async (req, res, next) => {
   }
 };
 
+// ============================================================
+// @route   GET /api/calls/:id/trail
+// @desc    TEMPORARY: one incoming call's in-app delivery, as one
+//          timeline: what the server routed (which device endpoints, how
+//          many phones), Plivo's verdict on the in-app leg, and every
+//          browser session's own events during the call (did it get
+//          onIncomingCall, did the ring-tone fallback run, was the Answer
+//          screen shown/cleared, was it answered) with its device label.
+//          Read from the server-side capture, so it survives reloads.
+// @access  Private [owner]
+// ============================================================
+const TRAIL_EVENTS = /^(server:|ui:|call:login|onIncomingCall|onIncomingCallCanceled|onIncomingCallIgnored|onCallAnswered|onCallTerminated|onCallFailed|onLogin|onLogout|onLoginFailed|onConnectionChange)/;
+
+exports.getCallTrail = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const log = await CallLog.findById(req.params.id).select('startedAt endedAt createdAt direction status routing').lean();
+    if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });
+
+    const start = new Date(new Date(log.startedAt || log.createdAt).getTime() - 5000);
+    const end = new Date(new Date(log.endedAt || (new Date(log.startedAt || log.createdAt).getTime() + 3 * 60 * 1000)).getTime() + 15000);
+    const logId = String(log._id);
+
+    const events = (await WebrtcDebugEvent.find({ at: { $gte: start, $lte: end } }).sort({ at: 1 }).limit(1000).lean())
+      .filter((e) => TRAIL_EVENTS.test(e.event));
+
+    // Per browser session: what happened to this call there.
+    const sessions = {};
+    for (const e of events) {
+      if (!e.sessionId) continue;
+      const s = sessions[e.sessionId] ||= {
+        sessionId: e.sessionId, device: e.device, user: e.userName,
+        gotIncoming: false, gotThisCall: false, answerScreenShown: false, ringtoneFallback: false,
+        cleared: [], answered: false, ended: false,
+      };
+      const mentionsCall = JSON.stringify(e.detail || '').includes(logId);
+      if (e.event === 'onIncomingCall') { s.gotIncoming = true; if (mentionsCall) s.gotThisCall = true; }
+      if (e.event === 'ui:incoming_shown') { s.answerScreenShown = true; if (mentionsCall) s.gotThisCall = true; }
+      if (e.event === 'ui:ringtone_without_event') s.ringtoneFallback = true;
+      if (e.event === 'ui:incoming_cleared' || e.event === 'onIncomingCallCanceled') s.cleared.push(e.event === 'onIncomingCallCanceled' ? 'canceled by Plivo' : (e.detail?.[0]?.why || 'cleared'));
+      if (e.event === 'onCallAnswered' || e.event === 'ui:in_call') s.answered = true;
+      if (e.event === 'onCallTerminated' || e.event === 'ui:call_ended') s.ended = true;
+    }
+
+    return res.json({
+      success: true,
+      call: { _id: log._id, status: log.status, startedAt: log.startedAt, endedAt: log.endedAt, decision: log.routing?.decision || null },
+      window: { from: start, to: end },
+      sessions: Object.values(sessions),
+      events: events.map((e) => ({
+        at: e.clientAt || e.at, event: e.event, reason: e.reason, device: e.device, sessionId: e.sessionId, user: e.userName,
+        detail: e.detail,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.getWebrtcDebug = async (req, res, next) => {
   try {
     const filter = req.query.all === '1' ? {} : { user: req.user._id };
@@ -1006,7 +1136,13 @@ exports.getWebrtcDebug = async (req, res, next) => {
       if (e.event === 'onLoginFailed') s.lastLoginFailed = { at: e.at, reason: e.reason || null };
       if (e.event === 'state') s.lastState = { at: e.at, ...e.detail };
     }
-    return res.json({ success: true, sessions: Object.values(sessions).reverse(), events });
+    // This user's in-app devices and which are checking in right now.
+    const deviceFilter = req.query.all === '1' ? {} : { user: req.user._id };
+    const devices = (await WebrtcEndpoint.find(deviceFilter).sort({ lastUsedAt: -1 }).lean()).map((d) => ({
+      user: d.user, device: d.device, deviceKey: d.deviceKey, lastUsedAt: d.lastUsedAt,
+      onlineAt: d.onlineAt || null, online: isFresh(d.onlineAt),
+    }));
+    return res.json({ success: true, devices, sessions: Object.values(sessions).reverse(), events });
   } catch (err) {
     next(err);
   }
@@ -1042,6 +1178,86 @@ async function ensureUserEndpoint(user, res) {
   }
 }
 
+// ── Per-device endpoints ─────────────────────────────────────────────────
+// The CRM sends a device key (X-Device-Key) it keeps in localStorage; each
+// device gets its own Plivo endpoint and registration (models/
+// WebrtcEndpoint.js). Requests without one — CRM builds from before this —
+// keep using the shared per-user endpoint.
+const DEVICE_KEY_RE = /^[A-Za-z0-9-]{8,64}$/;
+const MAX_DEVICES_PER_USER = 5;
+const deviceKeyOf = (req) => {
+  const k = req.get('X-Device-Key') || req.query?.deviceKey || req.body?.deviceKey;
+  return typeof k === 'string' && DEVICE_KEY_RE.test(k) ? k : null;
+};
+const deviceLabelOf = (req) => clip(req.get('X-Device-Label') || req.get('user-agent'), 200);
+
+// Plivo's record of one endpoint vs what we would dial: corrects the
+// username to Plivo's and re-links the endpoint to our application if
+// needed (Plivo requires endpoint and token "app" to match). Lengths and
+// flags only — no username, no password.
+async function checkEndpointRecord(endpointId, username) {
+  const check = { checkedAt: new Date(), storedLength: (username || '').length };
+  let corrected = null;
+  try {
+    const ep = await plivo.getEndpoint(endpointId);
+    const appExpected = await plivo.applicationId();
+    Object.assign(check, {
+      plivoLength: (ep.username || '').length, match: ep.username === username,
+      appExpected: appExpected || null, appLinked: ep.appId || null,
+      appMatches: !!appExpected && ep.appId === appExpected,
+      sipRegistered: ep.sipRegistered, sipUserAgent: ep.sipUserAgent,
+      usernameCorrected: false, appRelinked: false,
+    });
+    if (ep.username && ep.username !== username) { corrected = ep.username; check.usernameCorrected = true; }
+    if (appExpected && ep.appId !== appExpected) {
+      await plivo.linkEndpointToApp(endpointId, appExpected);
+      Object.assign(check, { appRelinked: true, appLinked: appExpected, appMatches: true });
+    }
+  } catch (err) {
+    const { status, text } = plivoErrorDetail(err);
+    check.error = `Plivo endpoint lookup failed (status ${status ?? '-'})`;
+    console.error(`[calls] endpoint check failed: status=${status ?? '-'} detail=${text}`);
+  }
+  return { check, corrected };
+}
+
+// This device's endpoint: found, or created (and the user's oldest device
+// endpoint retired past MAX_DEVICES_PER_USER), checked against Plivo, and
+// with a password set if missing or if Plivo just refused it (reset).
+async function ensureDeviceEndpoint(user, deviceKey, device, { reset = false } = {}) {
+  let doc = await WebrtcEndpoint.findOne({ user: user._id, deviceKey }).select('+password');
+  if (!doc) {
+    const existing = await WebrtcEndpoint.find({ user: user._id }).sort({ lastUsedAt: 1 }).select('endpointId').lean();
+    for (const old of existing.slice(0, Math.max(0, existing.length - MAX_DEVICES_PER_USER + 1))) {
+      if (old.endpointId) await plivo.deleteEndpoint(old.endpointId).catch(() => {});
+      await WebrtcEndpoint.deleteOne({ _id: old._id });
+      console.info(`[calls] retired oldest device endpoint for user=${user._id} (max ${MAX_DEVICES_PER_USER})`);
+    }
+    const ep = await plivo.ensureEndpoint({ userId: user._id, deviceKey });
+    if (!ep.username) throw new Error('Plivo returned no endpoint username');
+    doc = await WebrtcEndpoint.create({
+      user: user._id, deviceKey, device, endpointId: ep.id, username: ep.username, password: ep.password || undefined,
+    });
+    console.info(`[calls] ${ep.existing ? 'reused' : 'created'} device endpoint ${ep.username} for user=${user._id}`);
+  }
+
+  const { check, corrected } = doc.endpointId
+    ? await checkEndpointRecord(doc.endpointId, doc.username)
+    : { check: { error: 'no endpoint id stored' }, corrected: null };
+  if (corrected) doc.username = corrected;
+
+  if (!doc.password || reset) {
+    doc.password = await plivo.resetEndpointPassword(doc.endpointId);
+    // Never the password itself — only that it changed.
+    console.info(`[calls] set new device endpoint password for user=${user._id} (${reset ? 'login rejected' : 'none stored'})`);
+  }
+  doc.device = device || doc.device;
+  doc.lastUsedAt = new Date();
+  await doc.save();
+  return { doc, endpointCheck: check };
+}
+exports.ensureDeviceEndpoint = ensureDeviceEndpoint;
+
 // How the CRM logs in to Plivo for in-app calling:
 //   'password' — classic SIP registration with the endpoint's own
 //                username/password. The default: on our (India-region)
@@ -1070,6 +1286,35 @@ exports.webrtcLogin = async (req, res, next) => {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
     const mode = LOGIN_MODES.includes(req.query.mode) ? req.query.mode : serverLoginMode();
     if (mode === 'token') return res.json({ success: true, mode });
+
+    // This device's own endpoint (the CRM sends its device key).
+    const deviceKey = deviceKeyOf(req);
+    if (deviceKey) {
+      let ensured;
+      try {
+        ensured = await ensureDeviceEndpoint(req.user, deviceKey, deviceLabelOf(req), { reset: req.query.reset === '1' });
+      } catch (err) {
+        const { status, text } = plivoErrorDetail(err);
+        console.error(`[calls] device endpoint setup failed: status=${status ?? '-'} detail=${text}`);
+        return res.status(502).json({
+          success: false, stage: 'endpoint', plivoStatus: status,
+          message: `Could not set up in-app calling with Plivo for this device (status ${status ?? '-'}). Calls will ring your phone.`,
+        });
+      }
+      saveDebugEvents(req.user, [{
+        event: 'server:credentials_issued', sessionId: req.get('X-Client-Session'), device: deviceLabelOf(req),
+        detail: { endpointCheck: ensured.endpointCheck, deviceKey, perDevice: true }, at: new Date(),
+      }]).catch(() => {});
+      res.set('Cache-Control', 'no-store');
+      return res.json({
+        success : true,
+        mode,
+        perDevice: true,
+        username: ensured.doc.username,
+        password: ensured.doc.password,
+        endpointCheck: ensured.endpointCheck,
+      });
+    }
 
     const user = await loadEndpointUser(req.user._id);
     const failed = await ensureUserEndpoint(user, res);
@@ -1113,6 +1358,23 @@ exports.webrtcLogin = async (req, res, next) => {
 exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+
+    // Token mode on a device with its own endpoint signs for that endpoint.
+    const deviceKey = deviceKeyOf(req);
+    if (deviceKey) {
+      try {
+        const { doc, endpointCheck } = await ensureDeviceEndpoint(req.user, deviceKey, deviceLabelOf(req));
+        const { token, expiresAt } = await plivo.issueToken(doc.username);
+        return res.json({ success: true, token, expiresAt, endpointCheck, perDevice: true });
+      } catch (err) {
+        const { status, text } = plivoErrorDetail(err);
+        console.error(`[calls] device token failed: status=${status ?? '-'} detail=${text}`);
+        return res.status(502).json({
+          success: false, stage: 'token', plivoStatus: status,
+          message: `Could not get an in-app calling token from Plivo (status ${status ?? '-'}). Calls will ring your phone.`,
+        });
+      }
+    }
 
     const user = await loadEndpointUser(req.user._id);
     const failed = await ensureUserEndpoint(user, res);
@@ -1159,6 +1421,14 @@ exports.webrtcToken = async (req, res, next) => {
 exports.webrtcPresence = async (req, res, next) => {
   try {
     const online = !!req.body?.online;
+    const deviceKey = deviceKeyOf(req);
+    if (deviceKey) {
+      // This device only — the user's other devices keep their own state.
+      await WebrtcEndpoint.updateOne({ user: req.user._id, deviceKey }, online
+        ? { $set: { onlineAt: new Date() } }
+        : { $unset: { onlineAt: 1 } });
+      return res.json({ success: true, online, perDevice: true });
+    }
     await User.updateOne({ _id: req.user._id }, online
       ? { $set: { appOnlineAt: new Date() } }
       : { $unset: { appOnlineAt: 1 } });

@@ -167,8 +167,10 @@ const plivoRest = (method, path, data) => axios.request({
 // Plivo rejected. The alias also identifies the endpoint for lookup, which
 // keeps provisioning idempotent.
 const safeId = (userId) => String(userId).toLowerCase().replace(/[^a-z0-9]/g, '');
-const endpointAlias = (userId) => `savelife-${safeId(userId)}`;
-const endpointBaseUsername = (userId) => `sl${safeId(userId).slice(-12)}`;
+const endpointAlias = (userId, deviceKey) =>
+  deviceKey ? `savelife-${safeId(userId)}-${safeId(deviceKey).slice(0, 12)}` : `savelife-${safeId(userId)}`;
+const endpointBaseUsername = (userId, deviceKey) =>
+  deviceKey ? `sl${safeId(userId).slice(-8)}${safeId(deviceKey).slice(0, 6)}` : `sl${safeId(userId).slice(-12)}`;
 
 // The Plivo Application linked to PLIVO_NUMBER — the one holding our
 // /incoming and /events URLs. PLIVO_APP_ID wins if set; otherwise looked up
@@ -200,8 +202,8 @@ async function applicationId() {
 // to the requested username; the real one comes back and is what we keep.
 // Returns { id, username, password } — password only when newly created
 // (Plivo never returns it later).
-async function ensureEndpoint({ userId }) {
-  const alias = endpointAlias(userId);
+async function ensureEndpoint({ userId, deviceKey }) {
+  const alias = endpointAlias(userId, deviceKey);
 
   for (let offset = 0; offset < 1000; offset += 20) {
     const { data } = await plivoRest('get', `/Endpoint/?limit=20&offset=${offset}`);
@@ -214,7 +216,7 @@ async function ensureEndpoint({ userId }) {
   const password = crypto.randomBytes(18).toString('base64url');
   const appId = await applicationId();
   const { data } = await plivoRest('post', '/Endpoint/', {
-    username: endpointBaseUsername(userId),
+    username: endpointBaseUsername(userId, deviceKey),
     password,
     alias,
     ...(appId ? { app_id: appId } : {}),
@@ -266,6 +268,8 @@ async function listLiveCalls({ max = 25 } = {}) {
 }
 
 const hangupCall = (uuid) => plivoRest('delete', `/Call/${encodeURIComponent(uuid)}/`);
+
+const deleteEndpoint = (endpointId) => plivoRest('delete', `/Endpoint/${encodeURIComponent(endpointId)}/`);
 
 // Plivo issues the token: POST /JWT/Token/ — only used when
 // PLIVO_WEBRTC_LOGIN=token (password login is the default). Receive-only:
@@ -323,7 +327,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
-  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall,
+  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall, deleteEndpoint,
   APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,

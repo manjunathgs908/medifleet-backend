@@ -28,5 +28,8 @@ router.all('/recording', ctrl.requirePlivoSignature, ctrl.recording);
 router.get('/logs', protect, authorize('owner'), ctrl.listLogs);
 router.get('/duty', protect, authorize('owner'), ctrl.getDuty);
 router.put('/duty', protect, authorize('owner'), ctrl.setDuty);
+// Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
+// sent to the browser).
+router.get('/:id/recording', protect, authorize('owner'), ctrl.streamRecording);
 
 module.exports = router;

@@ -97,4 +97,15 @@ describe('no response carries a customer number', () => {
     expect(JSON.stringify(out)).not.toContain('9123456789');
     expect(out.customerMasked).toBe('••••••4442');
   });
+
+  it('CallLog — not the Plivo recording URL either, only that one exists', () => {
+    const log = new CallLog({
+      provider: 'plivo', direction: 'outbound', context: 'trip',
+      recordingUrl: 'https://media.plivo.com/v1/Account/MA/Recording/r1.mp3', recordingId: 'r1',
+    });
+    const out = JSON.parse(JSON.stringify(log));
+    expect(JSON.stringify(out)).not.toContain('plivo.com');
+    expect(out.recordingId).toBeUndefined();
+    expect(out.hasRecording).toBe(true);
+  });
 });

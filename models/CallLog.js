@@ -68,6 +68,12 @@ CallLogSchema.set('toJSON', {
       delete ret.customerPhone;
     }
     delete ret.agentPhone;
+    // The Plivo recording URL stays server-side too: with Plivo's Basic Auth
+    // for recordings on, it needs our credentials, and either way the CRM
+    // plays it through GET /api/calls/:id/recording, which checks the login.
+    ret.hasRecording = !!ret.recordingUrl;
+    delete ret.recordingUrl;
+    delete ret.recordingId;
     return ret;
   },
 });

@@ -42,6 +42,13 @@ jest.mock('../models/CallLog', () => ({
   create: jest.fn(), findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), updateOne: jest.fn(),
 }));
 jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
+// Only .get is replaced: the real Plivo SDK (kept for its signature check)
+// configures axios when it loads.
+jest.mock('axios', () => {
+  const actual = jest.requireActual('axios');
+  actual.get = jest.fn();
+  return actual;
+});
 
 const mockCreateCall = jest.fn();
 jest.mock('plivo', () => {
@@ -52,6 +59,7 @@ jest.mock('plivo', () => {
   };
 });
 
+const axios = require('axios');
 const { Trip, User } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const CallLog = require('../models/CallLog');
@@ -308,7 +316,7 @@ describe('events and recording', () => {
     expect(log.endedAt).toBeInstanceOf(Date);
   });
 
-  it('stores the recording URL', async () => {
+  it('stores the recording URL (server-side only)', async () => {
     await run(ctrl.recording, {
       method: 'POST', query: { log: '64b000000000000000000001' },
       body: { RecordUrl: 'https://media.plivo.com/rec.mp3', RecordingID: 'r1', RecordingDuration: '95' },
@@ -317,5 +325,72 @@ describe('events and recording', () => {
       { _id: '64b000000000000000000001' },
       { $set: { recordingUrl: 'https://media.plivo.com/rec.mp3', recordingId: 'r1', recordingSec: 95 } },
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('recording playback', () => {
+  const LOG_ID = '64b000000000000000000001';
+  const PLIVO_URL = 'https://media.plivo.com/v1/Account/MAXXX/Recording/r1.mp3';
+
+  const streamRes = () => {
+    const res = mockRes();
+    res.headers = {};
+    res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v; };
+    res.on = jest.fn();
+    res.destroy = jest.fn();
+    return res;
+  };
+  const upstream = (status, headers = {}) => ({
+    status,
+    headers,
+    data: { pipe: jest.fn(), on: jest.fn(), destroy: jest.fn() },
+  });
+
+  it('fetches from Plivo with Basic Auth and streams it, never sending the URL', async () => {
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL }));
+    const up = upstream(206, { 'content-type': 'audio/mpeg', 'content-range': 'bytes 0-99/1000', 'x-plivo': 'no' });
+    axios.get.mockResolvedValue(up);
+
+    const res = streamRes();
+    const next = jest.fn();
+    await ctrl.streamRecording({ params: { id: LOG_ID }, get: (h) => (h === 'range' ? 'bytes=0-99' : undefined) }, res, next);
+
+    const [url, opts] = axios.get.mock.calls[0];
+    expect(url).toBe(PLIVO_URL);
+    expect(opts.auth).toEqual({ username: 'MAXXXXXXXXXXXXXXXXXX', password: 'plivo-test-token' });
+    expect(opts.headers).toEqual({ Range: 'bytes=0-99' });
+    expect(res.statusCode).toBe(206);
+    expect(res.headers['content-range']).toBe('bytes 0-99/1000');
+    expect(res.headers['x-plivo']).toBeUndefined();
+    expect(res.headers['cache-control']).toBe('private, no-store');
+    expect(up.data.pipe).toHaveBeenCalledWith(res);
+    expect(JSON.stringify(res.headers)).not.toContain('plivo.com');
+  });
+
+  it('never sends our credentials to a host that is not Plivo', async () => {
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: 'https://evil.example.com/r.mp3' }));
+    const res = streamRes();
+    await ctrl.streamRecording({ params: { id: LOG_ID }, get: () => undefined }, res, jest.fn());
+    expect(res.statusCode).toBe(502);
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('404s a call with no recording', async () => {
+    CallLog.findById.mockReturnValue(chain({}));
+    const res = streamRes();
+    await ctrl.streamRecording({ params: { id: LOG_ID }, get: () => undefined }, res, jest.fn());
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('explains a Plivo auth refusal instead of streaming an error page', async () => {
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL }));
+    const up = upstream(401);
+    axios.get.mockResolvedValue(up);
+    const res = streamRes();
+    await ctrl.streamRecording({ params: { id: LOG_ID }, get: () => undefined }, res, jest.fn());
+    expect(res.statusCode).toBe(502);
+    expect(res.body.message).toMatch(/PLIVO_AUTH_ID/);
+    expect(up.data.pipe).not.toHaveBeenCalled();
   });
 });

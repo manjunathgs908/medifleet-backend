@@ -11,7 +11,8 @@
  *                         918065591088 -> ring CRM staff on call duty.
  *   POST /events          Plivo hangup_url and Dial action -> status.
  *   POST /recording       Plivo Record action/callback -> recording URL.
- *   GET  /logs            CRM call history with recordings.
+ *   GET  /logs            CRM call history (hasRecording, never the URL).
+ *   GET  /:id/recording   streams a recording from Plivo (Basic Auth).
  *   GET/PUT /duty         CRM staff's own "On call duty" switch.
  *
  * The customer's number exists only here and in Plivo's XML. Clients send a
@@ -27,6 +28,7 @@
 'use strict';
 
 const mongoose = require('mongoose');
+const axios    = require('axios');
 const { Trip, Lead, User } = require('../models');
 const Ambulance    = require('../models/Ambulance');
 const Quote        = require('../models/Quote');
@@ -413,6 +415,92 @@ exports.listLogs = async (req, res, next) => {
       .populate('lead', 'patientName');
 
     return res.json({ success: true, logs });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// Only ever fetch from Plivo's own hosts with our credentials. The URL came
+// from a signed Plivo webhook, but a stored value is still never trusted
+// to send PLIVO_AUTH_TOKEN somewhere else.
+function isPlivoMediaUrl(raw) {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && (u.hostname === 'plivo.com' || u.hostname.endsWith('.plivo.com'));
+  } catch {
+    return false;
+  }
+}
+
+// Passed through so the player can seek and the browser can show length.
+const PASSTHROUGH_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+
+// ============================================================
+// @route   GET /api/calls/:id/recording
+// @desc    Streams one call's recording from Plivo to a signed-in CRM user.
+//          Fetched with PLIVO_AUTH_ID/PLIVO_AUTH_TOKEN as Basic Auth, which
+//          is what Plivo requires once "Basic Auth For Recording URLs" is
+//          on (and is harmless while it is off). The Plivo URL itself never
+//          reaches the browser. A Range header is forwarded for seeking.
+// @access  Private [owner]
+// ============================================================
+exports.streamRecording = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) {
+      return res.status(404).json({ success: false, message: 'Recording not found.' });
+    }
+    const log = await CallLog.findById(req.params.id).select('recordingUrl');
+    if (!log?.recordingUrl) {
+      return res.status(404).json({ success: false, message: 'This call has no recording.' });
+    }
+    if (!isPlivoMediaUrl(log.recordingUrl)) {
+      return res.status(502).json({ success: false, message: 'This recording is not stored with Plivo.' });
+    }
+    if (!process.env.PLIVO_AUTH_ID || !process.env.PLIVO_AUTH_TOKEN) {
+      return res.status(503).json({ success: false, message: 'Recordings cannot be played: Plivo credentials are not set on the server.' });
+    }
+
+    let upstream;
+    try {
+      upstream = await axios.get(log.recordingUrl, {
+        auth          : { username: process.env.PLIVO_AUTH_ID, password: process.env.PLIVO_AUTH_TOKEN },
+        responseType  : 'stream',
+        timeout       : 20000,
+        headers       : req.get('range') ? { Range: req.get('range') } : {},
+        // Read Plivo's status ourselves so a 401/404 becomes a clear message.
+        validateStatus: () => true,
+      });
+    } catch (err) {
+      console.error('[calls] recording fetch failed:', err.message);
+      return res.status(502).json({ success: false, message: 'Could not reach Plivo for this recording. Please try again.' });
+    }
+
+    if (upstream.status >= 400) {
+      upstream.data?.destroy?.();
+      const message = upstream.status === 401 || upstream.status === 403
+        ? 'Plivo refused the recording request. Check PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN on Render.'
+        : upstream.status === 404
+          ? 'Plivo no longer has this recording.'
+          : 'Could not load this recording from Plivo.';
+      return res.status(upstream.status === 404 ? 404 : 502).json({ success: false, message });
+    }
+
+    res.status(upstream.status);
+    for (const h of PASSTHROUGH_HEADERS) {
+      if (upstream.headers?.[h]) res.setHeader(h, upstream.headers[h]);
+    }
+    if (!upstream.headers?.['content-type']) res.setHeader('content-type', 'audio/mpeg');
+    // A call recording is personal data: never cached by a browser or proxy.
+    res.setHeader('cache-control', 'private, no-store');
+
+    upstream.data.on('error', (err) => {
+      console.error('[calls] recording stream error:', err.message);
+      res.destroy(err);
+    });
+    // Stop pulling from Plivo if the user closes the player.
+    res.on('close', () => upstream.data.destroy?.());
+    upstream.data.pipe(res);
   } catch (err) {
     next(err);
   }

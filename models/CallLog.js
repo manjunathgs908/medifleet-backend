@@ -39,7 +39,7 @@ const CallLogSchema = new mongoose.Schema(
     callerId: { type: String },
 
     // What the call was about.
-    context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming'], required: true },
+    context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming', 'test_ring'], required: true },
     trip        : { type: mongoose.Schema.Types.ObjectId, ref: 'Trip', index: true },
     lead        : { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', index: true },
     quote       : { type: mongoose.Schema.Types.ObjectId, ref: 'Quote' },

@@ -22,6 +22,7 @@ router.all('/answer',    ctrl.requirePlivoSignature, ctrl.answer);
 router.all('/incoming',  ctrl.requirePlivoSignature, ctrl.incoming);
 router.all('/events',    ctrl.requirePlivoSignature, ctrl.events);
 router.all('/recording', ctrl.requirePlivoSignature, ctrl.recording);
+router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
 // cannot reach these.
@@ -31,6 +32,8 @@ router.put('/duty', protect, authorize('owner'), ctrl.setDuty);
 router.get('/me',     protect, authorize('owner'), ctrl.getMe);
 router.put('/me',     protect, authorize('owner'), ctrl.setMe);
 router.get('/config', protect, authorize('owner'), ctrl.getConfig);
+// "Ring my phone now (test)" — rings the user's own ring number.
+router.post('/test-ring', protect, authorize('owner'), ctrl.testRing);
 
 // What Plivo has live right now (each call counts toward its concurrency
 // limit), and hanging up one stuck call by id.

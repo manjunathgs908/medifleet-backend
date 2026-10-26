@@ -71,6 +71,25 @@ async function callFirstLeg({ phone, logId }) {
   return { requestId: res.requestUuid || res.request_uuid || null, callerId: companyNumber() };
 }
 
+// "Ring my phone now (test)": rings one staff ring phone from the company
+// number. /test-answer speaks a short message and hangs up — no <Dial>, no
+// <Record>, nobody else on the line.
+async function callTestRing({ phone, logId }) {
+  const res = await getClient().calls.create(
+    companyNumber(),
+    toE164(phone),
+    apiUrl(`/api/calls/test-answer?log=${logId}`),
+    {
+      answerMethod : 'POST',
+      hangupUrl    : apiUrl(`/api/calls/events?log=${logId}`),
+      hangupMethod : 'POST',
+      ringTimeout  : PHONE_RING_SECONDS,
+      timeLimit    : 60,
+    },
+  );
+  return { requestId: res.requestUuid || res.request_uuid || null };
+}
+
 // One line per call in the Render log, so which provider and caller ID
 // handled a call can be read straight off production, never assumed.
 const logCall = (what, log) =>
@@ -325,7 +344,7 @@ const emptyXml = () => xml('');
 
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
-  callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
+  callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
   getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall, deleteEndpoint,
   APP_RING_SECONDS, PHONE_RING_SECONDS,

@@ -1335,3 +1335,76 @@ describe('per-device endpoints (one registration per device)', () => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────
+describe('"Ring my phone now (test)" and the caller-is-ring-phone note', () => {
+  const me = { _id: 'u1', role: 'owner', name: 'Manju', phone: '9000000001', callPhone: '9986844442' };
+
+  it('rings my ring number from the company number, to the test answer URL — no customer, no recording', async () => {
+    CallLog.findOne.mockReturnValue(chain(null));
+    const { res } = await run(ctrl.testRing, { user: me });
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.ringPhone).toBe('••••••4442');
+    const [from, to, answerUrl, params] = mockCreateCall.mock.calls[0];
+    expect(from).toBe('918065591088');
+    expect(to).toBe('919986844442');
+    expect(answerUrl).toBe('https://api.savelife.health/api/calls/test-answer?log=64b000000000000000000001');
+    expect(params.hangupUrl).toContain('/api/calls/events?log=');
+    expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({ context: 'test_ring', direction: 'outbound', agentUser: 'u1' }));
+    expect(CallLog.create.mock.calls[0][0].customerPhone).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('9986844442');
+  });
+
+  it('one test at a time per user', async () => {
+    CallLog.findOne.mockReturnValue(chain({ _id: 'recent' }));
+    const { res } = await run(ctrl.testRing, { user: me });
+    expect(res.statusCode).toBe(429);
+    expect(mockCreateCall).not.toHaveBeenCalled();
+  });
+
+  it('needs a valid ring number', async () => {
+    const { res } = await run(ctrl.testRing, { user: { ...me, phone: '', callPhone: '' } });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('answered: marks it connected, speaks the test message and hangs up — no Dial, no Record', async () => {
+    const log = logDoc({ context: 'test_ring', status: 'initiated', flow: ['test_ring:40s'] });
+    CallLog.findById.mockResolvedValue(log);
+    const { res } = await run(ctrl.testAnswer, { method: 'POST', query: { log: '64b000000000000000000001' }, body: { CallUUID: 't1' } });
+    expect(res.body).toContain('SaveLife test call');
+    expect(res.body).toContain('<Hangup/>');
+    expect(res.body).not.toContain('<Dial');
+    expect(res.body).not.toContain('<Record');
+    expect(log.status).toBe('completed');
+  });
+
+  it('busy: the hang-up report marks the test busy with Plivo\'s cause', async () => {
+    const log = logDoc({ context: 'test_ring', status: 'initiated', flow: ['test_ring:40s'] });
+    CallLog.findById.mockResolvedValue(log);
+    await run(ctrl.events, { method: 'POST', query: { log: '64b000000000000000000001' }, body: { CallStatus: 'busy', HangupCause: 'USER_BUSY', HangupCauseName: 'Busy Line' } });
+    expect(log.status).toBe('agent_busy');
+    expect(log.hangup).toEqual(expect.objectContaining({ CallStatus: 'busy', HangupCauseName: 'Busy Line' }));
+    expect(log.flow).toEqual(['test_ring:40s', 'test_ring:busy']);
+  });
+
+  it('calling in FROM the only ring phone: nothing rings, and the log and the caller are told why', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([{ _id: 'u1', name: 'Manju', callMode: 'phone', phone: '9000000001', callPhone: '9986844442' }]));
+    const saved = process.env.PLIVO_FALLBACK_AGENTS;
+    delete process.env.PLIVO_FALLBACK_AGENTS;
+    try {
+      const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'self' } });
+      expect(res.body).not.toContain('<Dial');
+      expect(res.body).toContain('calling from a SaveLife ring number');
+      const created = CallLog.create.mock.calls[0][0];
+      expect(created.flow).toEqual(['skipped_caller_ring_phone→busy_message']);
+      expect(created.routing.skippedCaller).toEqual(expect.objectContaining({ ringPhone: '••••••4442', leftNobody: true }));
+      expect(created.routing.skippedCaller.message).toMatch(/Did not ring ••••••4442 \(Manju's ring number\) — it was the number that called in.*Ring my phone now/);
+      expect(JSON.stringify(created.routing)).not.toContain('9986844442');
+    } finally {
+      if (saved !== undefined) process.env.PLIVO_FALLBACK_AGENTS = saved;
+    }
+  });
+});

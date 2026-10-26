@@ -150,6 +150,23 @@ const callerIsRingPhone = (users, callerPhone) => {
   return !!caller && users.some((u) => normalisePhone(ringPhoneOf(u)) === caller);
 };
 
+// For the call log: whose ring number called in, and — when skipping it
+// left no other phone to ring — why nothing rang. Masked number only.
+function skippedCallerNote(users, callerPhone, otherPhones) {
+  const caller = normalisePhone(callerPhone);
+  const owners = users.filter((u) => normalisePhone(ringPhoneOf(u)) === caller).map((u) => u.name).filter(Boolean);
+  const masked = maskPhone(caller);
+  return {
+    ringPhone  : masked,
+    ringPhoneOf: owners,
+    otherPhones,
+    leftNobody : otherPhones === 0,
+    message    : otherPhones === 0
+      ? `Did not ring ${masked}${owners.length ? ` (${owners.join(', ')}'s ring number)` : ''} — it was the number that called in, and no other phone was on duty. Test from a different phone, or use "Ring my phone now".`
+      : `Did not ring ${masked} — it was the number that called in. Rang the other ${otherPhones} on-duty phone(s).`,
+  };
+}
+
 // ── Phone legs: overlap check and stuck-leg clean-up ──────────────────────
 // A leg Plivo still shows "ringing" this long after it started is stuck:
 // no Dial of ours rings longer than PHONE_RING_SECONDS, and Plivo gives up
@@ -321,7 +338,11 @@ function dialResult(b) {
 
 const BUSY_MESSAGE = 'Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.';
 
-const NOT_CONFIGURED = 'Calling is not set up: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER (91 followed by 10 digits) are needed on the server.';
+// Heard only by someone calling in FROM an on-duty ring number when that
+// left no phone to ring — staff testing, never a customer.
+const SELF_CALL_MESSAGE = 'You are calling from a SaveLife ring number, so this call was not forwarded to it, and no other phone is on duty. To test your phone, use Ring my phone now in the CRM, or call from a different phone.';
+
+const NOT_CONFIGURED ='Calling is not set up: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER (91 followed by 10 digits) are needed on the server.';
 
 // Logs the call, then has Plivo ring the first party from PLIVO_NUMBER.
 // Shared by click-to-call and the legacy /api/call/connect, so there is one
@@ -594,6 +615,8 @@ exports.incoming = async (req, res, next) => {
       // The caller is one of the ring numbers (e.g. a test call from it):
       // that number is left out of this call's phone Dial.
       callerIsRingPhone: callerWasRingPhone,
+      // Only when no app rings first: then whether skipping it left nobody.
+      ...(callerWasRingPhone && !sipUsers.length ? { skippedCaller: skippedCallerNote(onDuty, from, agentPhones.length) } : {}),
       dutyUsers   : onDuty.map((u) => ({
         user          : u._id,
         name          : u.name,
@@ -623,7 +646,7 @@ exports.incoming = async (req, res, next) => {
 
     const log = await CallLog.create({
       routing,
-      flow   : [!ringing ? 'busy_message' : sipUsers.length ? `app:${plivo.APP_RING_SECONDS}s` : `phones:${agentPhones.length}:${plivo.PHONE_RING_SECONDS}s`],
+      flow   : [!ringing ? (callerWasRingPhone ? 'skipped_caller_ring_phone→busy_message' : 'busy_message') :sipUsers.length ? `app:${plivo.APP_RING_SECONDS}s` : `phones:${agentPhones.length}:${plivo.PHONE_RING_SECONDS}s`],
       provider     : 'plivo',
       callerId     : plivo.companyNumber(),
       direction    : 'inbound',
@@ -646,7 +669,7 @@ exports.incoming = async (req, res, next) => {
       phones  : agentPhones.length,
     });
 
-    if (!ringing) return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
+    if (!ringing) return sendXml(res, plivo.speakXml(callerWasRingPhone ? SELF_CALL_MESSAGE : BUSY_MESSAGE));
     if (sipUsers.length) {
       sendXml(res, plivo.bridgeXml({ sipUsers, logId: log._id, stage: 'app', timeout: plivo.APP_RING_SECONDS }));
       // After answering Plivo, so it cannot delay the call: Plivo's own view
@@ -702,7 +725,8 @@ exports.events = async (req, res, next) => {
             fellBackToPhones: phones.length,
           };
           serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, DialHangupCause: b.DialHangupCause || b.DialBLegHangupCause || null, fellBackToPhones: phones.length });
-          log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : 'busy_message'}`];
+          log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : callerWasRingPhone ? 'skipped_caller_ring_phone→busy_message' : 'busy_message'}`];
+          if (callerWasRingPhone) log.routing = { ...(log.routing || {}), skippedCaller: skippedCallerNote(onDuty, b.From, phones.length) };
           log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
           if (phones.length) log.dialledPhones = phones.map(normalisePhone);
@@ -713,7 +737,7 @@ exports.events = async (req, res, next) => {
           recordPhoneDial(logId, phones, { callerWasRingPhone }).catch(() => {});
           return undefined;
         }
-        return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
+        return sendXml(res, plivo.speakXml(callerWasRingPhone ? SELF_CALL_MESSAGE : BUSY_MESSAGE));
       }
 
       if (log) {
@@ -759,6 +783,7 @@ exports.events = async (req, res, next) => {
           ? 'missed'
           : (log.status === 'agent_answered' ? 'customer_missed' : (AGENT_LEG_FAIL[callStatus] || 'agent_missed'));
       }
+      if (log.context === 'test_ring') log.flow = [...(log.flow || []), `test_ring:${callStatus || 'ended'}`];
       if (b.CallUUID && !log.providerCallId) log.providerCallId = b.CallUUID;
       const total = Number(b.Duration);
       if (Number.isFinite(total)) log.totalSec = total;
@@ -1603,6 +1628,95 @@ exports.getCall = async (req, res, next) => {
       .populate('lead', 'patientName');
     if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });
     return res.json({ success: true, log });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/calls/test-ring
+// @desc    "Ring my phone now (test)": Plivo rings the signed-in user's
+//          ring number from the company number and, if answered, says it
+//          is a test and hangs up. Nothing recorded, no customer involved —
+//          so the phone path can be checked without a second phone to
+//          call in from. The CRM polls GET /:id for the outcome.
+// @access  Private [owner]
+// ============================================================
+const TEST_RING_MESSAGE = 'This is a SaveLife test call. Your ring number works. Goodbye.';
+const TEST_RING_GAP_MS = 30 * 1000;
+
+exports.testRing = async (req, res, next) => {
+  try {
+    if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+    const phone = ringPhoneOf(req.user);
+    if (!isMobile(phone)) {
+      return res.status(400).json({ success: false, message: 'Set a valid ring number first.' });
+    }
+    // One test at a time per user — each is a real Plivo call.
+    const recent = await CallLog.findOne({
+      context: 'test_ring', agentUser: req.user._id,
+      startedAt: { $gte: new Date(Date.now() - TEST_RING_GAP_MS) },
+    }).select('_id').lean();
+    if (recent) {
+      return res.status(429).json({ success: false, message: 'A test call was placed in the last 30 seconds. Wait for it to finish.' });
+    }
+
+    const log = await CallLog.create({
+      provider  : 'plivo',
+      direction : 'outbound',
+      firstLeg  : 'agent',
+      context   : 'test_ring',
+      agentType : 'staff',
+      agentUser : req.user._id,
+      agentName : req.user.name,
+      agentPhone: normalisePhone(phone),
+      callerId  : plivo.companyNumber(),
+      status    : 'initiated',
+      flow      : [`test_ring:${plivo.PHONE_RING_SECONDS}s`],
+    });
+    try {
+      const { requestId } = await plivo.callTestRing({ phone, logId: log._id });
+      log.providerRequestId = requestId;
+      await log.save();
+      plivo.logCall('test ring placed', log);
+    } catch (plivoErr) {
+      console.error('[calls] test ring failed:', plivoErr?.message || plivoErr);
+      log.status = 'failed';
+      log.error = String(plivoErr?.message || plivoErr).slice(0, 500);
+      log.endedAt = new Date();
+      await log.save();
+      return res.status(502).json({ success: false, message: plivo.friendlyError(plivoErr), callLogId: log._id });
+    }
+    return res.json({
+      success  : true,
+      callLogId: log._id,
+      ringPhone: maskPhone(phone),
+      callerId : log.callerId,
+      message  : `Ringing ${maskPhone(phone)} from ${log.callerId} now.`,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/calls/test-answer?log=<id>
+// @desc    The test call was answered: say so, hang up. No Dial, no Record.
+// @access  Plivo (signature)
+// ============================================================
+exports.testAnswer = async (req, res, next) => {
+  try {
+    const logId = logIdOf(req);
+    const log = logId ? await CallLog.findById(logId) : null;
+    if (log?.context === 'test_ring') {
+      log.status = 'completed';
+      log.answeredAt = new Date();
+      if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
+      log.flow = [...(log.flow || []), 'test_ring:answered'];
+      await log.save();
+    }
+    return sendXml(res, plivo.speakXml(TEST_RING_MESSAGE));
   } catch (err) {
     next(err);
   }

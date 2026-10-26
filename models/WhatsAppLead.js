@@ -1,6 +1,7 @@
 'use strict';
 const mongoose = require('mongoose');
 const { maskPhone, customerRef } = require('../utils/customerPhone');
+const { fullPhone } = require('../utils/phoneViewer');
 
 // A WhatsApp conversation that asked for a service with no working
 // backendCode (see whatsappServiceCatalog.js's bookable flag) or hit a
@@ -39,7 +40,9 @@ WhatsAppLeadSchema.set('toJSON', {
     if ('phone' in ret) {
       ret.phoneMasked = maskPhone(ret.phone);
       ret.customerRef = customerRef(ret.phone);
+      const full = fullPhone(ret.phone); // CRM owner only
       delete ret.phone;
+      if (full) ret.phone = full;
     }
     return ret;
   },

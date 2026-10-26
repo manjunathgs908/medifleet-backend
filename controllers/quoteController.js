@@ -25,6 +25,7 @@ const { quoteTrip, createBookedTrip } = require('./tripController');
 const fareCalculator = require('../utils/fareCalculator');
 const { normalisePhone } = require('../utils/phone');
 const { maskPhone } = require('../utils/customerPhone');
+const { fullPhone } = require('../utils/phoneViewer');
 const whatsappNotifications = require('../services/whatsappNotifications');
 const { resolveTrackingUrl } = require('../services/trackingNotifications');
 
@@ -99,8 +100,10 @@ function crmView(quote) {
     _id         : quote._id,
     url         : quoteUrl(quote),
     // Masked like every other customer number the CRM receives; the desk
-    // calls a quote's customer through POST /api/calls/click-to-call.
+    // calls a quote's customer through POST /api/calls/click-to-call. The
+    // full number only for a CRM owner (absent for a telecaller).
     phoneMasked : maskPhone(quote.phone),
+    phone       : fullPhone(quote.phone),
     patientName : quote.patientName || null,
     pickup      : quote.pickup || null,
     drop        : quote.drop || null,

@@ -36,6 +36,7 @@
 const jwt  = require('jsonwebtoken');
 const { User } = require('../models');
 const Owner = require('../models/Owner');
+const { runAsViewer } = require('../utils/phoneViewer');
 
 /**
  * protect — JWT verification middleware
@@ -95,7 +96,8 @@ const protect = async (req, res, next) => {
     // invisible from inside a controller. Anything that must treat them
     // differently reads this instead of guessing.
     req.actorType = 'user';
-    next();
+    // Full customer numbers for a CRM owner, masked for everyone else.
+    runAsViewer(req.user, next);
 
   } catch (err) {
     // Distinguish between expired and invalid tokens for better UX
@@ -283,7 +285,7 @@ const protectUserOrOwner = async (req, res, next) => {
       }
       req.user = user;
       req.actorType = 'user';
-      return next();
+      return runAsViewer(req.user, next);
     }
 
     const owner = await Owner.findById(decoded.id);

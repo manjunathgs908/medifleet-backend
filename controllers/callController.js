@@ -883,7 +883,7 @@ exports.listLogs = async (req, res, next) => {
 
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const logs = await CallLog.find(filter)
-      .select('+customerPhone') // only so toJSON can mask it
+      .select('+customerPhone') // for toJSON: masked, or in full for a CRM owner
       .sort({ createdAt: -1 })
       .limit(limit)
       .populate('trip', 'tripNumber patientName')
@@ -1624,7 +1624,7 @@ exports.getCall = async (req, res, next) => {
   try {
     if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
     const log = await CallLog.findById(req.params.id)
-      .select('+customerPhone') // only so toJSON can mask it
+      .select('+customerPhone') // for toJSON: masked, or in full for a CRM owner
       .populate('trip', 'tripNumber patientName status')
       .populate('lead', 'patientName');
     if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });

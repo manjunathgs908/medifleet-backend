@@ -2,6 +2,7 @@
 const mongoose = require('mongoose');
 const { maskPhone } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
+const { fullPhone } = require('../utils/phoneViewer');
 
 // One masked, recorded phone call through Plivo (or the Exotel fallback):
 // an agent -- a driver, a fleet owner, or CRM staff -- and a customer.
@@ -99,7 +100,9 @@ CallLogSchema.set('toJSON', {
   transform(doc, ret) {
     if ('customerPhone' in ret) {
       ret.customerMasked = maskPhone(ret.customerPhone);
+      const full = fullPhone(ret.customerPhone); // CRM owner only
       delete ret.customerPhone;
+      if (full) ret.customerPhone = full;
     }
     delete ret.agentPhone;
     delete ret.dialledPhones;

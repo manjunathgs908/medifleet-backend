@@ -28,6 +28,7 @@ const mongoose = require('mongoose');
 const bcrypt   = require('bcryptjs');
 const crypto   = require('crypto');
 const { maskPhone } = require('../utils/customerPhone');
+const { fullPhone } = require('../utils/phoneViewer');
 
 const { Schema } = mongoose;
 
@@ -523,7 +524,9 @@ leadSchema.set('toJSON', {
   transform(doc, ret) {
     if ('phone' in ret) {
       ret.phoneMasked = maskPhone(ret.phone);
+      const full = fullPhone(ret.phone); // CRM owner only
       delete ret.phone;
+      if (full) ret.phone = full;
     }
     return ret;
   },
@@ -792,8 +795,9 @@ const tripSchema = new Schema(
   { timestamps: true }
 );
 
-// The customer's number is for this backend only: WhatsApp/SMS sends and
-// masked calls read it off the document, but no response carries it. Every
+// The customer's number is for this backend (and a CRM owner) only:
+// WhatsApp/SMS sends and masked calls read it off the document; responses
+// carry it masked, plus in full only for a CRM owner (utils/phoneViewer). Every
 // res.json of a Trip document goes through this, which is what makes the
 // rule hold for endpoints nobody remembers to check. Clients get the masked
 // form to display and call via POST /api/calls/click-to-call with the trip
@@ -803,7 +807,9 @@ tripSchema.set('toJSON', {
   transform(doc, ret) {
     if ('patientPhone' in ret) {
       ret.patientPhoneMasked = maskPhone(ret.patientPhone);
+      const full = fullPhone(ret.patientPhone); // CRM owner only
       delete ret.patientPhone;
+      if (full) ret.patientPhone = full;
     }
     return ret;
   },

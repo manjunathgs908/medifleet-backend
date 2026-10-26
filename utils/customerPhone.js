@@ -1,8 +1,9 @@
 'use strict';
 
 // ============================================================
-// Customer numbers never leave this backend. The CRM, the driver app and
-// the fleet-owner app get two things instead:
+// Customer numbers never leave this backend, except to a signed-in CRM
+// owner (see utils/phoneViewer.js). Telecallers, the driver app and the
+// fleet-owner app get two things instead:
 //
 //   maskPhone(raw)       "••••••4442" -- enough to recognise a caller,
 //                        not enough to dial them.

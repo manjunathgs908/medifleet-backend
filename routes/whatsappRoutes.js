@@ -31,6 +31,7 @@ const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { Trip, Lead } = require('../models');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { maskPhone, customerRef, phoneFromRef, isCustomerRef } = require('../utils/customerPhone');
+const { fullPhone } = require('../utils/phoneViewer');
 const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 
 const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
@@ -613,6 +614,7 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
     const conversations = result.rows.map((row) => ({
       customerRef: customerRef(row.phone),
       phoneMasked: maskPhone(row.phone),
+      phone      : fullPhone(row.phone), // CRM owner only; absent for anyone else
       lastStep: row.lastStep,
       lastStepLabel: STEP_LABELS[row.lastStep] || row.lastStep,
       language: row.language,
@@ -752,6 +754,7 @@ router.get('/customer/:phone', protect, authorize(...OPERATIONS), async (req, re
       success: true,
       customerRef: customerRef(normalized),
       phoneMasked: maskPhone(normalized),
+      phone      : fullPhone(normalized), // CRM owner only; absent for anyone else
       summary,
       conversations,
       calls: callRows,

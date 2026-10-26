@@ -1,6 +1,7 @@
 'use strict';
 const mongoose = require('mongoose');
-const { customerRef } = require('../utils/customerPhone');
+const { customerRef, maskPhone } = require('../utils/customerPhone');
+const { fullPhone } = require('../utils/phoneViewer');
 
 // Permanent record of every ops call-back attempt against a WhatsApp
 // conversation -- one row per call, never updated or deleted. Distinct from
@@ -42,7 +43,10 @@ WhatsAppCallLogSchema.set('toJSON', {
   transform(doc, ret) {
     if ('phone' in ret) {
       ret.customerRef = customerRef(ret.phone);
+      ret.phoneMasked = maskPhone(ret.phone);
+      const full = fullPhone(ret.phone); // CRM owner only
       delete ret.phone;
+      if (full) ret.phone = full;
     }
     return ret;
   },

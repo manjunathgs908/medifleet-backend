@@ -42,6 +42,10 @@ jest.mock('../models/CallLog', () => ({
   create: jest.fn(), findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), updateOne: jest.fn(),
 }));
 jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
+jest.mock('../models/WebrtcDebugEvent', () => ({
+  insertMany: jest.fn(async (docs) => docs),
+  find      : jest.fn(),
+}));
 // Only .get is replaced: the real Plivo SDK (kept for its signature check)
 // configures axios when it loads.
 jest.mock('axios', () => {
@@ -807,5 +811,40 @@ describe('in-app token errors', () => {
     const { status, text } = ctrl.plivoErrorDetail({ response: { status: 401, data: { error: 'authentication failed' } } });
     expect(status).toBe(401);
     expect(text).toBe('{"error":"authentication failed"}');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('in-app debug capture (temporary)', () => {
+  const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
+
+  it('stores SDK events with session and device, redacting anything token-like', async () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig';
+    const { res } = await run(ctrl.postWebrtcDebug, {
+      user: { _id: 'u1', name: 'Desk' },
+      body: { events: [
+        { event: 'onLoginFailed', reason: 'INVALID_ACCESS_TOKEN', sessionId: 's1', device: 'Chrome desktop', at: Date.now() },
+        { event: 'onConnectionChange', detail: { state: 'disconnected', token: 'abc', raw: jwt }, sessionId: 's1' },
+      ] },
+    });
+    expect(res.body.saved).toBe(2);
+    const docs = WebrtcDebugEvent.insertMany.mock.calls[0][0];
+    expect(docs[0]).toEqual(expect.objectContaining({ event: 'onLoginFailed', reason: 'INVALID_ACCESS_TOKEN', sessionId: 's1', device: 'Chrome desktop' }));
+    expect(docs[1].detail.token).toBe('[redacted]');
+    expect(JSON.stringify(docs)).not.toContain(jwt);
+  });
+
+  it('summarises one line per browser session, so two devices on one endpoint stand out', async () => {
+    const t = (s) => new Date(Date.UTC(2026, 9, 26, 10, 45, s));
+    WebrtcDebugEvent.find.mockReturnValue(chain([
+      { sessionId: 'phone', userName: 'Desk', device: 'Android PWA', event: 'onLogin', at: t(30) },
+      { sessionId: 'desk',  userName: 'Desk', device: 'Chrome',      event: 'onLogout', reason: 'Logout', at: t(20) },
+      { sessionId: 'desk',  userName: 'Desk', device: 'Chrome',      event: 'onLogin', at: t(10) },
+    ]));
+    const { res } = await run(ctrl.getWebrtcDebug, { user: { _id: 'u1' }, query: {} });
+    expect(res.body.sessions).toHaveLength(2);
+    const desk = res.body.sessions.find((s) => s.sessionId === 'desk');
+    expect(desk.lastLogout).toEqual({ at: t(20), reason: 'Logout' });
+    expect(desk.lastLogin).toEqual(t(10));
   });
 });

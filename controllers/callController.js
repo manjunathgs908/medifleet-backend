@@ -39,6 +39,7 @@ const Ambulance    = require('../models/Ambulance');
 const Quote        = require('../models/Quote');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
+const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
 const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
@@ -871,6 +872,87 @@ async function verifyEndpoint(user) {
 }
 exports.verifyEndpoint = verifyEndpoint;
 
+// ── TEMPORARY: in-app calling debug capture ─────────────────────────────
+// Anything token-shaped (JWTs, long opaque strings) is replaced before
+// saving: the point is to see events and reasons, not credentials.
+const redact = (v, depth = 0) => {
+  if (v == null || depth > 4) return v;
+  if (typeof v === 'string') {
+    if (/^eyJ[\w-]+\.[\w-]+\./.test(v) || v.length > 300) return `[redacted ${v.length} chars]`;
+    return v;
+  }
+  if (Array.isArray(v)) return v.slice(0, 20).map((x) => redact(x, depth + 1));
+  if (typeof v === 'object') {
+    const out = {};
+    for (const [k, x] of Object.entries(v).slice(0, 30)) {
+      out[k] = /token|password|secret|jwt|authorization/i.test(k) ? '[redacted]' : redact(x, depth + 1);
+    }
+    return out;
+  }
+  return v;
+};
+
+const clip = (s, n) => (s == null ? undefined : String(s).slice(0, n));
+
+async function saveDebugEvents(user, events) {
+  const docs = events.slice(0, 50).map((e) => ({
+    user     : user._id,
+    userName : user.name,
+    sessionId: clip(e.sessionId, 64),
+    device   : clip(e.device, 200),
+    event    : clip(e.event, 64) || 'unknown',
+    reason   : clip(typeof e.reason === 'string' ? e.reason : e.reason == null ? undefined : JSON.stringify(redact(e.reason)), 500),
+    detail   : redact(e.detail),
+    clientAt : e.at ? new Date(e.at) : undefined,
+  }));
+  if (docs.length) await WebrtcDebugEvent.insertMany(docs, { ordered: false });
+  return docs.length;
+}
+
+// ============================================================
+// @route   POST /api/calls/webrtc/debug { events: [{ event, reason, detail, at, sessionId, device }] }
+// @route   GET  /api/calls/webrtc/debug?all=1&limit=200
+// @desc    TEMPORARY: what the Plivo SDK did in each CRM tab. GET returns
+//          the signed-in user's events (all users with all=1), newest
+//          first, plus one line per browser session — two sessions active
+//          at once on one endpoint is the two-device registration clash.
+// @access  Private [owner]
+// ============================================================
+exports.postWebrtcDebug = async (req, res, next) => {
+  try {
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
+    const saved = await saveDebugEvents(req.user, events);
+    return res.json({ success: true, saved });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getWebrtcDebug = async (req, res, next) => {
+  try {
+    const filter = req.query.all === '1' ? {} : { user: req.user._id };
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 1000);
+    const events = await WebrtcDebugEvent.find(filter).sort({ at: -1 }).limit(limit).lean();
+
+    const sessions = {};
+    for (const e of [...events].reverse()) {
+      const s = sessions[e.sessionId || '-'] ||= {
+        sessionId: e.sessionId || null, user: e.userName, device: e.device,
+        firstAt: e.at, lastAt: e.at, events: 0, lastLogin: null, lastLogout: null, lastLoginFailed: null, lastState: null,
+      };
+      s.lastAt = e.at;
+      s.events += 1;
+      if (e.event === 'onLogin') s.lastLogin = e.at;
+      if (e.event === 'onLogout') s.lastLogout = { at: e.at, reason: e.reason || null };
+      if (e.event === 'onLoginFailed') s.lastLoginFailed = { at: e.at, reason: e.reason || null };
+      if (e.event === 'state') s.lastState = { at: e.at, ...e.detail };
+    }
+    return res.json({ success: true, sessions: Object.values(sessions).reverse(), events });
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
@@ -905,6 +987,15 @@ exports.webrtcToken = async (req, res, next) => {
 
     try {
       const { token, expiresAt } = await plivo.issueToken(user.plivoEndpointUsername);
+      // TEMPORARY: which browser session asked, so two devices sharing one
+      // endpoint are visible in GET /api/calls/webrtc/debug.
+      saveDebugEvents(user, [{
+        event    : 'server:token_issued',
+        sessionId: req.get('X-Client-Session'),
+        device   : req.get('user-agent'),
+        detail   : { endpointCheck },
+        at       : new Date(),
+      }]).catch(() => {});
       return res.json({ success: true, token, expiresAt, endpointCheck });
     } catch (err) {
       const { status, text } = plivoErrorDetail(err);

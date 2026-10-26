@@ -138,6 +138,9 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     plivoEndpointId      : { type: String, select: false },
     plivoEndpointUsername: { type: String, select: false },
     plivoEndpointPassword: { type: String, select: false },
+    // TEMPORARY diagnostic: the last check of this endpoint against Plivo's
+    // own record (lengths and flags only, no secrets).
+    plivoEndpointCheck   : { type: Schema.Types.Mixed, select: false },
 
     // Last check-in from an open, registered CRM tab. Server time.
     appOnlineAt   : { type: Date },

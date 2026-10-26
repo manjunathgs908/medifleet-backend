@@ -625,11 +625,22 @@ describe('in-app (WebRTC) calling', () => {
 
   // A fake Plivo REST API: answers by method + path, records every call.
   const USER_ID = '64b0000000000000000000aa';
-  const fakePlivo = ({ endpoints = [], application = '/v1/Account/MAXXXXXXXXXXXXXXXXXX/Application/29986316244302815/', jwt = 'plivo.issued.jwt' } = {}) => {
+  const APP_URI = '/v1/Account/MAXXXXXXXXXXXXXXXXXX/Application/29986316244302815/';
+  const fakePlivo = ({ endpoints = [], application = APP_URI, jwt = 'plivo.issued.jwt', endpointRecord } = {}) => {
+    // Plivo's record of each endpoint id, as created or listed.
+    const known = Object.fromEntries(endpoints.map((e) => [e.endpoint_id, e.username]));
     axios.request.mockImplementation(async ({ method, url, data }) => {
       const path = url.replace('https://api.plivo.com/v1/Account/MAXXXXXXXXXXXXXXXXXX', '');
+      const one = path.match(/^\/Endpoint\/([^/?]+)\/$/);
+      if (method === 'get' && one) {
+        return { data: endpointRecord || { endpoint_id: one[1], username: known[one[1]] || 'slexisting123', application: APP_URI, sip_registered: 'true', sip_user_agent: 'plivo-browser-sdk' } };
+      }
+      if (method === 'post' && one) return { data: { message: 'changed' } };
       if (method === 'get' && path.startsWith('/Endpoint/')) return { data: { meta: { next: null }, objects: endpoints } };
-      if (method === 'post' && path === '/Endpoint/') return { data: { endpoint_id: 'ep1', username: `${data.username}123`, alias: data.alias } };
+      if (method === 'post' && path === '/Endpoint/') {
+        known.ep1 = `${data.username}123`;
+        return { data: { endpoint_id: 'ep1', username: known.ep1, alias: data.alias } };
+      }
       if (method === 'get' && path === '/Number/918065591088/') return { data: { number: '918065591088', application } };
       if (method === 'post' && path === '/JWT/Token/') return { data: { api_id: 'x', token: jwt } };
       throw new Error(`unexpected Plivo call ${method} ${path}`);
@@ -675,6 +686,64 @@ describe('in-app (WebRTC) calling', () => {
     expect(jwtCall.data.exp - jwtCall.data.nbf).toBe(3600);
     expect(restCalls('post', '/Endpoint/')).toHaveLength(0);
     expect(JSON.stringify(res.body)).not.toMatch(/password/i);
+  });
+
+  it('checks the endpoint against Plivo: corrects the username to Plivo\'s, re-links the app, reports lengths only', async () => {
+    fakePlivo({ endpointRecord: { endpoint_id: 'ep1', username: 'slexisting123456', application: null, sip_registered: 'false' } });
+    const userDoc = { _id: USER_ID, plivoEndpointId: 'ep1', plivoEndpointUsername: 'slexisting123', save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: USER_ID } });
+
+    expect(res.body.endpointCheck).toEqual(expect.objectContaining({
+      storedLength: 13, plivoLength: 16, match: false, usernameCorrected: true,
+      appRelinked: true, appMatches: true, sipRegistered: false,
+    }));
+    expect(userDoc.plivoEndpointUsername).toBe('slexisting123456');
+    expect(restCalls('post', '/Endpoint/ep1/')[0].data).toEqual({ app_id: '29986316244302815' });
+    // The token is signed for Plivo's exact username.
+    expect(restCalls('post', '/JWT/Token/')[0].data.sub).toBe('slexisting123456');
+    expect(JSON.stringify(res.body.endpointCheck)).not.toContain('slexisting');
+  });
+
+  it('records the routing decision and Plivo\'s verdict on the in-app leg on the call log', async () => {
+    const log = logDoc({
+      direction: 'inbound', status: 'ringing',
+      routing: { appUsers: [{ sipUri: 'sip:slaaaa1@phone.plivo.com', dialled: true, appOnline: true }] },
+    });
+    CallLog.findById.mockResolvedValue(log);
+    User.find.mockReturnValue(chain(mixedDuty()));
+
+    await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'app' },
+      body: { DialStatus: 'failed', DialHangupCause: 'USER_NOT_REGISTERED', DialBLegTo: '919000000001', DialALegUUID: 'a1' },
+    });
+
+    expect(log.appLeg).toEqual(expect.objectContaining({
+      sipUris: ['sip:slaaaa1@phone.plivo.com'],
+      DialStatus: 'failed', DialHangupCause: 'USER_NOT_REGISTERED', DialALegUUID: 'a1',
+      fellBackToPhones: 2,
+    }));
+    expect(log.appLeg.DialBLegTo).toBe('••••••0001'); // numbers masked
+  });
+
+  it('stores the routing decision when a call comes in', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { _id: 'u1', name: 'A', callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: now(), phone: '9000000001' },
+      { _id: 'u2', name: 'B', callMode: 'app', plivoEndpointUsername: 'slbbbb2', appOnlineAt: stale(), phone: '9000000002' },
+    ]));
+
+    await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'diag' } });
+
+    const { routing } = CallLog.create.mock.calls[0][0];
+    expect(routing.decision).toBe('app_then_phone');
+    expect(routing.appUsers).toEqual([
+      expect.objectContaining({ name: 'A', appOnline: true, dialled: true, sipUri: 'sip:slaaaa1@phone.plivo.com' }),
+      expect.objectContaining({ name: 'B', appOnline: false, dialled: false }),
+    ]);
+    expect(JSON.stringify(routing)).not.toMatch(/900000000/);
   });
 
   it('reuses an endpoint Plivo already has for this user instead of making another', async () => {

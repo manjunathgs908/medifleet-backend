@@ -41,7 +41,7 @@ const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
 const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
-const { phoneFromRef } = require('../utils/customerPhone');
+const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
 
 // Statuses during which a driver or partner may still reach the customer.
 const ACTIVE_TRIP_STATUSES = ['booked', 'dispatched', 'en_route'];
@@ -99,8 +99,47 @@ function fallbackPhones(users) {
 exports.fallbackPhones = fallbackPhones;
 
 const loadOnDuty = () => User.find({ role: 'owner', isActive: true, callDuty: true })
-  .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername')
+  .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername +plivoEndpointId')
   .limit(MAX_INCOMING_AGENTS).lean();
+
+// TEMPORARY diagnostic: Plivo's record of each in-app user's endpoint at
+// the moment a call is routed to it, saved onto the call's routing.
+async function snapshotEndpoints(logId, onDuty) {
+  const appUsers = onDuty.filter((u) => u.callMode === 'app' && u.plivoEndpointId);
+  if (!appUsers.length) return;
+  const appExpected = await plivo.applicationId().catch(() => null);
+  const atCall = await Promise.all(appUsers.map(async (u) => {
+    try {
+      const ep = await plivo.getEndpoint(u.plivoEndpointId);
+      return {
+        user            : u._id,
+        plivoUsernameMatchesDialled: ep.username === u.plivoEndpointUsername,
+        dialledLength   : (u.plivoEndpointUsername || '').length,
+        plivoLength     : (ep.username || '').length,
+        sipRegistered   : ep.sipRegistered,
+        sipUserAgent    : ep.sipUserAgent,
+        sipExpires      : ep.sipExpires,
+        appLinked       : ep.appId,
+        appExpected     : appExpected || null,
+      };
+    } catch (err) {
+      return { user: u._id, error: `Plivo endpoint lookup failed (status ${plivoErrorDetail(err).status ?? '-'})` };
+    }
+  }));
+  await CallLog.updateOne({ _id: logId }, { $set: { 'routing.plivoEndpointsAtCall': atCall } });
+}
+
+// Plivo's Dial result fields, for the diagnostics. Anything that looks like
+// a phone number is masked.
+function dialResult(b) {
+  const out = {};
+  for (const [k, v] of Object.entries(b || {})) {
+    if (!k.startsWith('Dial')) continue;
+    out[k] = /^\+?\d{10,15}$/.test(String(v)) ? maskPhone(v) : v;
+  }
+  out.receivedAt = new Date();
+  return out;
+}
 
 const BUSY_MESSAGE = 'Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.';
 
@@ -352,7 +391,25 @@ exports.incoming = async (req, res, next) => {
     const agentPhones = fallbackPhones(onDuty);
     const ringing = agentPhones.length + sipUsers.length;
 
+    // TEMPORARY diagnostic: the decision and its inputs, per in-app user.
+    const routing = {
+      decision : !ringing ? 'none' : sipUsers.length ? 'app_then_phone' : 'phone',
+      decidedAt: new Date(),
+      onDuty   : onDuty.length,
+      phones   : agentPhones.length,
+      appUsers : onDuty.filter((u) => u.callMode === 'app').map((u) => ({
+        user          : u._id,
+        name          : u.name,
+        appOnline     : isAppOnline(u),
+        appOnlineAt   : u.appOnlineAt || null,
+        hasEndpoint   : !!u.plivoEndpointUsername,
+        sipUri        : u.plivoEndpointUsername ? plivo.sipUri(u.plivoEndpointUsername) : null,
+        dialled       : sipUsers.includes(u.plivoEndpointUsername),
+      })),
+    };
+
     const log = await CallLog.create({
+      routing,
       provider     : 'plivo',
       callerId     : plivo.companyNumber(),
       direction    : 'inbound',
@@ -368,7 +425,12 @@ exports.incoming = async (req, res, next) => {
 
     if (!ringing) return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
     if (sipUsers.length) {
-      return sendXml(res, plivo.bridgeXml({ sipUsers, logId: log._id, stage: 'app', timeout: plivo.APP_RING_SECONDS }));
+      sendXml(res, plivo.bridgeXml({ sipUsers, logId: log._id, stage: 'app', timeout: plivo.APP_RING_SECONDS }));
+      // After answering Plivo, so it cannot delay the call: Plivo's own view
+      // of each in-app endpoint right now — registered or not, its user
+      // agent, its application.
+      snapshotEndpoints(log._id, onDuty).catch(() => {});
+      return undefined;
     }
     return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, logId: log._id, stage: 'phone' }));
   } catch (err) {
@@ -404,8 +466,14 @@ exports.events = async (req, res, next) => {
       // now. Only a completed app leg ends the call here.
       if (req.query.stage === 'app' && dialStatus !== 'completed') {
         const phones = fallbackPhones(await loadOnDuty());
-        console.info(`[calls] in-app leg not answered (DialStatus=${dialStatus || '-'} cause=${b.DialBLegHangupCause || '-'}) log=${logId || '-'} — ringing ${phones.length} phone(s)`);
+        console.info(`[calls] in-app leg not answered (DialStatus=${dialStatus || '-'} cause=${b.DialHangupCause || b.DialBLegHangupCause || '-'}) log=${logId || '-'} — ringing ${phones.length} phone(s)`);
         if (log) {
+          // TEMPORARY diagnostic: Plivo's verdict on the in-app leg.
+          log.appLeg = {
+            sipUris  : (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri),
+            ...dialResult(b),
+            fellBackToPhones: phones.length,
+          };
           log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
           await log.save();
@@ -417,6 +485,12 @@ exports.events = async (req, res, next) => {
       }
 
       if (log) {
+        // TEMPORARY diagnostic: Plivo's verdict on whichever stage this was.
+        if (req.query.stage === 'app') {
+          log.appLeg = { sipUris: (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri), ...dialResult(b) };
+        } else if (req.query.stage === 'phone') {
+          log.phoneLeg = dialResult(b);
+        }
         if (dialStatus === 'completed') {
           log.status = 'completed';
           const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
@@ -747,11 +821,61 @@ function plivoErrorDetail(err) {
 }
 exports.plivoErrorDetail = plivoErrorDetail;
 
+// TEMPORARY diagnostic + self-repair, run on every token request:
+//   - the username Plivo has for our stored endpoint id must be exactly the
+//     one we dial in <User> and sign as JWT "sub"; on any mismatch Plivo's
+//     wins and is saved;
+//   - Plivo requires the endpoint to be linked to the same application the
+//     token names in "app"; if it is not, it is re-linked.
+// Reports lengths and flags only — no username, no password.
+async function verifyEndpoint(user) {
+  const check = { checkedAt: new Date(), storedLength: (user.plivoEndpointUsername || '').length };
+  try {
+    if (!user.plivoEndpointId) {
+      check.error = 'no endpoint id stored';
+    } else {
+      const ep = await plivo.getEndpoint(user.plivoEndpointId);
+      const appExpected = await plivo.applicationId();
+      Object.assign(check, {
+        plivoLength       : (ep.username || '').length,
+        match             : ep.username === user.plivoEndpointUsername,
+        appExpected       : appExpected || null,
+        appLinked         : ep.appId || null,
+        appMatches        : !!appExpected && ep.appId === appExpected,
+        sipRegistered     : ep.sipRegistered,
+        sipUserAgent      : ep.sipUserAgent,
+        usernameCorrected : false,
+        appRelinked       : false,
+      });
+      if (ep.username && ep.username !== user.plivoEndpointUsername) {
+        console.warn(`[calls] endpoint username mismatch for user=${user._id}: stored ${check.storedLength} chars, Plivo ${check.plivoLength} chars — using Plivo's`);
+        user.plivoEndpointUsername = ep.username;
+        check.usernameCorrected = true;
+      }
+      if (appExpected && ep.appId !== appExpected) {
+        await plivo.linkEndpointToApp(user.plivoEndpointId, appExpected);
+        check.appRelinked = true;
+        check.appLinked = appExpected;
+        check.appMatches = true;
+        console.warn(`[calls] endpoint for user=${user._id} was linked to app ${ep.appId || 'none'} — re-linked to ${appExpected}`);
+      }
+    }
+  } catch (err) {
+    const { status, text } = plivoErrorDetail(err);
+    check.error = `Plivo endpoint lookup failed (status ${status ?? '-'})`;
+    console.error(`[calls] endpoint verify failed for user=${user._id}: status=${status ?? '-'} detail=${text}`);
+  }
+  user.plivoEndpointCheck = check;
+  try { await user.save(); } catch (e) { console.error('[calls] could not save endpoint check:', e.message); }
+  return check;
+}
+exports.verifyEndpoint = verifyEndpoint;
+
 exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
 
-    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername +plivoEndpointPassword');
+    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername +plivoEndpointPassword +plivoEndpointCheck');
     if (!user.plivoEndpointUsername) {
       try {
         // Finds the endpoint by its alias first, so a retry after a
@@ -775,9 +899,13 @@ exports.webrtcToken = async (req, res, next) => {
       }
     }
 
+    // Check what we will dial and sign against Plivo's own record of the
+    // endpoint. Never blocks the token: a failed check is reported, not fatal.
+    const endpointCheck = await verifyEndpoint(user);
+
     try {
       const { token, expiresAt } = await plivo.issueToken(user.plivoEndpointUsername);
-      return res.json({ success: true, token, expiresAt });
+      return res.json({ success: true, token, expiresAt, endpointCheck });
     } catch (err) {
       const { status, text } = plivoErrorDetail(err);
       console.error(`[calls] Plivo JWT token failed: status=${status ?? '-'} detail=${text}`, err);

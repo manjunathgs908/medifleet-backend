@@ -61,6 +61,18 @@ const CallLogSchema = new mongoose.Schema(
     talkSec    : { type: Number }, // customer leg, i.e. the actual conversation
     totalSec   : { type: Number }, // whole call including ringing the agent
 
+    // TEMPORARY diagnostics for in-app (WebRTC) delivery — readable via
+    // GET /api/calls/logs. No phone numbers in any of them (counts and
+    // masked values only).
+    //   routing:  what /incoming decided and why — per in-app user whether
+    //             their app counted as online, the exact SIP URI dialled,
+    //             and Plivo's own view of that endpoint at call time.
+    //   appLeg:   what Plivo reported for the in-app <Dial> (stage 1).
+    //   phoneLeg: what Plivo reported for the phone <Dial> (stage 2).
+    routing : { type: mongoose.Schema.Types.Mixed },
+    appLeg  : { type: mongoose.Schema.Types.Mixed },
+    phoneLeg: { type: mongoose.Schema.Types.Mixed },
+
     recordingUrl: { type: String },
     recordingId : { type: String },
     recordingSec: { type: Number },

@@ -217,6 +217,23 @@ async function ensureEndpoint({ userId }) {
   return { id: data?.endpoint_id, username: data?.username, password, existing: false };
 }
 
+// Plivo's own record of an endpoint: its exact username, the application
+// it is linked to, and whether Plivo sees it registered right now.
+async function getEndpoint(endpointId) {
+  const { data } = await plivoRest('get', `/Endpoint/${endpointId}/`);
+  const appMatch = String(data?.application || '').match(/Application\/([^/]+)\/?$/);
+  return {
+    username      : data?.username || null,
+    alias         : data?.alias || null,
+    appId         : appMatch ? appMatch[1] : null,
+    sipRegistered : String(data?.sip_registered) === 'true',
+    sipUserAgent  : data?.sip_user_agent || null,
+    sipExpires    : data?.sip_expires || null,
+  };
+}
+
+const linkEndpointToApp = (endpointId, appId) => plivoRest('post', `/Endpoint/${endpointId}/`, { app_id: appId });
+
 // Plivo issues the token: POST /JWT/Token/. "per" grants receiving only —
 // the CRM never places calls from the browser, and an outgoing grant would
 // let a browser dial out through our application.
@@ -272,6 +289,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
+  getEndpoint, linkEndpointToApp,
   APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,

@@ -716,42 +716,41 @@ exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
 
-    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername');
+    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername +plivoEndpointPassword');
     if (!user.plivoEndpointUsername) {
       try {
-        const ep = await plivo.createEndpoint({ userId: user._id, name: user.name });
+        // Finds the endpoint by its alias first, so a retry after a
+        // half-finished attempt reuses it instead of making another.
+        const ep = await plivo.ensureEndpoint({ userId: user._id });
         if (!ep.username) throw new Error('Plivo returned no endpoint username');
         user.plivoEndpointId = ep.id;
         user.plivoEndpointUsername = ep.username;
+        if (ep.password) user.plivoEndpointPassword = ep.password;
         await user.save();
-        console.info(`[calls] created Plivo endpoint for user=${user._id}`);
+        console.info(`[calls] ${ep.existing ? 'reused' : 'created'} Plivo endpoint ${ep.username} for user=${user._id}`);
       } catch (err) {
         const { status, text } = plivoErrorDetail(err);
-        console.error(`[calls] endpoint create failed: status=${status ?? '-'} detail=${text}`, err);
-        // TEMPORARY: Plivo's own error text in the response, to diagnose
-        // in-app calling setup. Trim back to a plain message once fixed.
+        // Plivo's full error stays in the server log; the browser gets the
+        // stage and status only.
+        console.error(`[calls] endpoint setup failed: status=${status ?? '-'} detail=${text}`, err);
         return res.status(502).json({
-          success: false,
-          stage  : 'endpoint',
-          plivoStatus: status,
-          message: `Could not set up in-app calling with Plivo (endpoint create, status ${status ?? '-'}): ${text.slice(0, 500)}`,
+          success: false, stage: 'endpoint', plivoStatus: status,
+          message: `Could not set up in-app calling with Plivo (endpoint, status ${status ?? '-'}). Calls will ring your phone.`,
         });
       }
     }
 
-    let issued;
     try {
-      issued = plivo.accessToken(user.plivoEndpointUsername);
+      const { token, expiresAt } = await plivo.issueToken(user.plivoEndpointUsername);
+      return res.json({ success: true, token, expiresAt });
     } catch (err) {
       const { status, text } = plivoErrorDetail(err);
-      console.error(`[calls] access token failed: status=${status ?? '-'} detail=${text}`, err);
+      console.error(`[calls] Plivo JWT token failed: status=${status ?? '-'} detail=${text}`, err);
       return res.status(502).json({
-        success: false,
-        stage  : 'token',
-        message: `Could not issue an in-app calling token (status ${status ?? '-'}): ${text.slice(0, 500)}`,
+        success: false, stage: 'token', plivoStatus: status,
+        message: `Could not get an in-app calling token from Plivo (status ${status ?? '-'}). Calls will ring your phone.`,
       });
     }
-    return res.json({ success: true, token: issued.token, expiresAt: issued.expiresAt });
   } catch (err) {
     next(err);
   }

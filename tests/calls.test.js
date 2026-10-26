@@ -47,16 +47,16 @@ jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
 jest.mock('axios', () => {
   const actual = jest.requireActual('axios');
   actual.get = jest.fn();
+  actual.request = jest.fn(); // Plivo REST: endpoints, number lookup, JWT
   return actual;
 });
 
 const mockCreateCall = jest.fn();
-const mockCreateEndpoint = jest.fn();
 jest.mock('plivo', () => {
   const actual = jest.requireActual('plivo');
   return {
     ...actual,
-    Client: jest.fn(() => ({ calls: { create: mockCreateCall }, endpoints: { create: mockCreateEndpoint } })),
+    Client: jest.fn(() => ({ calls: { create: mockCreateCall } })),
   };
 });
 
@@ -568,26 +568,69 @@ describe('in-app (WebRTC) calling', () => {
     expect(res.body).toContain('<Record ');
   });
 
-  it('issues a receive-only token, creating the user\'s endpoint the first time', async () => {
-    const userDoc = { _id: 'u1', name: 'Desk', save: jest.fn() };
+  // A fake Plivo REST API: answers by method + path, records every call.
+  const USER_ID = '64b0000000000000000000aa';
+  const fakePlivo = ({ endpoints = [], application = '/v1/Account/MAXXXXXXXXXXXXXXXXXX/Application/29986316244302815/', jwt = 'plivo.issued.jwt' } = {}) => {
+    axios.request.mockImplementation(async ({ method, url, data }) => {
+      const path = url.replace('https://api.plivo.com/v1/Account/MAXXXXXXXXXXXXXXXXXX', '');
+      if (method === 'get' && path.startsWith('/Endpoint/')) return { data: { meta: { next: null }, objects: endpoints } };
+      if (method === 'post' && path === '/Endpoint/') return { data: { endpoint_id: 'ep1', username: `${data.username}123`, alias: data.alias } };
+      if (method === 'get' && path === '/Number/918065591088/') return { data: { number: '918065591088', application } };
+      if (method === 'post' && path === '/JWT/Token/') return { data: { api_id: 'x', token: jwt } };
+      throw new Error(`unexpected Plivo call ${method} ${path}`);
+    });
+  };
+  const restCalls = (method, path) => axios.request.mock.calls
+    .map(([c]) => c).filter((c) => c.method === method && c.url.endsWith(path));
+
+  it('creates the endpoint with a Plivo-safe alias and username, whatever the user is called', async () => {
+    fakePlivo();
+    const userDoc = { _id: USER_ID, name: 'Manjunath gs', save: jest.fn() };
     User.findById.mockReturnValue(chain(userDoc));
-    mockCreateEndpoint.mockResolvedValue({ endpointId: 'ep1', username: 'slu1000123' });
 
-    const { res } = await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: USER_ID } });
 
-    expect(userDoc.plivoEndpointUsername).toBe('slu1000123');
+    expect(res.statusCode).toBe(200);
+    const created = restCalls('post', '/Endpoint/')[0].data;
+    expect(created.alias).toBe(`savelife-${USER_ID}`);
+    expect(created.alias).toMatch(/^[A-Za-z0-9.+@_-]+$/);
+    expect(created.username).toMatch(/^[a-z0-9]+$/);
+    expect(created.alias).not.toContain('Manjunath');
+    expect(created.app_id).toBe('29986316244302815');
+    expect(userDoc.plivoEndpointUsername).toBe(`${created.username}123`);
+    expect(userDoc.plivoEndpointPassword).toBe(created.password);
     expect(userDoc.save).toHaveBeenCalled();
-    const payload = JSON.parse(Buffer.from(res.body.token.split('.')[1], 'base64url').toString());
-    expect(payload.sub).toBe('slu1000123');
-    expect(payload.iss).toBe('MAXXXXXXXXXXXXXXXXXX');
-    expect(payload.grants.voice).toEqual({ incoming_allow: true, outgoing_allow: false });
+  });
+
+  it('gets the token from Plivo\'s JWT API, receive-only, for the endpoint, with the app id', async () => {
+    fakePlivo({ jwt: 'issued-by-plivo' });
+    User.findById.mockReturnValue(chain({ _id: USER_ID, plivoEndpointUsername: 'slexisting123', save: jest.fn() }));
+
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: USER_ID } });
+
+    expect(res.body).toEqual(expect.objectContaining({ success: true, token: 'issued-by-plivo' }));
+    const [jwtCall] = restCalls('post', '/JWT/Token/');
+    expect(jwtCall.auth).toEqual({ username: 'MAXXXXXXXXXXXXXXXXXX', password: 'plivo-test-token' });
+    expect(jwtCall.data).toEqual(expect.objectContaining({
+      iss: 'MAXXXXXXXXXXXXXXXXXX',
+      sub: 'slexisting123',
+      per: { voice: { incoming_allow: true, outgoing_allow: false } },
+      app: '29986316244302815',
+    }));
+    expect(jwtCall.data.exp - jwtCall.data.nbf).toBe(3600);
+    expect(restCalls('post', '/Endpoint/')).toHaveLength(0);
     expect(JSON.stringify(res.body)).not.toMatch(/password/i);
   });
 
-  it('reuses an existing endpoint', async () => {
-    User.findById.mockReturnValue(chain({ _id: 'u1', plivoEndpointUsername: 'slu1000123', save: jest.fn() }));
-    await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
-    expect(mockCreateEndpoint).not.toHaveBeenCalled();
+  it('reuses an endpoint Plivo already has for this user instead of making another', async () => {
+    fakePlivo({ endpoints: [{ alias: `savelife-${USER_ID}`, username: 'slfound999', endpoint_id: 'ep9' }] });
+    const userDoc = { _id: USER_ID, save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+
+    await run(ctrl.webrtcToken, { user: { _id: USER_ID } });
+
+    expect(restCalls('post', '/Endpoint/')).toHaveLength(0);
+    expect(userDoc.plivoEndpointUsername).toBe('slfound999');
   });
 
   it('records who answered in the app; a second claim changes nothing', async () => {
@@ -617,22 +660,23 @@ describe('in-app (WebRTC) calling', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-describe('in-app token errors say what Plivo said', () => {
-  it('reports Plivo\'s error body instead of "[object Object]"', async () => {
-    User.findById.mockReturnValue(chain({ _id: 'u1', name: 'Desk', save: jest.fn() }));
-    const plivoErr = Object.assign(new Error('x'), {
-      message: { api_id: 'abc', error: 'endpoint creation not permitted for this account' },
-      status : 400,
-    });
-    mockCreateEndpoint.mockRejectedValue(plivoErr);
+describe('in-app token errors', () => {
+  it('logs Plivo\'s full error but sends the browser only the stage and status', async () => {
+    User.findById.mockReturnValue(chain({ _id: '64b0000000000000000000aa', name: 'Desk', save: jest.fn() }));
+    const plivoBody = { alias: ['Invalid Endpoint Alias name. Allowed characters: Letters, Numbers, . , + , @ , - , _'] };
+    axios.request.mockRejectedValue(Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: plivoBody },
+    }));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
-    const { res } = await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: '64b0000000000000000000aa' } });
 
     expect(res.statusCode).toBe(502);
+    expect(res.body).toEqual(expect.objectContaining({ stage: 'endpoint', plivoStatus: 400 }));
+    expect(res.body.message).not.toContain('Invalid Endpoint Alias');
     expect(res.body.message).not.toContain('[object Object]');
-    expect(res.body.message).toContain('endpoint creation not permitted for this account');
-    expect(res.body.message).toContain('status 400');
-    expect(res.body.stage).toBe('endpoint');
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes('Invalid Endpoint Alias'))).toBe(true);
+    errSpy.mockRestore();
   });
 
   it('reads an axios-style response body and status', () => {

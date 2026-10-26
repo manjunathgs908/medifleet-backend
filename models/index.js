@@ -132,9 +132,12 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
 
     // Their own Plivo endpoint, created on first use of in-app calling.
     // The browser never gets its password -- it logs in with a short-lived
-    // access token issued for this username (GET /api/calls/webrtc/token).
+    // access token Plivo issues for this username (GET
+    // /api/calls/webrtc/token). The password is kept only so the endpoint
+    // stays usable by SIP login if ever needed; never sent to a client.
     plivoEndpointId      : { type: String, select: false },
     plivoEndpointUsername: { type: String, select: false },
+    plivoEndpointPassword: { type: String, select: false },
 
     // Last check-in from an open, registered CRM tab. Server time.
     appOnlineAt   : { type: Date },

@@ -9,6 +9,8 @@
  *   PLIVO_NUMBER                     the company number every customer and
  *                                    every agent sees (918065591088)
  *   PUBLIC_API_BASE_URL              optional; https://api.savelife.health
+ *   PLIVO_APP_ID                     optional; otherwise found from the
+ *                                    application linked to PLIVO_NUMBER
  *
  * Every masked call goes through here when Plivo is configured, including
  * the legacy /api/call/connect, so customers always see PLIVO_NUMBER.
@@ -19,6 +21,7 @@
 'use strict';
 
 const plivo = require('plivo');
+const axios = require('axios');
 const { normalisePhone } = require('../utils/phone');
 
 const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE_URL || 'https://api.savelife.health').replace(/\/+$/, '');
@@ -137,32 +140,100 @@ const xml = (body) => `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${body}
 // ── In-app (WebRTC) calling ────────────────────────────────────────────────
 // Each CRM user who rings in the app gets their own Plivo endpoint. Plivo
 // rings it with <User>sip:<username>@phone.plivo.com</User>, and the
-// browser registers as that username with an access token: a JWT signed
-// with our auth token whose only grant is RECEIVING calls. The endpoint's
-// password is random, never stored, never sent anywhere.
+// browser registers as that username with an access token issued BY PLIVO
+// (POST /JWT/Token/) — never signed locally. These three calls go straight
+// to Plivo's REST API so the JSON field names are exactly Plivo's own.
 const SIP_DOMAIN = 'phone.plivo.com';
 const sipUri = (username) => `sip:${username}@${SIP_DOMAIN}`;
 
-const TOKEN_LIFETIME_SEC = 12 * 60 * 60; // one long shift; the CRM renews before it lapses
+const TOKEN_LIFETIME_SEC = 60 * 60; // the CRM renews 10 minutes before it lapses
 
-async function createEndpoint({ userId, name }) {
-  const crypto = require('crypto');
-  // Plivo appends digits to whatever username it is given; the real one
-  // comes back in the response and is what we store.
-  const base = `sl${String(userId).slice(-8)}`;
-  const password = crypto.randomBytes(18).toString('base64url');
-  const alias = `SaveLife CRM ${String(name || '').replace(/[^\w ]/g, '').slice(0, 30) || String(userId).slice(-6)}`;
-  const res = await getClient().endpoints.create(base, password, alias);
-  return { id: res.endpointId || res.endpoint_id, username: res.username };
+const plivoRest = (method, path, data) => axios.request({
+  method,
+  url    : `https://api.plivo.com/v1/Account/${process.env.PLIVO_AUTH_ID}${path}`,
+  auth   : { username: process.env.PLIVO_AUTH_ID, password: process.env.PLIVO_AUTH_TOKEN },
+  data,
+  timeout: 15000,
+});
+
+// Plivo allows letters, numbers and . + @ - _ in an alias, and letters and
+// numbers in a username. Both are built from the user's id (a 24-character
+// hex ObjectId), never their name: a name with a space is exactly what
+// Plivo rejected. The alias also identifies the endpoint for lookup, which
+// keeps provisioning idempotent.
+const safeId = (userId) => String(userId).toLowerCase().replace(/[^a-z0-9]/g, '');
+const endpointAlias = (userId) => `savelife-${safeId(userId)}`;
+const endpointBaseUsername = (userId) => `sl${safeId(userId).slice(-12)}`;
+
+// The Plivo Application linked to PLIVO_NUMBER — the one holding our
+// /incoming and /events URLs. PLIVO_APP_ID wins if set; otherwise looked up
+// from the number and cached. null (not linked) means "app" is left out of
+// the token, which Plivo treats as optional.
+let cachedAppId;          // undefined = not looked up yet
+let appIdLookedUpAt = 0;
+const APP_ID_RETRY_MS = 10 * 60 * 1000;
+
+async function applicationId() {
+  if (process.env.PLIVO_APP_ID) return process.env.PLIVO_APP_ID;
+  if (cachedAppId || (cachedAppId === null && Date.now() - appIdLookedUpAt < APP_ID_RETRY_MS)) return cachedAppId;
+  appIdLookedUpAt = Date.now();
+  try {
+    const { data } = await plivoRest('get', `/Number/${companyNumber()}/`);
+    // "application" is a resource URI: /v1/Account/<id>/Application/<appId>/
+    const m = String(data?.application || '').match(/Application\/([^/]+)\/?$/);
+    cachedAppId = m ? m[1] : null;
+    if (!cachedAppId) console.warn(`[calls] Plivo number ${companyNumber()} has no linked application — tokens will omit "app".`);
+    else console.info(`[calls] Plivo application for ${companyNumber()}: ${cachedAppId}`);
+  } catch (err) {
+    cachedAppId = null;
+    console.warn(`[calls] could not read Plivo number ${companyNumber()} to find its application:`, err?.response?.status, JSON.stringify(err?.response?.data ?? err?.message));
+  }
+  return cachedAppId;
 }
 
-function accessToken(username) {
-  const token = new plivo.AccessToken(
-    process.env.PLIVO_AUTH_ID, process.env.PLIVO_AUTH_TOKEN, username,
-    { lifetime: TOKEN_LIFETIME_SEC },
-  );
-  token.addVoiceGrants(true, false); // receive only
-  return { token: token.toJwt(), expiresAt: new Date(Date.now() + TOKEN_LIFETIME_SEC * 1000) };
+// Finds this user's endpoint by alias, or creates it. Plivo appends digits
+// to the requested username; the real one comes back and is what we keep.
+// Returns { id, username, password } — password only when newly created
+// (Plivo never returns it later).
+async function ensureEndpoint({ userId }) {
+  const alias = endpointAlias(userId);
+
+  for (let offset = 0; offset < 1000; offset += 20) {
+    const { data } = await plivoRest('get', `/Endpoint/?limit=20&offset=${offset}`);
+    const found = (data?.objects || []).find((e) => e.alias === alias);
+    if (found) return { id: found.endpoint_id, username: found.username, password: null, existing: true };
+    if (!data?.meta?.next) break;
+  }
+
+  const crypto = require('crypto');
+  const password = crypto.randomBytes(18).toString('base64url');
+  const appId = await applicationId();
+  const { data } = await plivoRest('post', '/Endpoint/', {
+    username: endpointBaseUsername(userId),
+    password,
+    alias,
+    ...(appId ? { app_id: appId } : {}),
+  });
+  return { id: data?.endpoint_id, username: data?.username, password, existing: false };
+}
+
+// Plivo issues the token: POST /JWT/Token/. "per" grants receiving only —
+// the CRM never places calls from the browser, and an outgoing grant would
+// let a browser dial out through our application.
+async function issueToken(username) {
+  const now = Math.floor(Date.now() / 1000);
+  const appId = await applicationId();
+  const { data } = await plivoRest('post', '/JWT/Token/', {
+    iss: process.env.PLIVO_AUTH_ID,
+    sub: username,
+    nbf: now,
+    exp: now + TOKEN_LIFETIME_SEC,
+    per: { voice: { incoming_allow: true, outgoing_allow: false } },
+    ...(appId ? { app: appId } : {}),
+  });
+  const token = data?.token || data?.jwt_token;
+  if (!token) throw Object.assign(new Error('Plivo returned no token'), { response: { data } });
+  return { token, expiresAt: new Date((now + TOKEN_LIFETIME_SEC) * 1000) };
 }
 
 // Record + Dial is Plivo's way to record a bridged call: <Record> placed
@@ -194,7 +265,7 @@ const emptyXml = () => xml('');
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
-  createEndpoint, accessToken, sipUri,
+  ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

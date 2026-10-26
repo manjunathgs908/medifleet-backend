@@ -75,8 +75,9 @@ const CUSTOMER = '9986844442';
 const DRIVER_PHONE = '9123456789';
 
 function mockRes() {
-  const res = { statusCode: 200, body: null, contentType: null };
+  const res = { statusCode: 200, body: null, contentType: null, headers: {} };
   res.status = (c) => { res.statusCode = c; return res; };
+  res.set = (k, v) => { res.headers[k.toLowerCase()] = v; return res; };
   res.json = (b) => { res.body = b; return res; };
   res.type = (t) => { res.contentType = t; return res; };
   res.send = (b) => { res.body = b; return res; };
@@ -684,7 +685,7 @@ describe('in-app (WebRTC) calling', () => {
     expect(jwtCall.data).toEqual(expect.objectContaining({
       iss: 'MAXXXXXXXXXXXXXXXXXX',
       sub: 'slexisting123',
-      per: { voice: { incoming_allow: true, outgoing_allow: false } },
+      per: { voice: { incoming_allow: true, outgoing_allow: true } },
       app: '29986316244302815',
     }));
     expect(jwtCall.data.exp - jwtCall.data.nbf).toBe(3600);
@@ -748,6 +749,39 @@ describe('in-app (WebRTC) calling', () => {
       expect.objectContaining({ name: 'B', appOnline: false, dialled: false }),
     ]);
     expect(JSON.stringify(routing)).not.toMatch(/900000000/);
+  });
+
+  it('login mode defaults to the token and hands out no credentials', async () => {
+    delete process.env.PLIVO_WEBRTC_LOGIN;
+    const { res } = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: {} });
+    expect(res.body).toEqual({ success: true, mode: 'token' });
+  });
+
+  it('password mode gives the user their OWN endpoint username and password', async () => {
+    fakePlivo();
+    const userDoc = { _id: USER_ID, plivoEndpointId: 'ep1', plivoEndpointUsername: 'slexisting123', plivoEndpointPassword: 'stored-pw', save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+
+    const { res } = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: { mode: 'password' } });
+
+    expect(res.body).toEqual(expect.objectContaining({ mode: 'password', username: 'slexisting123', password: 'stored-pw' }));
+    expect(User.findById).toHaveBeenCalledWith(USER_ID);
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('password mode resets and stores a password Plivo never gave us', async () => {
+    fakePlivo();
+    const userDoc = { _id: USER_ID, plivoEndpointId: 'ep1', plivoEndpointUsername: 'slexisting123', save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+    process.env.PLIVO_WEBRTC_LOGIN = 'password';
+
+    const { res } = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: {} });
+    delete process.env.PLIVO_WEBRTC_LOGIN;
+
+    const reset = restCalls('post', '/Endpoint/ep1/').find((c) => c.data.password);
+    expect(reset).toBeTruthy();
+    expect(userDoc.plivoEndpointPassword).toBe(reset.data.password);
+    expect(res.body.password).toBe(reset.data.password);
   });
 
   it('reuses an endpoint Plivo already has for this user instead of making another', async () => {

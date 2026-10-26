@@ -34,6 +34,7 @@ router.get('/config', protect, authorize('owner'), ctrl.getConfig);
 
 // In-app (WebRTC) calling for CRM staff.
 router.get ('/webrtc/token',    protect, authorize('owner'), ctrl.webrtcToken);
+router.get ('/webrtc/login',    protect, authorize('owner'), ctrl.webrtcLogin);
 router.post('/webrtc/presence', protect, authorize('owner'), ctrl.webrtcPresence);
 // TEMPORARY: Plivo SDK event capture from each CRM tab.
 router.post('/webrtc/debug',    protect, authorize('owner'), ctrl.postWebrtcDebug);

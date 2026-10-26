@@ -234,9 +234,20 @@ async function getEndpoint(endpointId) {
 
 const linkEndpointToApp = (endpointId, appId) => plivoRest('post', `/Endpoint/${endpointId}/`, { app_id: appId });
 
-// Plivo issues the token: POST /JWT/Token/. "per" grants receiving only —
-// the CRM never places calls from the browser, and an outgoing grant would
-// let a browser dial out through our application.
+// Sets a new password on an endpoint (Plivo never returns the old one), for
+// classic username/password SIP login when we do not have it stored.
+async function resetEndpointPassword(endpointId) {
+  const crypto = require('crypto');
+  const password = crypto.randomBytes(18).toString('base64url');
+  await plivoRest('post', `/Endpoint/${endpointId}/`, { password });
+  return password;
+}
+
+// Plivo issues the token: POST /JWT/Token/. Both grants are on: with
+// receive-only, Plivo held no routable registration for the endpoint
+// (sip_registered stayed false), and Plivo's own example grants both. The
+// CRM still never places calls from the browser; an outgoing call from an
+// endpoint would reach our application's answer URL like any other.
 async function issueToken(username) {
   const now = Math.floor(Date.now() / 1000);
   const appId = await applicationId();
@@ -245,7 +256,7 @@ async function issueToken(username) {
     sub: username,
     nbf: now,
     exp: now + TOKEN_LIFETIME_SEC,
-    per: { voice: { incoming_allow: true, outgoing_allow: false } },
+    per: { voice: { incoming_allow: true, outgoing_allow: true } },
     ...(appId ? { app: appId } : {}),
   });
   const token = data?.token || data?.jwt_token;
@@ -289,7 +300,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
-  getEndpoint, linkEndpointToApp,
+  getEndpoint, linkEndpointToApp, resetEndpointPassword,
   APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,

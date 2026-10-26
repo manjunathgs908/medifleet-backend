@@ -953,33 +953,103 @@ exports.getWebrtcDebug = async (req, res, next) => {
   }
 };
 
+const loadEndpointUser = (id) => User.findById(id)
+  .select('name +plivoEndpointId +plivoEndpointUsername +plivoEndpointPassword +plivoEndpointCheck');
+
+// Makes sure the user has their Plivo endpoint, creating or finding it the
+// first time. Returns nothing on success, or the 502 response already sent.
+async function ensureUserEndpoint(user, res) {
+  if (user.plivoEndpointUsername) return undefined;
+  try {
+    // Finds the endpoint by its alias first, so a retry after a
+    // half-finished attempt reuses it instead of making another.
+    const ep = await plivo.ensureEndpoint({ userId: user._id });
+    if (!ep.username) throw new Error('Plivo returned no endpoint username');
+    user.plivoEndpointId = ep.id;
+    user.plivoEndpointUsername = ep.username;
+    if (ep.password) user.plivoEndpointPassword = ep.password;
+    await user.save();
+    console.info(`[calls] ${ep.existing ? 'reused' : 'created'} Plivo endpoint ${ep.username} for user=${user._id}`);
+    return undefined;
+  } catch (err) {
+    const { status, text } = plivoErrorDetail(err);
+    // Plivo's full error stays in the server log; the browser gets the
+    // stage and status only.
+    console.error(`[calls] endpoint setup failed: status=${status ?? '-'} detail=${text}`, err);
+    return res.status(502).json({
+      success: false, stage: 'endpoint', plivoStatus: status,
+      message: `Could not set up in-app calling with Plivo (endpoint, status ${status ?? '-'}). Calls will ring your phone.`,
+    });
+  }
+}
+
+// How the CRM logs in to Plivo for in-app calling:
+//   'token'    — access token from Plivo's JWT API (the default);
+//   'password' — classic SIP registration with the endpoint's own
+//                username/password.
+// Set with PLIVO_WEBRTC_LOGIN on Render; a browser may also ask for one
+// explicitly (localStorage plivoLoginMode) to compare the two.
+const LOGIN_MODES = ['token', 'password'];
+const serverLoginMode = () => (LOGIN_MODES.includes(process.env.PLIVO_WEBRTC_LOGIN) ? process.env.PLIVO_WEBRTC_LOGIN : 'token');
+
+// ============================================================
+// @route   GET /api/calls/webrtc/login?mode=token|password
+// @desc    Which login the CRM should use for in-app calling, and for
+//          'password' the signed-in user's OWN endpoint username and
+//          password (over HTTPS, to that user only — never anyone else's).
+//          A missing stored password is reset on Plivo and stored first.
+// @access  Private [owner]
+// ============================================================
+exports.webrtcLogin = async (req, res, next) => {
+  try {
+    if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+    const mode = LOGIN_MODES.includes(req.query.mode) ? req.query.mode : serverLoginMode();
+    if (mode === 'token') return res.json({ success: true, mode });
+
+    const user = await loadEndpointUser(req.user._id);
+    const failed = await ensureUserEndpoint(user, res);
+    if (failed) return failed;
+    const endpointCheck = await verifyEndpoint(user);
+
+    if (!user.plivoEndpointPassword) {
+      try {
+        user.plivoEndpointPassword = await plivo.resetEndpointPassword(user.plivoEndpointId);
+        await user.save();
+        console.info(`[calls] reset Plivo endpoint password for user=${user._id} (none stored)`);
+      } catch (err) {
+        const { status, text } = plivoErrorDetail(err);
+        console.error(`[calls] endpoint password reset failed: status=${status ?? '-'} detail=${text}`);
+        return res.status(502).json({
+          success: false, stage: 'password', plivoStatus: status,
+          message: `Could not prepare in-app calling credentials (status ${status ?? '-'}). Calls will ring your phone.`,
+        });
+      }
+    }
+
+    saveDebugEvents(user, [{
+      event: 'server:credentials_issued', sessionId: req.get('X-Client-Session'), device: req.get('user-agent'),
+      detail: { endpointCheck }, at: new Date(),
+    }]).catch(() => {});
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      success : true,
+      mode,
+      username: user.plivoEndpointUsername,
+      password: user.plivoEndpointPassword,
+      endpointCheck,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
 
-    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername +plivoEndpointPassword +plivoEndpointCheck');
-    if (!user.plivoEndpointUsername) {
-      try {
-        // Finds the endpoint by its alias first, so a retry after a
-        // half-finished attempt reuses it instead of making another.
-        const ep = await plivo.ensureEndpoint({ userId: user._id });
-        if (!ep.username) throw new Error('Plivo returned no endpoint username');
-        user.plivoEndpointId = ep.id;
-        user.plivoEndpointUsername = ep.username;
-        if (ep.password) user.plivoEndpointPassword = ep.password;
-        await user.save();
-        console.info(`[calls] ${ep.existing ? 'reused' : 'created'} Plivo endpoint ${ep.username} for user=${user._id}`);
-      } catch (err) {
-        const { status, text } = plivoErrorDetail(err);
-        // Plivo's full error stays in the server log; the browser gets the
-        // stage and status only.
-        console.error(`[calls] endpoint setup failed: status=${status ?? '-'} detail=${text}`, err);
-        return res.status(502).json({
-          success: false, stage: 'endpoint', plivoStatus: status,
-          message: `Could not set up in-app calling with Plivo (endpoint, status ${status ?? '-'}). Calls will ring your phone.`,
-        });
-      }
-    }
+    const user = await loadEndpointUser(req.user._id);
+    const failed = await ensureUserEndpoint(user, res);
+    if (failed) return failed;
 
     // Check what we will dial and sign against Plivo's own record of the
     // endpoint. Never blocks the token: a failed check is reported, not fatal.

@@ -1422,3 +1422,42 @@ describe('phone verdict timing', () => {
     expect(phoneLegVerdict(leg(3), undefined).afterSec).toBeNull();
   });
 });
+
+describe('telecallers', () => {
+  it('on-duty telecallers are rung with the owners on an incoming call', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { _id: 't1', role: 'telecaller', name: 'Tele 1', callMode: 'phone', phone: '9123456781' },
+      { _id: 't2', role: 'telecaller', name: 'Tele 2', callMode: 'phone', phone: '9123456782' },
+    ]));
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '918884092777', CallUUID: 'c1' } });
+    expect(User.find.mock.calls[0][0]).toEqual(expect.objectContaining({ role: { $in: ['owner', 'telecaller'] }, callDuty: true }));
+    expect(res.body).toContain('<Number>919123456781</Number>');
+    expect(res.body).toContain('<Number>919123456782</Number>');
+  });
+
+  it('a telecaller may use the calling routes but not Plivo\'s live-call panel', () => {
+    const router = require('../routes/calls');
+    const roleOf = (path, method) => {
+      const layer = router.stack.find((l) => l.route?.path === path && l.route.methods[method]);
+      return layer;
+    };
+    expect(roleOf('/logs', 'get')).toBeTruthy();
+    // Exercise the real guards with a telecaller request.
+    const pass = (path, method) => {
+      const layer = roleOf(path, method);
+      const guard = layer.route.stack[1].handle; // [protect, authorize, handler]
+      let ok = false;
+      const res = { status: () => ({ json: () => {} }) };
+      guard({ user: { role: 'telecaller' } }, res, () => { ok = true; });
+      return ok;
+    };
+    expect(pass('/logs', 'get')).toBe(true);
+    expect(pass('/me', 'put')).toBe(true);
+    expect(pass('/test-ring', 'post')).toBe(true);
+    expect(pass('/:id/recording', 'get')).toBe(true);
+    expect(pass('/plivo/live', 'get')).toBe(false);
+    expect(pass('/plivo/live/:uuid/hangup', 'post')).toBe(false);
+  });
+});

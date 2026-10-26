@@ -4,7 +4,7 @@
  * Central export of ALL Mongoose schemas and models.
  *
  * Models defined here:
- *   1. User          â€” Staff (Owner / Driver) — telecaller role removed
+ *   1. User          â€” Staff (Owner / Driver / Telecaller)
  *                       for now, planned to come back later
  *   2. Vehicle       â€” Fleet asset with compliance documents
  *   3. Attendance    â€” Driver punch-in/out + shift record
@@ -63,12 +63,10 @@ const userSchema = new Schema(
     // â”€â”€ RBAC Role â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     role: {
       type    : String,
-      // telecaller removed for now — planned to come back later. An
-      // existing User document with role:'telecaller' isn't touched by
-      // this enum change (Mongoose only validates enum on save, not on
-      // read), it just can't be re-saved with that value until it's
-      // re-added.
-      enum    : ['owner', 'driver'],
+      // telecaller: CRM login limited to calls — answers incoming customer
+      // calls (rung with the owners on call duty) and calls customers back.
+      // Every other CRM route stays owner-only.
+      enum    : ['owner', 'driver', 'telecaller'],
       default : 'driver',
     },
 

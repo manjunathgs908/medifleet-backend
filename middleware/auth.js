@@ -12,9 +12,9 @@
  *     — Must come AFTER protect() in the middleware chain.
  *     — Usage:  router.get('/report', protect, authorize('owner'), handler)
  *
- * Access Matrix (telecaller role removed for now — every route below is
- * owner-only until it comes back; nothing here is currently gated to a
- * telecaller-only allowance):
+ * Access Matrix. Telecallers reach only the CRM calling routes
+ * (routes/calls.js: call logs, recordings, call back, their own ring
+ * number, duty and in-app phone); everything below is owner-only:
  * ┌────────────────────────────┬───────┬────────┐
  * │ Resource                   │ owner │ driver │
  * ├────────────────────────────┼───────┼────────┤
@@ -201,8 +201,8 @@ const driverSelfOnly = (req, res, next) => {
     return next();
   }
 
-  // Any role besides owner/driver (none exist right now — telecaller
-  // removed) has no access to salary/driver records.
+  // Any role besides owner/driver (i.e. telecaller) has no access to
+  // salary/driver records.
   return res.status(403).json({ success: false, message: 'Access denied.' });
 };
 

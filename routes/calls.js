@@ -12,6 +12,8 @@ const router  = express.Router();
 const ctrl    = require('../controllers/callController');
 const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
+const CRM_CALLS = ['owner', 'telecaller'];
+
 // Drivers, fleet owners (Owner accounts) and CRM staff may all place a
 // masked call; controllers/callController.js decides whom each may reach.
 router.post('/click-to-call', protectUserOrOwner, ctrl.clickToCall);
@@ -25,15 +27,16 @@ router.all('/recording', ctrl.requirePlivoSignature, ctrl.recording);
 router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
-// cannot reach these.
-router.get('/logs', protect, authorize('owner'), ctrl.listLogs);
-router.get('/duty', protect, authorize('owner'), ctrl.getDuty);
-router.put('/duty', protect, authorize('owner'), ctrl.setDuty);
-router.get('/me',     protect, authorize('owner'), ctrl.getMe);
-router.put('/me',     protect, authorize('owner'), ctrl.setMe);
-router.get('/config', protect, authorize('owner'), ctrl.getConfig);
+// cannot reach these. Telecallers (CRM_CALLS) take and return customer
+// calls; Plivo's live-call panel stays with the owner.
+router.get('/logs', protect, authorize(...CRM_CALLS), ctrl.listLogs);
+router.get('/duty', protect, authorize(...CRM_CALLS), ctrl.getDuty);
+router.put('/duty', protect, authorize(...CRM_CALLS), ctrl.setDuty);
+router.get('/me',     protect, authorize(...CRM_CALLS), ctrl.getMe);
+router.put('/me',     protect, authorize(...CRM_CALLS), ctrl.setMe);
+router.get('/config', protect, authorize(...CRM_CALLS), ctrl.getConfig);
 // "Ring my phone now (test)" — rings the user's own ring number.
-router.post('/test-ring', protect, authorize('owner'), ctrl.testRing);
+router.post('/test-ring', protect, authorize(...CRM_CALLS), ctrl.testRing);
 
 // What Plivo has live right now (each call counts toward its concurrency
 // limit), and hanging up one stuck call by id.
@@ -41,17 +44,17 @@ router.get ('/plivo/live',              protect, authorize('owner'), ctrl.liveCa
 router.post('/plivo/live/:uuid/hangup', protect, authorize('owner'), ctrl.hangupLiveCall);
 
 // In-app (WebRTC) calling for CRM staff.
-router.get ('/webrtc/token',    protect, authorize('owner'), ctrl.webrtcToken);
-router.get ('/webrtc/login',    protect, authorize('owner'), ctrl.webrtcLogin);
-router.post('/webrtc/presence', protect, authorize('owner'), ctrl.webrtcPresence);
+router.get ('/webrtc/token',    protect, authorize(...CRM_CALLS), ctrl.webrtcToken);
+router.get ('/webrtc/login',    protect, authorize(...CRM_CALLS), ctrl.webrtcLogin);
+router.post('/webrtc/presence', protect, authorize(...CRM_CALLS), ctrl.webrtcPresence);
 // TEMPORARY: Plivo SDK event capture from each CRM tab.
-router.post('/webrtc/debug',    protect, authorize('owner'), ctrl.postWebrtcDebug);
-router.get ('/webrtc/debug',    protect, authorize('owner'), ctrl.getWebrtcDebug);
-router.get ('/:id',             protect, authorize('owner'), ctrl.getCall);
-router.get ('/:id/trail',       protect, authorize('owner'), ctrl.getCallTrail);
-router.post('/:id/answered',    protect, authorize('owner'), ctrl.markAnswered);
+router.post('/webrtc/debug',    protect, authorize(...CRM_CALLS), ctrl.postWebrtcDebug);
+router.get ('/webrtc/debug',    protect, authorize(...CRM_CALLS), ctrl.getWebrtcDebug);
+router.get ('/:id',             protect, authorize(...CRM_CALLS), ctrl.getCall);
+router.get ('/:id/trail',       protect, authorize(...CRM_CALLS), ctrl.getCallTrail);
+router.post('/:id/answered',    protect, authorize(...CRM_CALLS), ctrl.markAnswered);
 // Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
 // sent to the browser).
-router.get('/:id/recording', protect, authorize('owner'), ctrl.streamRecording);
+router.get('/:id/recording', protect, authorize(...CRM_CALLS), ctrl.streamRecording);
 
 module.exports = router;

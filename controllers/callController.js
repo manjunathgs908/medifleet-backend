@@ -283,7 +283,8 @@ async function releaseLegs(logId) {
 }
 exports.releaseLegs = releaseLegs;
 
-const loadOnDuty = () => User.find({ role: 'owner', isActive: true, callDuty: true })
+// CRM admins and telecallers on call duty.
+const loadOnDuty = () => User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true, callDuty: true })
   .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername +plivoEndpointId')
   .limit(MAX_INCOMING_AGENTS).lean();
 

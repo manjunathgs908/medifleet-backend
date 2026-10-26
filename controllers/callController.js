@@ -130,6 +130,16 @@ async function snapshotEndpoints(logId, onDuty) {
   await CallLog.updateOne({ _id: logId }, { $set: { 'routing.plivoEndpointsAtCall': atCall } });
 }
 
+// Plivo's hang-up fields for a whole call (hangup_url), for the
+// diagnostics. Numbers masked.
+const HANGUP_FIELDS = ['CallStatus', 'HangupCause', 'HangupCauseCode', 'HangupCauseName', 'HangupSource', 'Duration', 'BillDuration', 'AnswerTime', 'EndTime', 'Direction'];
+function hangupDetail(b) {
+  const out = {};
+  for (const k of HANGUP_FIELDS) if (b?.[k] != null && b[k] !== '') out[k] = b[k];
+  out.receivedAt = new Date();
+  return out;
+}
+
 // Plivo's Dial result fields, for the diagnostics. Anything that looks like
 // a phone number is masked.
 function dialResult(b) {
@@ -369,7 +379,17 @@ exports.answer = async (req, res, next) => {
 // ============================================================
 exports.incoming = async (req, res, next) => {
   try {
-    const from = normalisePhone(plivoParams(req).From);
+    // Our in-app endpoints share this application, so a call PLACED from a
+    // browser would arrive here as if a customer were calling. The CRM never
+    // dials from the browser (outbound is server click-to-call), so such a
+    // call is turned away instead of ringing staff and holding legs open.
+    const rawFrom = String(plivoParams(req).From || '');
+    if (/^sip:/i.test(rawFrom)) {
+      console.warn(`[calls] incoming from a SIP endpoint (browser-originated) — hung up, not routed. callUUID=${plivoParams(req).CallUUID || '-'}`);
+      return sendXml(res, plivo.hangupXml());
+    }
+
+    const from = normalisePhone(rawFrom);
 
     // Link it to what we know about this caller, so the CRM's call history
     // shows "Trip TRP-…" rather than a bare masked number.
@@ -526,9 +546,12 @@ exports.events = async (req, res, next) => {
       const total = Number(b.Duration);
       if (Number.isFinite(total)) log.totalSec = total;
       if (b.HangupCause && !log.hangupCause) log.hangupCause = b.HangupCause;
+      // TEMPORARY diagnostic: Plivo's full hang-up report for the whole
+      // call — e.g. HangupCauseCode 5030 is its concurrency limit.
+      log.hangup = hangupDetail(b);
       log.endedAt = new Date();
       await log.save();
-      plivo.logCall(`hangup status=${log.status}`, log);
+      plivo.logCall(`hangup status=${log.status} cause=${b.HangupCauseName || b.HangupCause || '-'} code=${b.HangupCauseCode || '-'} source=${b.HangupSource || '-'}`, log);
     } else if (String(b.Direction || '').toLowerCase() === 'inbound' && b.CallUUID) {
       // An incoming call we have no log for: /incoming never ran for it
       // (Plivo's number not linked to our application, or the answer
@@ -1146,6 +1169,91 @@ exports.markAnswered = async (req, res, next) => {
       { new: true },
     );
     return res.json({ success: true, claimed: !!updated });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/calls/plivo/live
+// @desc    Every call Plivo has live on the account right now — each one
+//          counts toward its simultaneous-call limit. Matched to our call
+//          logs where possible; numbers masked. A call nobody here knows
+//          about, or one far older than any real call, is a stuck leg.
+// @access  Private [owner]
+// ============================================================
+exports.liveCalls = async (req, res, next) => {
+  try {
+    if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+    let live;
+    try {
+      live = await plivo.listLiveCalls();
+    } catch (err) {
+      const { status, text } = plivoErrorDetail(err);
+      console.error(`[calls] live call list failed: status=${status ?? '-'} detail=${text}`);
+      return res.status(502).json({ success: false, plivoStatus: status, message: `Could not read live calls from Plivo (status ${status ?? '-'}).` });
+    }
+
+    const uuids = live.calls.map((c) => c.callUuid);
+    const logs = uuids.length
+      ? await CallLog.find({ $or: [{ providerCallId: { $in: uuids } }, { customerLegId: { $in: uuids } }] })
+        .select('_id providerCallId customerLegId direction status context startedAt').lean()
+      : [];
+    const byUuid = new Map();
+    for (const l of logs) {
+      if (l.providerCallId) byUuid.set(l.providerCallId, l);
+      if (l.customerLegId) byUuid.set(l.customerLegId, l);
+    }
+    const mask = (v) => (/^\+?\d{10,15}$/.test(String(v || '')) ? maskPhone(v) : v || null);
+
+    return res.json({
+      success: true,
+      total  : live.total,
+      calls  : live.calls.map((c) => {
+        const log = byUuid.get(c.callUuid);
+        const started = c.session_start ? new Date(c.session_start) : null;
+        return {
+          callUuid  : c.callUuid,
+          direction : c.direction || null,
+          from      : mask(c.from),
+          to        : mask(c.to),
+          status    : c.call_status || null,
+          startedAt : started && !Number.isNaN(started.getTime()) ? started : null,
+          ageSec    : started && !Number.isNaN(started.getTime()) ? Math.round((Date.now() - started.getTime()) / 1000) : null,
+          callLog   : log ? { _id: log._id, direction: log.direction, status: log.status, context: log.context } : null,
+          error     : c.error || undefined,
+        };
+      }),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/calls/plivo/live/:uuid/hangup
+// @desc    Hang up one live Plivo call — for clearing a stuck leg that
+//          holds the simultaneous-call limit. One at a time, by id, so a
+//          real conversation is never cut off in bulk.
+// @access  Private [owner]
+// ============================================================
+exports.hangupLiveCall = async (req, res, next) => {
+  try {
+    const uuid = String(req.params.uuid || '');
+    if (!/^[A-Za-z0-9-]{8,64}$/.test(uuid)) return res.status(400).json({ success: false, message: 'Not a Plivo call id.' });
+    try {
+      await plivo.hangupCall(uuid);
+    } catch (err) {
+      const { status, text } = plivoErrorDetail(err);
+      console.error(`[calls] hangup ${uuid} failed: status=${status ?? '-'} detail=${text}`);
+      return res.status(status === 404 ? 404 : 502).json({
+        success: false, plivoStatus: status,
+        message: status === 404 ? 'That call has already ended.' : `Plivo could not hang up that call (status ${status ?? '-'}).`,
+      });
+    }
+    console.info(`[calls] live call ${uuid} hung up by user=${req.user._id}`);
+    return res.json({ success: true });
   } catch (err) {
     next(err);
   }

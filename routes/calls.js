@@ -32,6 +32,11 @@ router.get('/me',     protect, authorize('owner'), ctrl.getMe);
 router.put('/me',     protect, authorize('owner'), ctrl.setMe);
 router.get('/config', protect, authorize('owner'), ctrl.getConfig);
 
+// What Plivo has live right now (each call counts toward its concurrency
+// limit), and hanging up one stuck call by id.
+router.get ('/plivo/live',              protect, authorize('owner'), ctrl.liveCalls);
+router.post('/plivo/live/:uuid/hangup', protect, authorize('owner'), ctrl.hangupLiveCall);
+
 // In-app (WebRTC) calling for CRM staff.
 router.get ('/webrtc/token',    protect, authorize('owner'), ctrl.webrtcToken);
 router.get ('/webrtc/login',    protect, authorize('owner'), ctrl.webrtcLogin);

@@ -80,6 +80,11 @@ const logCall = (what, log) =>
 // trial account's refusal deserves a plain explanation.
 function friendlyError(err) {
   const raw = String(err?.message || err?.error || err || '').trim();
+  // Plivo's concurrency cap (India accounts: 50 ringing+connected PSTN legs)
+  // answers Make-a-Call with HTTP 403 "Concurrency Limit Breached".
+  if (/concurren/i.test(raw)) {
+    return 'Plivo\'s limit on simultaneous calls is reached — too many calls are ringing or connected right now. Check Call Logs → Live Plivo calls for stuck calls, or try again shortly.';
+  }
   if (/verif|trial|sandbox|not allowed to call/i.test(raw)) {
     return 'The Plivo account is on a free trial and can only call verified numbers. Verify this number in the Plivo console, or add credit to call anyone.';
   }
@@ -243,11 +248,29 @@ async function resetEndpointPassword(endpointId) {
   return password;
 }
 
-// Plivo issues the token: POST /JWT/Token/. Both grants are on: with
-// receive-only, Plivo held no routable registration for the endpoint
-// (sip_registered stayed false), and Plivo's own example grants both. The
-// CRM still never places calls from the browser; an outgoing call from an
-// endpoint would reach our application's answer URL like any other.
+// Every call Plivo currently has live on the account (ringing or
+// connected) — each counts toward the concurrency limit. Up to `max`
+// detailed; the total is always exact.
+async function listLiveCalls({ max = 25 } = {}) {
+  const { data } = await plivoRest('get', '/Call/?status=live');
+  const ids = Array.isArray(data?.calls) ? data.calls : (data?.objects || []).map((c) => c.call_uuid);
+  const details = await Promise.all(ids.slice(0, max).map(async (uuid) => {
+    try {
+      const { data: c } = await plivoRest('get', `/Call/${uuid}/?status=live`);
+      return { callUuid: uuid, ...c };
+    } catch {
+      return { callUuid: uuid, error: 'details unavailable' };
+    }
+  }));
+  return { total: ids.length, calls: details };
+}
+
+const hangupCall = (uuid) => plivoRest('delete', `/Call/${encodeURIComponent(uuid)}/`);
+
+// Plivo issues the token: POST /JWT/Token/ — only used when
+// PLIVO_WEBRTC_LOGIN=token (password login is the default). Receive-only:
+// the outgoing grant was tried and did not help registration, and the CRM
+// never places calls from the browser (outbound is server click-to-call).
 async function issueToken(username) {
   const now = Math.floor(Date.now() / 1000);
   const appId = await applicationId();
@@ -256,7 +279,7 @@ async function issueToken(username) {
     sub: username,
     nbf: now,
     exp: now + TOKEN_LIFETIME_SEC,
-    per: { voice: { incoming_allow: true, outgoing_allow: true } },
+    per: { voice: { incoming_allow: true, outgoing_allow: false } },
     ...(appId ? { app: appId } : {}),
   });
   const token = data?.token || data?.jwt_token;
@@ -300,7 +323,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
-  getEndpoint, linkEndpointToApp, resetEndpointPassword,
+  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall,
   APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,

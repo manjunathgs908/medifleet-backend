@@ -685,7 +685,7 @@ describe('in-app (WebRTC) calling', () => {
     expect(jwtCall.data).toEqual(expect.objectContaining({
       iss: 'MAXXXXXXXXXXXXXXXXXX',
       sub: 'slexisting123',
-      per: { voice: { incoming_allow: true, outgoing_allow: true } },
+      per: { voice: { incoming_allow: true, outgoing_allow: false } },
       app: '29986316244302815',
     }));
     expect(jwtCall.data.exp - jwtCall.data.nbf).toBe(3600);
@@ -908,5 +908,79 @@ describe('in-app debug capture (temporary)', () => {
     const desk = res.body.sessions.find((s) => s.sessionId === 'desk');
     expect(desk.lastLogout).toEqual({ at: t(20), reason: 'Logout' });
     expect(desk.lastLogin).toEqual(t(10));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('busy / leg-release investigation', () => {
+  const fresh = () => new Date();
+
+  it('"My phone" mode goes straight to the phone, even with an endpoint and a fresh app check-in', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { _id: 'u1', name: 'Me', callMode: 'phone', plivoEndpointUsername: 'slme1', plivoEndpointId: 'ep1', appOnlineAt: fresh(), phone: '9000000001', callPhone: '9986844442' },
+    ]));
+
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919123456780', CallUUID: 'mine' } });
+
+    expect(res.body).toContain('<Number>919986844442</Number>');
+    expect(res.body).not.toContain('<User>');
+    expect(res.body).toContain('stage=phone');
+    expect(res.body).toContain('timeout="40"');
+    expect(CallLog.create.mock.calls[0][0].routing.decision).toBe('phone');
+  });
+
+  it('a call placed FROM a browser endpoint is hung up, not routed to staff', async () => {
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: 'sip:slme1@phone.plivo.com', CallUUID: 'browser-out' } });
+    expect(res.body).toContain('<Hangup/>');
+    expect(res.body).not.toContain('<Dial');
+    expect(CallLog.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps Plivo\'s full hang-up report on the call log', async () => {
+    const log = logDoc({ direction: 'outbound', status: 'initiated' });
+    CallLog.findById.mockResolvedValue(log);
+    await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001' },
+      body: { CallStatus: 'busy', HangupCause: 'USER_BUSY', HangupCauseCode: '3010', HangupCauseName: 'Busy Line', HangupSource: 'Callee', Duration: '0' },
+    });
+    expect(log.status).toBe('agent_busy');
+    expect(log.hangup).toEqual(expect.objectContaining({ CallStatus: 'busy', HangupCauseCode: '3010', HangupCauseName: 'Busy Line', HangupSource: 'Callee' }));
+  });
+
+  it('a Plivo concurrency refusal on click-to-call says so plainly', async () => {
+    mockCreateCall.mockRejectedValue(new Error('Concurrency Limit Breached'));
+    const { res } = await run(ctrl.clickToCall, { user: staff, body: { customerRef: customerRef(CUSTOMER) } });
+    expect(res.statusCode).toBe(502);
+    expect(res.body.message).toMatch(/simultaneous calls/);
+  });
+
+  it('lists Plivo\'s live calls, matched to our logs, numbers masked', async () => {
+    const started = new Date(Date.now() - 3 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    axios.request.mockImplementation(async ({ method, url }) => {
+      if (method === 'get' && url.endsWith('/Call/?status=live')) return { data: { calls: ['leg-1', 'leg-2'] } };
+      if (method === 'get' && url.includes('/Call/leg-1/')) return { data: { direction: 'inbound', from: '919986844442', to: '918065591088', call_status: 'in-progress', session_start: started } };
+      if (method === 'get' && url.includes('/Call/leg-2/')) return { data: { direction: 'outbound', from: '918065591088', to: 'sip:slme1@phone.plivo.com', call_status: 'ringing' } };
+      throw new Error(`unexpected ${method} ${url}`);
+    });
+    CallLog.find.mockReturnValue(chain([{ _id: 'l1', providerCallId: 'leg-1', direction: 'inbound', status: 'ringing', context: 'incoming' }]));
+
+    const { res } = await run(ctrl.liveCalls, { user: staff });
+
+    expect(res.body.total).toBe(2);
+    const [a, b] = res.body.calls;
+    expect(a).toEqual(expect.objectContaining({ callUuid: 'leg-1', from: '••••••4442', status: 'in-progress', callLog: expect.objectContaining({ _id: 'l1' }) }));
+    expect(a.ageSec).toBeGreaterThan(3 * 3600 - 120);
+    expect(b).toEqual(expect.objectContaining({ callUuid: 'leg-2', to: 'sip:slme1@phone.plivo.com', callLog: null }));
+    expect(JSON.stringify(res.body)).not.toContain('9986844442');
+  });
+
+  it('hangs up one live call by id', async () => {
+    axios.request.mockResolvedValue({ data: {} });
+    const { res } = await run(ctrl.hangupLiveCall, { user: staff, params: { uuid: 'leg-1-abcdef' } });
+    expect(res.body.success).toBe(true);
+    expect(axios.request.mock.calls[0][0]).toEqual(expect.objectContaining({ method: 'delete' }));
+    expect(axios.request.mock.calls[0][0].url).toMatch(/\/Call\/leg-1-abcdef\/$/);
   });
 });

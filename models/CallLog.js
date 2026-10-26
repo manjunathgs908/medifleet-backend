@@ -70,6 +70,7 @@ const CallLogSchema = new mongoose.Schema(
     //   appLeg:   what Plivo reported for the in-app <Dial> (stage 1).
     //   phoneLeg: what Plivo reported for the phone <Dial> (stage 2).
     routing : { type: mongoose.Schema.Types.Mixed },
+    hangup  : { type: mongoose.Schema.Types.Mixed }, // Plivo's hang-up report for the whole call
     appLeg  : { type: mongoose.Schema.Types.Mixed },
     phoneLeg: { type: mongoose.Schema.Types.Mixed },
 

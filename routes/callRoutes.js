@@ -102,7 +102,9 @@ router.post('/connect', async (req, res, next) => {
     });
     await trip.save();
 
-    return res.json({ success: true, call });
+    // Exotel's Call object carries both From and To -- the driver's and the
+    // customer's real numbers. Only the id and status go back to the app.
+    return res.json({ success: true, call: { Sid: call.Sid, Status: call.Status || 'initiated' } });
   } catch (err) {
     next(err);
   }

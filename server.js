@@ -99,6 +99,7 @@ app.use('/api/app/auth',  require('./routes/appAuth'));   // customer app phone 
 app.use('/api/seo',       require('./routes/seo'));       // owner-only
 app.use('/api/guides',    require('./routes/seoPublic'));  // public, approved articles only
 app.use('/api/quotes',    require('./routes/quotes'));     // owner + token-keyed public quote page
+app.use('/api/calls',     require('./routes/calls'));      // Plivo masked calling (Exotel stays at /api/call)
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

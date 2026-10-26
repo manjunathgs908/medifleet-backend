@@ -27,6 +27,7 @@
 const mongoose = require('mongoose');
 const bcrypt   = require('bcryptjs');
 const crypto   = require('crypto');
+const { maskPhone } = require('../utils/customerPhone');
 
 const { Schema } = mongoose;
 
@@ -101,6 +102,12 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     refreshToken  : { type: String, select: false },
     isActive      : { type: Boolean, default: true },
     lastLogin     : { type: Date },
+
+    // CRM staff only: switched on from the CRM header to take incoming
+    // customer calls. Incoming Plivo calls ring every user with this on, at
+    // once, and the first to answer gets the call (controllers/
+    // callController.js incoming).
+    callDuty      : { type: Boolean, default: false },
 
     // â”€â”€ Driver current availability (synced from mobile app) â”€â”€
     availability  : {
@@ -476,6 +483,18 @@ const leadSchema = new Schema(
   { timestamps: true }
 );
 
+// Same rule as Trip below: the lead's number never goes out in a response.
+// The CRM calls a lead through POST /api/calls/click-to-call with its id.
+leadSchema.set('toJSON', {
+  transform(doc, ret) {
+    if ('phone' in ret) {
+      ret.phoneMasked = maskPhone(ret.phone);
+      delete ret.phone;
+    }
+    return ret;
+  },
+});
+
 const Lead = mongoose.model('Lead', leadSchema);
 
 
@@ -738,6 +757,23 @@ const tripSchema = new Schema(
   },
   { timestamps: true }
 );
+
+// The customer's number is for this backend only: WhatsApp/SMS sends and
+// masked calls read it off the document, but no response carries it. Every
+// res.json of a Trip document goes through this, which is what makes the
+// rule hold for endpoints nobody remembers to check. Clients get the masked
+// form to display and call via POST /api/calls/click-to-call with the trip
+// id. (.lean() and toObject() results bypass toJSON -- the few places that
+// use those strip it themselves; see tripController's redactTrip.)
+tripSchema.set('toJSON', {
+  transform(doc, ret) {
+    if ('patientPhone' in ret) {
+      ret.patientPhoneMasked = maskPhone(ret.patientPhone);
+      delete ret.patientPhone;
+    }
+    return ret;
+  },
+});
 
 // Auto-generate trip number before save
 tripSchema.pre('save', function (next) {

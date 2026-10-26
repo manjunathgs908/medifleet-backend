@@ -1,5 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
+const { maskPhone, customerRef } = require('../utils/customerPhone');
 
 // A WhatsApp conversation that asked for a service with no working
 // backendCode (see whatsappServiceCatalog.js's bookable flag) or hit a
@@ -30,5 +31,18 @@ const WhatsAppLeadSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// The number never goes out in a response: the CRM shows phoneMasked and
+// calls through POST /api/calls/click-to-call with the lead's id.
+WhatsAppLeadSchema.set('toJSON', {
+  transform(doc, ret) {
+    if ('phone' in ret) {
+      ret.phoneMasked = maskPhone(ret.phone);
+      ret.customerRef = customerRef(ret.phone);
+      delete ret.phone;
+    }
+    return ret;
+  },
+});
 
 module.exports = mongoose.model('WhatsAppLead', WhatsAppLeadSchema);

@@ -30,6 +30,7 @@ const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { Trip, Lead } = require('../models');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
+const { maskPhone, customerRef, phoneFromRef, isCustomerRef } = require('../utils/customerPhone');
 const { protect, authorize } = require('../middleware/auth');
 
 const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
@@ -335,14 +336,18 @@ router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
 //          Permanent, append-only -- see models/WhatsAppCallLog.js.
 // @access  Private [owner] -- same reasoning as /funnel above.
 //
-// Body: { phone, outcome, followUpAt, note, tripId }
+// Body: { customerRef, outcome, followUpAt, note, tripId }
+//   customerRef is the opaque token /conversations hands out in place of
+//   the number (utils/customerPhone.js). A raw `phone` is still accepted
+//   for any older caller, but the CRM no longer has one to send.
 // ============================================================
 router.post('/call-outcome', protect, authorize('owner'), async (req, res, next) => {
   try {
-    const { phone, outcome, followUpAt, note, tripId } = req.body;
+    const { outcome, followUpAt, note, tripId } = req.body;
+    const phone = req.body.customerRef ? phoneFromRef(req.body.customerRef) : req.body.phone;
 
     if (!phone) {
-      return res.status(400).json({ success: false, message: 'phone is required.' });
+      return res.status(400).json({ success: false, message: 'customerRef is required.' });
     }
 
     if (!CALL_OUTCOMES.includes(outcome)) {
@@ -602,8 +607,12 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
     ]);
 
     const counts = result.counts[0] || { total: 0, completed: 0, dropped: 0, live: 0, needsCall: 0, done: 0 };
+    // customerRef stands in for the number everywhere the CRM used it: the
+    // row key, logging an outcome, opening history and placing a masked
+    // call. phoneMasked is what it displays.
     const conversations = result.rows.map((row) => ({
-      phone: row.phone,
+      customerRef: customerRef(row.phone),
+      phoneMasked: maskPhone(row.phone),
       lastStep: row.lastStep,
       lastStepLabel: STEP_LABELS[row.lastStep] || row.lastStep,
       language: row.language,
@@ -651,13 +660,16 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
 //          for the full investigation.
 // @access  Private [owner] -- same reasoning as /funnel above.
 // ============================================================
+// :phone is the customerRef from /conversations (a raw number is still
+// accepted for older callers). The response never contains the number.
 router.get('/customer/:phone', protect, authorize('owner'), async (req, res, next) => {
   try {
-    const normalized = normalisePhone(req.params.phone);
+    const raw = isCustomerRef(req.params.phone) ? phoneFromRef(req.params.phone) : req.params.phone;
+    const normalized = normalisePhone(raw);
     if (normalized.length !== 10) {
-      return res.status(400).json({ success: false, message: 'phone must contain at least 10 digits.' });
+      return res.status(400).json({ success: false, message: 'Unknown customer reference.' });
     }
-    const phoneQuery = phoneSuffixQuery(req.params.phone);
+    const phoneQuery = phoneSuffixQuery(normalized);
     const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
 
     const [events, calls, trips] = await Promise.all([
@@ -738,7 +750,8 @@ router.get('/customer/:phone', protect, authorize('owner'), async (req, res, nex
 
     res.json({
       success: true,
-      phone: normalized,
+      customerRef: customerRef(normalized),
+      phoneMasked: maskPhone(normalized),
       summary,
       conversations,
       calls: callRows,

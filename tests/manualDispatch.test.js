@@ -416,6 +416,9 @@ describe('D. the historical trips still load', () => {
     ambulance: null,
     driver: { _id: 'd0', name: 'Old Driver' },
     toObject() { return { ...this }; },
+    // getTripById serialises with toJSON() so the Trip schema's rule masks
+    // the customer's number; a real document has both.
+    toJSON() { return { ...this }; },
     getLiveWaitState: () => null,
   };
 

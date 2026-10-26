@@ -1548,18 +1548,14 @@ exports.getTrips = async (req, res, next) => {
       .skip(skip)
       .limit(Number(limit));
 
-    // Drivers get masked calling (POST /api/call/connect) instead of the
-    // customer's raw number — owner/CRM still sees it for support/dispatch.
-    const tripsOut = req.user.role === 'driver'
-      ? trips.map(t => { const o = t.toObject(); delete o.patientPhone; return o; })
-      : trips;
-
+    // No caller gets the customer's number (see the Trip toJSON rule in
+    // models/index.js); everyone calls through POST /api/calls/click-to-call.
     return res.json({
       success: true,
       total,
       pages: Math.ceil(total / limit),
       currentPage: Number(page),
-      trips: tripsOut,
+      trips,
     });
   } catch (err) {
     next(err);
@@ -1610,15 +1606,11 @@ exports.getLiveBoard = async (req, res, next) => {
 
     const availableVehicles = ambulanceEntries;
 
-    // Drivers get masked calling (POST /api/call/connect) instead of the
-    // customer's raw number — owner/CRM still sees it for support/dispatch.
-    const liveTripsOut = req.user.role === 'driver'
-      ? activeTrips.map(t => { const o = t.toObject(); delete o.patientPhone; return o; })
-      : activeTrips;
-
+    // Trip documents: the toJSON rule replaces the customer's number with
+    // patientPhoneMasked for every caller.
     return res.json({
       success: true,
-      liveTrips       : liveTripsOut,
+      liveTrips       : activeTrips,
       availableVehicles,
       counts: {
         active   : activeTrips.length,
@@ -1661,12 +1653,10 @@ exports.getTripById = async (req, res, next) => {
       if (!mine) return res.status(404).json({ success: false, message: 'Trip not found.' });
     }
 
-    const tripObj = trip.toObject();
+    // toJSON(), not toObject(), so the customer's number is masked here the
+    // same as on every other trip response.
+    const tripObj = trip.toJSON();
     tripObj.waitState = trip.getLiveWaitState();
-
-    // Drivers get masked calling (POST /api/call/connect) instead of the
-    // customer's raw number — owner/CRM still sees it for support/dispatch.
-    if (req.user.role === 'driver') delete tripObj.patientPhone;
 
     return res.json({ success: true, trip: tripObj });
   } catch (err) {

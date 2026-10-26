@@ -24,6 +24,7 @@ const { Trip } = require('../models');
 const { quoteTrip, createBookedTrip } = require('./tripController');
 const fareCalculator = require('../utils/fareCalculator');
 const { normalisePhone } = require('../utils/phone');
+const { maskPhone } = require('../utils/customerPhone');
 const whatsappNotifications = require('../services/whatsappNotifications');
 const { resolveTrackingUrl } = require('../services/trackingNotifications');
 
@@ -97,7 +98,9 @@ function crmView(quote) {
   return {
     _id         : quote._id,
     url         : quoteUrl(quote),
-    phone       : quote.phone,
+    // Masked like every other customer number the CRM receives; the desk
+    // calls a quote's customer through POST /api/calls/click-to-call.
+    phoneMasked : maskPhone(quote.phone),
     patientName : quote.patientName || null,
     pickup      : quote.pickup || null,
     drop        : quote.drop || null,
@@ -120,9 +123,6 @@ function crmView(quote) {
   };
 }
 
-// The phone is the customer's own, but the link can be forwarded -- show
-// only enough to recognise it.
-const maskPhone = (phone) => (phone ? `••••••${String(phone).slice(-4)}` : null);
 
 function publicView(quote, extra = {}) {
   return {

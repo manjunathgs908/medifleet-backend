@@ -18,6 +18,7 @@ const Shift       = require('../models/Shift');
 const Ambulance   = require('../models/Ambulance');
 const { Trip, User, Attendance } = require('../models');
 const { isPlatformDriver } = require('../utils/platformOwner');
+const { maskPhone } = require('../utils/customerPhone');
 const { computeAmbulanceDisplayStatus } = require('./ambulanceController');
 
 function toLocation(lat, lng) {
@@ -540,7 +541,9 @@ exports.getFleetShiftStatus = async (req, res, next) => {
             tripNumber   : trip.tripNumber,
             status       : trip.status,
             patientName  : trip.patientName,
-            patientPhone : trip.patientPhone,
+            // Masked: a partner calls the customer through POST
+            // /api/calls/click-to-call with the trip id, never directly.
+            patientPhoneMasked: maskPhone(trip.patientPhone),
             pickup       : trip.pickup,
             dropHospital : trip.dropHospital,
             dropAddress  : trip.dropAddress,

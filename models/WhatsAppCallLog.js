@@ -1,5 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
+const { customerRef } = require('../utils/customerPhone');
 
 // Permanent record of every ops call-back attempt against a WhatsApp
 // conversation -- one row per call, never updated or deleted. Distinct from
@@ -35,5 +36,16 @@ const WhatsAppCallLogSchema = new mongoose.Schema({
 });
 
 WhatsAppCallLogSchema.index({ phone: 1, createdAt: -1 });
+
+// Responses carry the opaque customerRef the CRM sent, never the number.
+WhatsAppCallLogSchema.set('toJSON', {
+  transform(doc, ret) {
+    if ('phone' in ret) {
+      ret.customerRef = customerRef(ret.phone);
+      delete ret.phone;
+    }
+    return ret;
+  },
+});
 
 module.exports = mongoose.model('WhatsAppCallLog', WhatsAppCallLogSchema);

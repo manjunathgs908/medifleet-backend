@@ -36,6 +36,10 @@ function phoneLegVerdict(phoneLeg, overlap) {
     if (ours) {
       return out('busy_overlap', `Busy before ringing (${cause || 'busy'}) — ${ours} other call leg(s) of ours were already on this number when it was dialled.`);
     }
+    // Calls from before the overlap check existed: can't rule our own legs out.
+    if (!overlap) {
+      return out('busy_no_ring_unchecked', `Busy before it ever rang (${cause || 'busy'}). This call predates the overlap check, so an overlapping leg of ours can't be ruled out.`);
+    }
     return out('busy_no_ring',
       `Busy before it ever rang (${cause || 'busy'}), and no other call of ours was on this number — the busy came from the carrier or the handset, not from SaveLife or Plivo.`,
       'Check call forwarding on that SIM (left on from the old night forwarding? dial ##002# from it to cancel all forwarding), DND or call barring, and whether the phone was on another call. Or set your ring number to the telecaller\'s actual idle phone.');

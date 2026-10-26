@@ -1038,6 +1038,7 @@ describe('phone leg: ring verdict, overlap, one leg per number, stuck legs', () 
     expect(phoneLegVerdict({ DialStatus: 'busy', DialRingStatus: 'false', DialHangupCause: 'USER_BUSY' }, { ourCalls: [{}], liveLegs: [] }).code).toBe('busy_overlap');
     expect(phoneLegVerdict({ DialStatus: 'completed', DialRingStatus: 'true' }).code).toBe('answered');
     expect(phoneLegVerdict({ DialStatus: 'no-answer', DialRingStatus: 'true', DialHangupCause: 'NO_ANSWER' }).code).toBe('rang_no_answer');
+    expect(phoneLegVerdict({ DialStatus: 'busy', DialRingStatus: 'false', DialHangupCause: 'USER_BUSY' }).code).toBe('busy_no_ring_unchecked');
     expect(phoneLegVerdict(undefined)).toBeNull();
   });
 

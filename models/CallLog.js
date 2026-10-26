@@ -1,6 +1,7 @@
 'use strict';
 const mongoose = require('mongoose');
 const { maskPhone } = require('../utils/customerPhone');
+const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
 
 // One masked, recorded phone call through Plivo (or the Exotel fallback):
 // an agent -- a driver, a fleet owner, or CRM staff -- and a customer.
@@ -71,6 +72,13 @@ const CallLogSchema = new mongoose.Schema(
     //   phoneLeg: what Plivo reported for the phone <Dial> (stage 2).
     routing : { type: mongoose.Schema.Types.Mixed },
     hangup  : { type: mongoose.Schema.Types.Mixed }, // Plivo's hang-up report for the whole call
+    // The exact phones this call's phone <Dial> rang — server-side only,
+    // for spotting two of our calls ringing one number at once.
+    dialledPhones: { type: [String], select: false, index: true },
+    // TEMPORARY diagnostic: when the phone <Dial> went out, was anything
+    // else of ours (another call, a stuck leg) already on that number? And
+    // was the caller themselves one of the ring numbers?
+    overlap : { type: mongoose.Schema.Types.Mixed },
     // Each step our XML took, in order — e.g. ["app:15s", "app:no-answer→phones:1",
     // "phones:busy→sorry"]. A call Plivo reports as "ended by Answer XML"
     // ended on our <Hangup/>; this says which one and why.
@@ -94,6 +102,8 @@ CallLogSchema.set('toJSON', {
       delete ret.customerPhone;
     }
     delete ret.agentPhone;
+    delete ret.dialledPhones;
+    ret.phoneVerdict = phoneLegVerdict(ret.phoneLeg, ret.overlap);
     // The Plivo recording URL stays server-side too: with Plivo's Basic Auth
     // for recordings on, it needs our credentials, and either way the CRM
     // plays it through GET /api/calls/:id/recording, which checks the login.

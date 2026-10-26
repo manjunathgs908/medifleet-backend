@@ -44,6 +44,7 @@ const WebrtcEndpoint   = require('../models/WebrtcEndpoint');
 const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
+const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
 
 // Statuses during which a driver or partner may still reach the customer.
 const ACTIVE_TRIP_STATUSES = ['booked', 'dispatched', 'en_route'];
@@ -123,15 +124,147 @@ const serverTrail = (event, detail) => {
 
 // Every on-duty user's phone — in-app users included — for when nobody
 // answers in the app. Then PLIVO_FALLBACK_AGENTS if nobody has one.
-function fallbackPhones(users) {
-  let phones = [...new Set(users.map(ringPhoneOf).filter(isMobile))];
+// Each subscriber once, however the number is written ("9986844442" and
+// "+91 99868 44442" are one phone — two <Number>s for it in one Dial would
+// ring it once and get USER_BUSY on the other). Never the caller's own
+// number: ringing the phone that is making the call is busy by definition.
+function fallbackPhones(users, callerPhone) {
+  const caller = normalisePhone(callerPhone);
+  const seen = new Set();
+  const pick = (list) => list.filter((p) => {
+    const n = normalisePhone(p);
+    if (!isMobile(p) || seen.has(n) || (caller && n === caller)) return false;
+    seen.add(n);
+    return true;
+  });
+  let phones = pick(users.map(ringPhoneOf));
   if (!phones.length) {
-    phones = String(process.env.PLIVO_FALLBACK_AGENTS || '')
-      .split(',').map((s) => s.trim()).filter(isMobile);
+    phones = pick(String(process.env.PLIVO_FALLBACK_AGENTS || '').split(',').map((s) => s.trim()));
   }
   return phones.slice(0, MAX_INCOMING_AGENTS);
 }
 exports.fallbackPhones = fallbackPhones;
+
+const callerIsRingPhone = (users, callerPhone) => {
+  const caller = normalisePhone(callerPhone);
+  return !!caller && users.some((u) => normalisePhone(ringPhoneOf(u)) === caller);
+};
+
+// ── Phone legs: overlap check and stuck-leg clean-up ──────────────────────
+// A leg Plivo still shows "ringing" this long after it started is stuck:
+// no Dial of ours rings longer than PHONE_RING_SECONDS, and Plivo gives up
+// on an unanswered outbound first leg at 60s. Only RINGING legs are ever
+// hung up automatically — a connected conversation never is.
+const STUCK_RINGING_SEC = Math.max(plivo.PHONE_RING_SECONDS, 60) + 30;
+
+const legAgeSec = (c) => {
+  const t = c?.session_start ? new Date(c.session_start).getTime() : NaN;
+  return Number.isNaN(t) ? null : Math.round((Date.now() - t) / 1000);
+};
+const isRinging = (c) => String(c?.call_status || '').toLowerCase() === 'ringing';
+
+async function hangupLegs(uuids, why) {
+  const done = [];
+  for (const uuid of uuids) {
+    try {
+      await plivo.hangupCall(uuid);
+      done.push(uuid);
+      console.warn(`[calls] auto hang-up of leg ${uuid}: ${why}`);
+    } catch (err) {
+      const { status } = plivoErrorDetail(err);
+      if (status !== 404) console.error(`[calls] auto hang-up of leg ${uuid} failed (status ${status ?? '-'})`);
+    }
+  }
+  return done;
+}
+
+const stuckLegs = (live) => live.calls
+  .filter((c) => isRinging(c) && (legAgeSec(c) ?? 0) >= STUCK_RINGING_SEC)
+  .map((c) => c.callUuid);
+
+// Run right after a phone <Dial> goes out — after Plivo has its XML, so it
+// never delays the call. Records on the log whether anything of ours was
+// already on one of those numbers: another call log still ringing it (or an
+// outbound call ringing it as the agent), or a live Plivo leg to it that
+// started before this dial. Also hangs up stuck ringing legs.
+async function recordPhoneDial(logId, phones, { callerWasRingPhone = false } = {}) {
+  const dialAt = new Date();
+  const targets = phones.map(normalisePhone);
+  const overlap = {
+    dialAt,
+    phones: phones.map(maskPhone),
+    callerIsRingPhone: callerWasRingPhone,
+    ourCalls: [],
+    liveLegs: [],
+  };
+  try {
+    const others = await CallLog.find({
+      _id: { $ne: logId },
+      startedAt: { $gte: new Date(dialAt.getTime() - 10 * 60 * 1000) },
+      $or: [
+        { direction: 'inbound', status: 'ringing', dialledPhones: { $in: targets } },
+        { direction: 'outbound', status: { $in: ['initiated', 'agent_answered'] }, agentPhone: { $in: targets } },
+      ],
+    }).select('_id direction status startedAt').lean();
+    overlap.ourCalls = (others || []).map((o) => ({
+      logId: o._id, direction: o.direction, status: o.status,
+      ageSec: o.startedAt ? Math.round((dialAt - new Date(o.startedAt)) / 1000) : null,
+    }));
+  } catch {
+    overlap.ourCallsCheck = 'failed';
+  }
+  try {
+    const live = await plivo.listLiveCalls();
+    overlap.liveTotal = live.total;
+    // Started 3s+ before this dial, so it cannot be this call's own leg.
+    overlap.liveLegs = live.calls
+      .filter((c) => targets.includes(normalisePhone(c.to)) && legAgeSec(c) != null
+        && legAgeSec(c) * 1000 > Date.now() - dialAt.getTime() + 3000)
+      .map((c) => ({ callUuid: c.callUuid, to: maskPhone(c.to), status: c.call_status || null, ageSec: legAgeSec(c) }));
+    overlap.autoHungUp = await hangupLegs(stuckLegs(live), `ringing over ${STUCK_RINGING_SEC}s`);
+  } catch (err) {
+    overlap.liveCheck = `failed (status ${plivoErrorDetail(err).status ?? '-'})`;
+  }
+  await CallLog.updateOne({ _id: logId }, { $set: { overlap } });
+  if (overlap.ourCalls.length || overlap.liveLegs.length) {
+    console.warn(`[calls] log=${logId} dialled a phone that already had ${overlap.ourCalls.length} call(s) / ${overlap.liveLegs.length} live leg(s) of ours on it`);
+  }
+  return overlap;
+}
+exports.recordPhoneDial = recordPhoneDial;
+
+// When an incoming call ends: any leg of it Plivo still has up is released
+// — its connected phone leg (DialBLegUUID), and any leg still ringing one of
+// the phones it dialled that started with its Dial, unless another call of
+// ours is ringing that number right now. Plus the stuck-leg sweep.
+async function releaseLegs(logId) {
+  const log = await CallLog.findById(logId).select('+dialledPhones customerLegId overlap').lean();
+  if (!log) return [];
+  const live = await plivo.listLiveCalls();
+  const uuids = new Set(stuckLegs(live));
+  const liveIds = new Set(live.calls.map((c) => c.callUuid));
+  if (log.customerLegId && liveIds.has(log.customerLegId)) uuids.add(log.customerLegId);
+
+  const dialled = log.dialledPhones || [];
+  const dialAt = log.overlap?.dialAt ? new Date(log.overlap.dialAt).getTime() : null;
+  if (dialled.length && dialAt) {
+    const busyElsewhere = await CallLog.find({
+      _id: { $ne: logId }, direction: 'inbound', status: 'ringing', dialledPhones: { $in: dialled },
+    }).select('+dialledPhones').lean();
+    const shared = new Set((busyElsewhere || []).flatMap((o) => o.dialledPhones || []));
+    for (const c of live.calls) {
+      const to = normalisePhone(c.to);
+      const age = legAgeSec(c);
+      if (isRinging(c) && dialled.includes(to) && !shared.has(to) && age != null && Date.now() - age * 1000 >= dialAt - 2000) {
+        uuids.add(c.callUuid);
+      }
+    }
+  }
+  const done = await hangupLegs([...uuids], `outlived call log=${logId}`);
+  if (done.length) await CallLog.updateOne({ _id: logId }, { $set: { 'overlap.releasedAtHangup': done } });
+  return done;
+}
+exports.releaseLegs = releaseLegs;
 
 const loadOnDuty = () => User.find({ role: 'owner', isActive: true, callDuty: true })
   .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername +plivoEndpointId')
@@ -444,7 +577,8 @@ exports.incoming = async (req, res, next) => {
     const onDuty = await loadOnDuty();
     const devices = await loadOnlineDevices(onDuty);
     const { sipUsers } = routeIncoming(onDuty, devices);
-    const agentPhones = fallbackPhones(onDuty);
+    const agentPhones = fallbackPhones(onDuty, from);
+    const callerWasRingPhone = callerIsRingPhone(onDuty, from);
     const ringing = agentPhones.length + sipUsers.length;
 
     // TEMPORARY diagnostic: the decision and its inputs, per in-app user.
@@ -457,6 +591,9 @@ exports.incoming = async (req, res, next) => {
       // stage. With phoneLeg's DialStatus/DialHangupCause this tells
       // "the phone was busy" apart from "the phone was never dialled".
       phoneTargets: agentPhones.map(maskPhone),
+      // The caller is one of the ring numbers (e.g. a test call from it):
+      // that number is left out of this call's phone Dial.
+      callerIsRingPhone: callerWasRingPhone,
       dutyUsers   : onDuty.map((u) => ({
         user          : u._id,
         name          : u.name,
@@ -497,6 +634,8 @@ exports.incoming = async (req, res, next) => {
       lead         : lead?._id,
       status       : ringing ? 'ringing' : 'no_agents',
       endedAt      : ringing ? undefined : new Date(),
+      // Phones go straight into this call's Dial only when no app rings first.
+      dialledPhones: ringing && !sipUsers.length ? agentPhones.map(normalisePhone) : undefined,
     });
     plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
     serverTrail('server:incoming_routed', {
@@ -516,7 +655,9 @@ exports.incoming = async (req, res, next) => {
       snapshotEndpoints(log._id, onDuty).catch(() => {});
       return undefined;
     }
-    return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, logId: log._id, stage: 'phone' }));
+    sendXml(res, plivo.bridgeXml({ numbers: agentPhones, logId: log._id, stage: 'phone' }));
+    recordPhoneDial(log._id, agentPhones, { callerWasRingPhone }).catch(() => {});
+    return undefined;
   } catch (err) {
     next(err);
   }
@@ -549,7 +690,9 @@ exports.events = async (req, res, next) => {
       // no status at all. Never strand the caller: ring every on-duty phone
       // now. Only a completed app leg ends the call here.
       if (req.query.stage === 'app' && dialStatus !== 'completed') {
-        const phones = fallbackPhones(await loadOnDuty());
+        const onDuty = await loadOnDuty();
+        const phones = fallbackPhones(onDuty, b.From);
+        const callerWasRingPhone = callerIsRingPhone(onDuty, b.From);
         console.info(`[calls] in-app leg not answered (DialStatus=${dialStatus || '-'} cause=${b.DialHangupCause || b.DialBLegHangupCause || '-'}) log=${logId || '-'} — ringing ${phones.length} phone(s)`);
         if (log) {
           // TEMPORARY diagnostic: Plivo's verdict on the in-app leg.
@@ -562,10 +705,13 @@ exports.events = async (req, res, next) => {
           log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : 'busy_message'}`];
           log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
+          if (phones.length) log.dialledPhones = phones.map(normalisePhone);
           await log.save();
         }
         if (phones.length && logId) {
-          return sendXml(res, plivo.bridgeXml({ numbers: phones, logId, stage: 'phone' }));
+          sendXml(res, plivo.bridgeXml({ numbers: phones, logId, stage: 'phone' }));
+          recordPhoneDial(logId, phones, { callerWasRingPhone }).catch(() => {});
+          return undefined;
         }
         return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
       }
@@ -577,6 +723,8 @@ exports.events = async (req, res, next) => {
           serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, answered: dialStatus === 'completed' });
         } else if (req.query.stage === 'phone') {
           log.phoneLeg = dialResult(b);
+          const v = phoneLegVerdict(log.phoneLeg, log.overlap);
+          console.info(`[calls] phone leg log=${logId} DialStatus=${dialStatus || '-'} DialRingStatus=${b.DialRingStatus ?? '-'} cause=${b.DialHangupCause || '-'} verdict=${v?.code}`);
         }
         const stage = req.query.stage || 'dial';
         const endsWithSorry = log.direction === 'inbound' && dialStatus && dialStatus !== 'completed';
@@ -621,6 +769,8 @@ exports.events = async (req, res, next) => {
       log.endedAt = new Date();
       await log.save();
       plivo.logCall(`hangup status=${log.status} cause=${b.HangupCauseName || b.HangupCause || '-'} code=${b.HangupCauseCode || '-'} source=${b.HangupSource || '-'}`, log);
+      // No leg of this call may outlive it.
+      if (log.direction === 'inbound') releaseLegs(log._id).catch(() => {});
     } else if (String(b.Direction || '').toLowerCase() === 'inbound' && b.CallUUID) {
       // An incoming call we have no log for: /incoming never ran for it
       // (Plivo's number not linked to our application, or the answer
@@ -1501,6 +1651,12 @@ exports.liveCalls = async (req, res, next) => {
       return res.status(502).json({ success: false, plivoStatus: status, message: `Could not read live calls from Plivo (status ${status ?? '-'}).` });
     }
 
+    // Legs stuck ringing are hung up on sight, and left out of the list.
+    const autoHungUp = await hangupLegs(stuckLegs(live), `ringing over ${STUCK_RINGING_SEC}s (seen on the Live calls panel)`);
+    if (autoHungUp.length) {
+      live = { total: Math.max(0, live.total - autoHungUp.length), calls: live.calls.filter((c) => !autoHungUp.includes(c.callUuid)) };
+    }
+
     const uuids = live.calls.map((c) => c.callUuid);
     const logs = uuids.length
       ? await CallLog.find({ $or: [{ providerCallId: { $in: uuids } }, { customerLegId: { $in: uuids } }] })
@@ -1516,6 +1672,8 @@ exports.liveCalls = async (req, res, next) => {
     return res.json({
       success: true,
       total  : live.total,
+      autoHungUp: autoHungUp.length,
+      stuckAfterSec: STUCK_RINGING_SEC,
       calls  : live.calls.map((c) => {
         const log = byUuid.get(c.callUuid);
         const started = c.session_start ? new Date(c.session_start) : null;

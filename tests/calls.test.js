@@ -1016,6 +1016,148 @@ describe('busy / leg-release investigation', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
+describe('phone leg: ring verdict, overlap, one leg per number, stuck legs', () => {
+  const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
+  const ago = (sec) => new Date(Date.now() - sec * 1000).toISOString();
+  const flush = () => new Promise((r) => setImmediate(r));
+  const liveLegs = (legs) => axios.request.mockImplementation(async ({ method, url }) => {
+    if (method === 'get' && url.endsWith('/Call/?status=live')) return { data: { calls: Object.keys(legs) } };
+    const id = Object.keys(legs).find((k) => url.includes(`/Call/${k}/`));
+    if (method === 'get' && id) return { data: legs[id] };
+    if (method === 'delete') return { data: {} };
+    throw new Error(`unexpected ${method} ${url}`);
+  });
+  const deleted = () => axios.request.mock.calls.filter(([a]) => a.method === 'delete').map(([a]) => a.url);
+
+  it('tells "rang then busy" from "busy with no ring", and blames the carrier only with no overlap', () => {
+    expect(phoneLegVerdict({ DialStatus: 'busy', DialRingStatus: 'true', DialHangupCause: 'USER_BUSY' }).code).toBe('rang_then_busy');
+    const noRing = phoneLegVerdict({ DialStatus: 'busy', DialRingStatus: 'false', DialHangupCause: 'USER_BUSY' }, { ourCalls: [], liveLegs: [] });
+    expect(noRing.code).toBe('busy_no_ring');
+    expect(noRing.text).toMatch(/carrier or the handset/);
+    expect(noRing.advice).toMatch(/forwarding/);
+    expect(phoneLegVerdict({ DialStatus: 'busy', DialRingStatus: 'false', DialHangupCause: 'USER_BUSY' }, { ourCalls: [{}], liveLegs: [] }).code).toBe('busy_overlap');
+    expect(phoneLegVerdict({ DialStatus: 'completed', DialRingStatus: 'true' }).code).toBe('answered');
+    expect(phoneLegVerdict({ DialStatus: 'no-answer', DialRingStatus: 'true', DialHangupCause: 'NO_ANSWER' }).code).toBe('rang_no_answer');
+    expect(phoneLegVerdict(undefined)).toBeNull();
+  });
+
+  it('dials one number once, however it is written, and never the caller\'s own number', () => {
+    const users = [
+      { _id: 'a', phone: '9000000001', callPhone: '9986844442' },
+      { _id: 'b', phone: '+91 99868 44442' },
+      { _id: 'c', phone: '9123456780' },
+    ];
+    expect(ctrl.fallbackPhones(users)).toEqual(['9986844442', '9123456780']);
+    expect(ctrl.fallbackPhones(users, '919986844442')).toEqual(['9123456780']);
+  });
+
+  it('a call from the ring phone itself does not dial that phone, and says so', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { _id: 'u1', name: 'Me', callMode: 'phone', phone: '9000000001', callPhone: '9986844442' },
+      { _id: 'u2', name: 'Desk', callMode: 'phone', phone: '9123456780' },
+    ]));
+
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'self' } });
+
+    expect(res.body).not.toContain('<Number>919986844442</Number>');
+    expect(res.body).toContain('<Number>919123456780</Number>');
+    expect(CallLog.create.mock.calls[0][0].routing.callerIsRingPhone).toBe(true);
+    expect(CallLog.create.mock.calls[0][0].dialledPhones).toEqual(['9123456780']);
+  });
+
+  it('records an overlapping live leg to the same number, and hangs up legs stuck ringing', async () => {
+    liveLegs({
+      'old-ring': { to: '919986844442', call_status: 'ringing', session_start: ago(300) },
+      'other':    { to: '919123456780', call_status: 'in-progress', session_start: ago(400) },
+      'mine-new': { to: '919986844442', call_status: 'ringing', session_start: ago(0) },
+    });
+    CallLog.find.mockReturnValue(chain([]));
+    CallLog.updateOne.mockResolvedValue({});
+
+    const overlap = await ctrl.recordPhoneDial('64b000000000000000000001', ['9986844442']);
+
+    expect(overlap.liveLegs).toEqual([expect.objectContaining({ callUuid: 'old-ring', to: '••••••4442', status: 'ringing' })]);
+    expect(overlap.autoHungUp).toEqual(['old-ring']);
+    expect(deleted()).toEqual([expect.stringMatching(/\/Call\/old-ring\/$/)]);
+    expect(CallLog.updateOne).toHaveBeenCalledWith({ _id: '64b000000000000000000001' }, { $set: { overlap } });
+    expect(JSON.stringify(overlap)).not.toContain('9986844442');
+  });
+
+  it('records another of our calls still ringing the same number', async () => {
+    liveLegs({});
+    CallLog.find.mockReturnValue(chain([{ _id: 'other-log', direction: 'inbound', status: 'ringing', startedAt: new Date(Date.now() - 20000) }]));
+    CallLog.updateOne.mockResolvedValue({});
+    const overlap = await ctrl.recordPhoneDial('64b000000000000000000001', ['9986844442']);
+    expect(overlap.ourCalls).toEqual([expect.objectContaining({ logId: 'other-log', status: 'ringing' })]);
+    expect(CallLog.find.mock.calls[0][0].$or[0].dialledPhones).toEqual({ $in: ['9986844442'] });
+  });
+
+  it('the phone stage records what it dialled and checks overlap without delaying the XML', async () => {
+    liveLegs({});
+    CallLog.find.mockReturnValue(chain([]));
+    CallLog.updateOne.mockResolvedValue({});
+    const log = logDoc({ direction: 'inbound', status: 'ringing', flow: ['app:15s'], routing: { appUsers: [] } });
+    CallLog.findById.mockResolvedValue(log);
+    User.find.mockReturnValue(chain([{ _id: 'u1', callMode: 'app', phone: '9000000001', callPhone: '9986844442' }]));
+
+    const { res } = await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'app' },
+      body: { DialStatus: 'no-answer', From: '919123456780' },
+    });
+    await flush(); await flush();
+
+    expect(res.body.match(/<Number>/g)).toHaveLength(1);
+    expect(log.dialledPhones).toEqual(['9986844442']);
+    expect(CallLog.updateOne).toHaveBeenCalledWith({ _id: '64b000000000000000000001' }, { $set: { overlap: expect.objectContaining({ callerIsRingPhone: false }) } });
+  });
+
+  it('when an incoming call ends, its legs still up are hung up — never a leg another call is ringing', async () => {
+    const dialAt = new Date(Date.now() - 30000);
+    liveLegs({
+      'b-leg':     { to: '919986844442', call_status: 'in-progress', session_start: ago(25) },
+      'ring-mine': { to: '919123456780', call_status: 'ringing', session_start: ago(25) },
+      'ring-shared': { to: '919000000009', call_status: 'ringing', session_start: ago(10) },
+      'before':    { to: '919123456780', call_status: 'ringing', session_start: ago(50) },
+    });
+    CallLog.findById.mockReturnValue(chain({ _id: 'L', customerLegId: 'b-leg', dialledPhones: ['9986844442', '9123456780', '9000000009'], overlap: { dialAt } }));
+    CallLog.find.mockReturnValue(chain([{ _id: 'other', dialledPhones: ['9000000009'] }]));
+    CallLog.updateOne.mockResolvedValue({});
+
+    const done = await ctrl.releaseLegs('L');
+
+    expect(done.sort()).toEqual(['b-leg', 'ring-mine']);
+    expect(CallLog.updateOne).toHaveBeenCalledWith({ _id: 'L' }, { $set: { 'overlap.releasedAtHangup': expect.any(Array) } });
+  });
+
+  it('the live-calls panel hangs up legs stuck ringing and leaves connected calls alone', async () => {
+    liveLegs({
+      stuck: { direction: 'outbound', to: '919986844442', call_status: 'ringing', session_start: ago(600) },
+      talk : { direction: 'inbound', to: '918065591088', call_status: 'in-progress', session_start: ago(600) },
+    });
+    CallLog.find.mockReturnValue(chain([]));
+    const { res } = await run(ctrl.liveCalls, { user: staff });
+    expect(res.body.autoHungUp).toBe(1);
+    expect(res.body.calls.map((c) => c.callUuid)).toEqual(['talk']);
+    expect(deleted()).toEqual([expect.stringMatching(/\/Call\/stuck\/$/)]);
+  });
+
+  it('a call log\'s JSON carries the verdict, never the dialled numbers', () => {
+    const CallLogModel = jest.requireActual('../models/CallLog');
+    const doc = new CallLogModel({
+      provider: 'plivo', direction: 'inbound', context: 'incoming', dialledPhones: ['9986844442'],
+      phoneLeg: { DialStatus: 'busy', DialRingStatus: 'false', DialHangupCause: 'USER_BUSY' },
+      overlap: { ourCalls: [], liveLegs: [] },
+    });
+    const json = doc.toJSON();
+    expect(json.phoneVerdict.code).toBe('busy_no_ring');
+    expect(json.dialledPhones).toBeUndefined();
+    expect(JSON.stringify(json)).not.toContain('9986844442');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
 describe('recordings only for answered calls; call flow trail', () => {
   const PLIVO_URL = 'https://media.plivo.com/v1/Account/MAXXX/Recording/r9.mp3';
   const streamRes = () => {

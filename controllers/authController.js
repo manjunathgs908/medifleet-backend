@@ -23,6 +23,7 @@ const smsService = require('../utils/smsService');
 const { uploadToCloudinary } = require('../utils/cloudinary');
 const { generateOtp, otpExpiryFromNow } = require('../utils/otp');
 const { isPlatformDriver } = require('../utils/platformOwner');
+const { normalisePhone } = require('../utils/phone');
 
 const DRIVER_DOC_TYPES = ['dl', 'aadhaar', 'photo'];
 
@@ -115,7 +116,21 @@ exports.sendTokenResponse = sendTokenResponse;
 // ============================================================
 exports.register = async (req, res, next) => {
   try {
-    const { name, phone, email, role, password, baseSalary, perTripBonus, vehicleId, shiftType } = req.body;
+    const { name, email, role, password, baseSalary, perTripBonus, vehicleId, shiftType } = req.body;
+    let { phone } = req.body;
+
+    // A telecaller logs in to the CRM with phone + password, so both must
+    // be usable: 10-digit phone (what the login form is typed with), and a
+    // real password.
+    if (role === 'telecaller') {
+      phone = normalisePhone(phone);
+      if (!/^[6-9]\d{9}$/.test(phone)) {
+        return res.status(400).json({ success: false, message: 'Enter the telecaller\'s 10-digit mobile number.' });
+      }
+      if (typeof password !== 'string' || password.length < 8 || password.length > 128 || /\s/.test(password)) {
+        return res.status(400).json({ success: false, message: 'A telecaller needs a password of 8–128 characters, no spaces.' });
+      }
+    }
 
     const existing = await User.findOne({ phone });
     if (existing) {
@@ -261,7 +276,13 @@ exports.loginPassword = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Phone and password are required.' });
     }
 
-    const user = await User.findOne({ phone }).select('+password +refreshToken');
+    // Exactly as typed first; then as the 10-digit number accounts are
+    // stored with, so "+91 99019 95897" finds "9901995897".
+    let user = await User.findOne({ phone }).select('+password +refreshToken');
+    const ten = normalisePhone(phone);
+    if (!user && ten.length === 10 && ten !== String(phone)) {
+      user = await User.findOne({ phone: ten }).select('+password +refreshToken');
+    }
     if (!user || !user.password) {
       return res.status(401).json({ success: false, message: 'Invalid credentials.' });
     }

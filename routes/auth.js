@@ -7,6 +7,7 @@
  */
 'use strict';
 const express   = require('express');
+const mongoose  = require('mongoose');
 const router    = express.Router();
 const authCtrl  = require('../controllers/authController');
 const unifiedAuthCtrl = require('../controllers/unifiedAuthController');
@@ -147,6 +148,35 @@ router.put('/users/:id/owner', protect, authorize('owner'), async (req, res, nex
         : `${driver.name} unlinked from their fleet.`,
       driver: { id: driver._id, name: driver.name, owner: driver.owner || null },
     });
+  } catch (err) { next(err); }
+});
+
+// PUT /api/auth/users/:id/password — an owner sets or resets a staff
+// login's password (telecallers: CRM phone + password login). Stored only
+// as the bcrypt hash (User pre-save hook); never logged or sent back — the
+// owner's screen shows what they typed once. Signs the user out of any
+// existing session. Not for owners (they use /update-password themselves)
+// or drivers (they log in to the app by OTP).
+const MIN_STAFF_PASSWORD = 8;
+router.put('/users/:id/password', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const password = String(req.body?.password ?? '');
+    if (password.length < MIN_STAFF_PASSWORD || password.length > 128 || /\s/.test(password)) {
+      return res.status(400).json({ success: false, message: `Password must be ${MIN_STAFF_PASSWORD}–128 characters, no spaces.` });
+    }
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.id))) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+    const user = await User.findById(req.params.id).select('+password +refreshToken');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    if (user.role !== 'telecaller') {
+      return res.status(400).json({ success: false, message: 'Passwords can be set here only for telecaller logins.' });
+    }
+    user.password = password;
+    user.refreshToken = undefined;
+    await user.save();
+    console.info(`[auth] password set for user=${user._id} role=${user.role} by owner=${req.user._id}`);
+    return res.json({ success: true, message: `Password set for ${user.name}.` });
   } catch (err) { next(err); }
 });
 

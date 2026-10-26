@@ -404,7 +404,7 @@ describe('recording playback', () => {
   });
 
   it('fetches from Plivo with Basic Auth and streams it, never sending the URL', async () => {
-    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL }));
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL, status: 'completed' }));
     const up = upstream(206, { 'content-type': 'audio/mpeg', 'content-range': 'bytes 0-99/1000', 'x-plivo': 'no' });
     axios.get.mockResolvedValue(up);
 
@@ -425,7 +425,7 @@ describe('recording playback', () => {
   });
 
   it('never sends our credentials to a host that is not Plivo', async () => {
-    CallLog.findById.mockReturnValue(chain({ recordingUrl: 'https://evil.example.com/r.mp3' }));
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: 'https://evil.example.com/r.mp3', status: 'completed' }));
     const res = streamRes();
     await ctrl.streamRecording({ params: { id: LOG_ID }, get: () => undefined }, res, jest.fn());
     expect(res.statusCode).toBe(502);
@@ -440,7 +440,7 @@ describe('recording playback', () => {
   });
 
   it('explains a Plivo auth refusal instead of streaming an error page', async () => {
-    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL }));
+    CallLog.findById.mockReturnValue(chain({ recordingUrl: PLIVO_URL, status: 'completed' }));
     const up = upstream(401);
     axios.get.mockResolvedValue(up);
     const res = streamRes();
@@ -998,5 +998,66 @@ describe('busy / leg-release investigation', () => {
     expect(res.body.success).toBe(true);
     expect(axios.request.mock.calls[0][0]).toEqual(expect.objectContaining({ method: 'delete' }));
     expect(axios.request.mock.calls[0][0].url).toMatch(/\/Call\/leg-1-abcdef\/$/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('recordings only for answered calls; call flow trail', () => {
+  const PLIVO_URL = 'https://media.plivo.com/v1/Account/MAXXX/Recording/r9.mp3';
+  const streamRes = () => {
+    const res = mockRes();
+    res.headers = {};
+    res.setHeader = (k, v) => { res.headers[k.toLowerCase()] = v; };
+    res.on = jest.fn();
+    res.destroy = jest.fn();
+    return res;
+  };
+
+  it('a missed call offers no recording, even if Plivo posted a URL', () => {
+    const CallLogReal = jest.requireActual('../models/CallLog');
+    const missed = JSON.parse(JSON.stringify(new CallLogReal({ provider: 'plivo', direction: 'inbound', context: 'incoming', status: 'missed', recordingUrl: PLIVO_URL })));
+    const answered = JSON.parse(JSON.stringify(new CallLogReal({ provider: 'plivo', direction: 'inbound', context: 'incoming', status: 'completed', talkSec: 42, recordingUrl: PLIVO_URL })));
+    expect(missed).toEqual(expect.objectContaining({ hasRecording: false, recordingState: 'not_answered' }));
+    expect(answered).toEqual(expect.objectContaining({ hasRecording: true, recordingState: 'available' }));
+  });
+
+  it('asked for a missed call\'s recording, it says so without asking Plivo', async () => {
+    CallLog.findById.mockReturnValue(chain({ _id: 'l1', recordingUrl: PLIVO_URL, status: 'missed' }));
+    const res = streamRes();
+    await ctrl.streamRecording({ params: { id: '64b000000000000000000001' }, get: () => undefined }, res, jest.fn());
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual(expect.objectContaining({ reason: 'not_answered' }));
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('a 403 with Basic Auth is retried once without it, and streams if that works', async () => {
+    CallLog.findById.mockReturnValue(chain({ _id: 'l1', recordingUrl: PLIVO_URL, status: 'completed', talkSec: 30 }));
+    const refused = { status: 403, headers: {}, data: { destroy: jest.fn() } };
+    const ok = { status: 200, headers: { 'content-type': 'audio/mpeg' }, data: { pipe: jest.fn(), on: jest.fn(), destroy: jest.fn() } };
+    axios.get.mockResolvedValueOnce(refused).mockResolvedValueOnce(ok);
+    const res = streamRes();
+
+    await ctrl.streamRecording({ params: { id: '64b000000000000000000001' }, get: () => undefined }, res, jest.fn());
+
+    expect(axios.get.mock.calls[0][1].auth).toBeDefined();
+    expect(axios.get.mock.calls[1][1].auth).toBeUndefined();
+    expect(ok.data.pipe).toHaveBeenCalledWith(res);
+  });
+
+  it('records the flow: app 15s, no answer → phones, phones busy → sorry message', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    const duty = [{ callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: new Date(), phone: '9000000001' }];
+    User.find.mockReturnValue(chain(duty));
+    await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'f1' } });
+    expect(CallLog.create.mock.calls[0][0].flow).toEqual(['app:15s']);
+
+    const log = logDoc({ direction: 'inbound', status: 'ringing', flow: ['app:15s'], routing: { appUsers: [] } });
+    CallLog.findById.mockResolvedValue(log);
+    await run(ctrl.events, { method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'app' }, body: { DialStatus: 'no-answer' } });
+    expect(log.flow).toEqual(['app:15s', 'app:no-answer→phones:1:40s']);
+
+    await run(ctrl.events, { method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'phone' }, body: { DialStatus: 'busy' } });
+    expect(log.flow).toEqual(['app:15s', 'app:no-answer→phones:1:40s', 'phone:busy→sorry_message']);
   });
 });

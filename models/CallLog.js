@@ -71,6 +71,10 @@ const CallLogSchema = new mongoose.Schema(
     //   phoneLeg: what Plivo reported for the phone <Dial> (stage 2).
     routing : { type: mongoose.Schema.Types.Mixed },
     hangup  : { type: mongoose.Schema.Types.Mixed }, // Plivo's hang-up report for the whole call
+    // Each step our XML took, in order — e.g. ["app:15s", "app:no-answer→phones:1",
+    // "phones:busy→sorry"]. A call Plivo reports as "ended by Answer XML"
+    // ended on our <Hangup/>; this says which one and why.
+    flow    : { type: [String], default: undefined },
     appLeg  : { type: mongoose.Schema.Types.Mixed },
     phoneLeg: { type: mongoose.Schema.Types.Mixed },
 
@@ -93,7 +97,13 @@ CallLogSchema.set('toJSON', {
     // The Plivo recording URL stays server-side too: with Plivo's Basic Auth
     // for recordings on, it needs our credentials, and either way the CRM
     // plays it through GET /api/calls/:id/recording, which checks the login.
-    ret.hasRecording = !!ret.recordingUrl;
+    // A recording only exists once someone answered: <Record
+    // startOnDialAnswer> never starts on an unanswered call, even if Plivo
+    // posts a URL for it. So offer playback only for an answered call (or a
+    // recording Plivo says has length), never for a missed one.
+    const answered = ret.status === 'completed' || Number(ret.talkSec) > 0;
+    ret.hasRecording = !!ret.recordingUrl && (Number(ret.recordingSec) > 0 || (ret.recordingSec == null && answered));
+    ret.recordingState = ret.hasRecording ? 'available' : answered ? 'none' : 'not_answered';
     delete ret.recordingUrl;
     delete ret.recordingId;
     return ret;

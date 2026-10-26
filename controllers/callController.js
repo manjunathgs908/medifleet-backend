@@ -442,6 +442,7 @@ exports.incoming = async (req, res, next) => {
 
     const log = await CallLog.create({
       routing,
+      flow   : [!ringing ? 'busy_message' : sipUsers.length ? `app:${plivo.APP_RING_SECONDS}s` : `phones:${agentPhones.length}:${plivo.PHONE_RING_SECONDS}s`],
       provider     : 'plivo',
       callerId     : plivo.companyNumber(),
       direction    : 'inbound',
@@ -506,6 +507,7 @@ exports.events = async (req, res, next) => {
             ...dialResult(b),
             fellBackToPhones: phones.length,
           };
+          log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : 'busy_message'}`];
           log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
           await log.save();
@@ -523,6 +525,9 @@ exports.events = async (req, res, next) => {
         } else if (req.query.stage === 'phone') {
           log.phoneLeg = dialResult(b);
         }
+        const stage = req.query.stage || 'dial';
+        const endsWithSorry = log.direction === 'inbound' && dialStatus && dialStatus !== 'completed';
+        log.flow = [...(log.flow || []), `${stage}:${dialStatus === 'completed' ? 'answered' : (dialStatus || 'none')}${endsWithSorry ? '→sorry_message' : ''}`];
         if (dialStatus === 'completed') {
           log.status = 'completed';
           const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
@@ -691,9 +696,15 @@ exports.streamRecording = async (req, res, next) => {
     if (!isObjectId(String(req.params.id))) {
       return res.status(404).json({ success: false, message: 'Recording not found.' });
     }
-    const log = await CallLog.findById(req.params.id).select('recordingUrl');
+    const log = await CallLog.findById(req.params.id).select('recordingUrl recordingSec status talkSec');
+    // Recording starts only when someone answers (<Record startOnDialAnswer>),
+    // so an unanswered call has nothing to fetch — even if Plivo posted a URL.
+    const answered = log?.status === 'completed' || Number(log?.talkSec) > 0 || Number(log?.recordingSec) > 0;
+    if (log && !answered) {
+      return res.status(404).json({ success: false, reason: 'not_answered', message: 'No recording — this call was not answered.' });
+    }
     if (!log?.recordingUrl) {
-      return res.status(404).json({ success: false, message: 'This call has no recording.' });
+      return res.status(404).json({ success: false, reason: 'none', message: 'This call has no recording.' });
     }
     if (!isPlivoMediaUrl(log.recordingUrl)) {
       return res.status(502).json({ success: false, message: 'This recording is not stored with Plivo.' });
@@ -702,16 +713,27 @@ exports.streamRecording = async (req, res, next) => {
       return res.status(503).json({ success: false, message: 'Recordings cannot be played: Plivo credentials are not set on the server.' });
     }
 
+    const fetchRecording = (withAuth) => axios.get(log.recordingUrl, {
+      ...(withAuth ? { auth: { username: process.env.PLIVO_AUTH_ID, password: process.env.PLIVO_AUTH_TOKEN } } : {}),
+      responseType  : 'stream',
+      timeout       : 20000,
+      headers       : req.get('range') ? { Range: req.get('range') } : {},
+      // Read Plivo's status ourselves so a 401/404 becomes a clear message.
+      validateStatus: () => true,
+    });
+
     let upstream;
     try {
-      upstream = await axios.get(log.recordingUrl, {
-        auth          : { username: process.env.PLIVO_AUTH_ID, password: process.env.PLIVO_AUTH_TOKEN },
-        responseType  : 'stream',
-        timeout       : 20000,
-        headers       : req.get('range') ? { Range: req.get('range') } : {},
-        // Read Plivo's status ourselves so a 401/404 becomes a clear message.
-        validateStatus: () => true,
-      });
+      // With Basic Auth (needed once "Basic Auth For Recording URLs" is on).
+      // If that is refused, once more without: with the setting off, a media
+      // link can redirect to storage that rejects an extra Authorization
+      // header, and storage answers a missing file with 403 as well.
+      upstream = await fetchRecording(true);
+      if (upstream.status === 401 || upstream.status === 403) {
+        console.warn(`[calls] recording ${log._id}: Plivo answered ${upstream.status} with Basic Auth — retrying without`);
+        upstream.data?.destroy?.();
+        upstream = await fetchRecording(false);
+      }
     } catch (err) {
       console.error('[calls] recording fetch failed:', err.message);
       return res.status(502).json({ success: false, message: 'Could not reach Plivo for this recording. Please try again.' });
@@ -719,12 +741,15 @@ exports.streamRecording = async (req, res, next) => {
 
     if (upstream.status >= 400) {
       upstream.data?.destroy?.();
-      const message = upstream.status === 401 || upstream.status === 403
-        ? 'Plivo refused the recording request. Check PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN on Render.'
-        : upstream.status === 404
-          ? 'Plivo no longer has this recording.'
-          : 'Could not load this recording from Plivo.';
-      return res.status(upstream.status === 404 ? 404 : 502).json({ success: false, message });
+      console.error(`[calls] recording ${log._id}: Plivo answered ${upstream.status}`);
+      const message = upstream.status === 401
+        ? 'Plivo refused the recording request (401). Check PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN on Render.'
+        : upstream.status === 403
+          ? 'Plivo would not return this recording (403) — it may not exist, or Basic Auth for recordings needs PLIVO_AUTH_ID/PLIVO_AUTH_TOKEN checked.'
+          : upstream.status === 404
+            ? 'Plivo no longer has this recording.'
+            : `Could not load this recording from Plivo (${upstream.status}).`;
+      return res.status(upstream.status === 404 ? 404 : 502).json({ success: false, plivoStatus: upstream.status, message });
     }
 
     res.status(upstream.status);

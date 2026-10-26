@@ -100,7 +100,7 @@ describe('no response carries a customer number', () => {
 
   it('CallLog — not the Plivo recording URL either, only that one exists', () => {
     const log = new CallLog({
-      provider: 'plivo', direction: 'outbound', context: 'trip',
+      provider: 'plivo', direction: 'outbound', context: 'trip', status: 'completed',
       recordingUrl: 'https://media.plivo.com/v1/Account/MA/Recording/r1.mp3', recordingId: 'r1',
     });
     const out = JSON.parse(JSON.stringify(log));

@@ -288,6 +288,14 @@ const loadOnDuty = () => User.find({ role: { $in: ['owner', 'telecaller'] }, isA
   .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername +plivoEndpointId')
   .limit(MAX_INCOMING_AGENTS).lean();
 
+// The on-duty owner/telecaller whose ring phone is this number, if any.
+async function whoseRingPhone(raw) {
+  const ten = normalisePhone(raw);
+  if (ten.length !== 10) return null;
+  const onDuty = await loadOnDuty();
+  return (onDuty || []).find((u) => normalisePhone(ringPhoneOf(u)) === ten) || null;
+}
+
 // TEMPORARY diagnostic: Plivo's record of each in-app user's endpoint at
 // the moment a call is routed to it, saved onto the call's routing.
 async function snapshotEndpoints(logId, onDuty) {
@@ -758,6 +766,19 @@ exports.events = async (req, res, next) => {
           log.status = 'completed';
           const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
           if (Number.isFinite(talk)) log.talkSec = talk;
+          // An incoming call answered on a ring PHONE: Plivo says which
+          // number picked up; that number's on-duty owner answered it. (An
+          // in-app answer is claimed by the CRM itself: POST /:id/answered.)
+          if (log.direction === 'inbound' && req.query.stage === 'phone' && !log.agentUser && b.DialBLegTo) {
+            const answeredBy = await whoseRingPhone(b.DialBLegTo);
+            if (answeredBy) {
+              log.agentUser = answeredBy._id;
+              log.agentName = answeredBy.name;
+              log.agentType = 'staff';
+            }
+            // The Dial reports at the END of the call: picked up talk-time ago.
+            if (!log.answeredAt) log.answeredAt = new Date(Date.now() - (Number.isFinite(talk) ? talk * 1000 : 0));
+          }
         } else if (dialStatus) {
           log.status = log.direction === 'inbound'
             ? 'missed'
@@ -880,6 +901,17 @@ exports.listLogs = async (req, res, next) => {
       filter.customerPhone = normalisePhone(phone);
     }
     if (['inbound', 'outbound'].includes(direction)) filter.direction = direction;
+    // Calls handled by one staff member (answered incoming, or placed). The
+    // owner may pick anyone; a telecaller only themselves — someone else's
+    // list is their performance.
+    if (req.query.agent) {
+      const agent = String(req.query.agent);
+      if (!isObjectId(agent)) return res.status(400).json({ success: false, message: 'Unknown staff member.' });
+      if (req.user.role !== 'owner' && agent !== String(req.user._id)) {
+        return res.status(403).json({ success: false, message: 'You can filter by your own calls only.' });
+      }
+      filter.agentUser = agent;
+    }
 
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
     const logs = await CallLog.find(filter)
@@ -890,6 +922,84 @@ exports.listLogs = async (req, res, next) => {
       .populate('lead', 'patientName');
 
     return res.json({ success: true, logs });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/calls/performance?from=<ISO>&to=<ISO>
+// @desc    Who took the calls in a period. Per person (each telecaller and
+//          owner): incoming calls they answered (in the app, or on their
+//          ring phone — Plivo says which number picked up), average time to
+//          answer, and calls they placed / that connected. For the team:
+//          total incoming, and missed — calls NOBODY answered, counted once
+//          for the team, never against one person.
+//          The owner sees every person; a telecaller only their own row
+//          (and the team totals, which name nobody).
+// @access  Private [owner, telecaller]
+// ============================================================
+const PERFORMANCE_MAX_DAYS = 93;
+const MISSED_STATUSES = ['missed', 'no_agents', 'not_routed'];
+
+exports.performance = async (req, res, next) => {
+  try {
+    const to = req.query.to ? new Date(req.query.to) : new Date();
+    const from = req.query.from ? new Date(req.query.from) : new Date(to.getTime() - 24 * 3600 * 1000);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) {
+      return res.status(400).json({ success: false, message: 'Give a valid from/to period.' });
+    }
+    if (to - from > PERFORMANCE_MAX_DAYS * 24 * 3600 * 1000) {
+      return res.status(400).json({ success: false, message: `Pick a period of at most ${PERFORMANCE_MAX_DAYS} days.` });
+    }
+    const isOwner = req.user.role === 'owner';
+
+    const [calls, staff] = await Promise.all([
+      CallLog.find({ startedAt: { $gte: from, $lt: to }, context: { $ne: 'test_ring' } })
+        .select('direction status agentUser startedAt answeredAt').lean(),
+      isOwner
+        ? User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true }).select('name role').lean()
+        : Promise.resolve([{ _id: req.user._id, name: req.user.name, role: req.user.role }]),
+    ]);
+
+    const rows = new Map((staff || []).map((u) => [String(u._id), {
+      user: u._id, name: u.name, role: u.role,
+      answered: 0, answerSecTotal: 0, answerSecCount: 0, placed: 0, connected: 0,
+    }]));
+    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0 };
+
+    for (const c of calls || []) {
+      const row = c.agentUser ? rows.get(String(c.agentUser)) : null;
+      if (c.direction === 'inbound') {
+        team.incoming += 1;
+        if (c.status === 'completed') {
+          team.answered += 1;
+          if (!c.agentUser) team.answeredUnattributed += 1;
+          if (row) {
+            row.answered += 1;
+            if (c.answeredAt && c.startedAt) {
+              const sec = (new Date(c.answeredAt) - new Date(c.startedAt)) / 1000;
+              if (sec >= 0 && sec < 600) { row.answerSecTotal += sec; row.answerSecCount += 1; }
+            }
+          }
+        } else if (MISSED_STATUSES.includes(c.status)) {
+          team.missed += 1;
+        } else {
+          team.inProgress += 1;
+        }
+      } else if (row) {
+        row.placed += 1;
+        if (c.status === 'completed') row.connected += 1;
+      }
+    }
+
+    const people = [...rows.values()].map(({ answerSecTotal, answerSecCount, ...r }) => ({
+      ...r,
+      avgAnswerSec: answerSecCount ? Math.round(answerSecTotal / answerSecCount) : null,
+    })).sort((a, b) => b.answered - a.answered || String(a.name).localeCompare(String(b.name)));
+
+    return res.json({ success: true, from, to, scope: isOwner ? 'team' : 'self', team, people });
   } catch (err) {
     next(err);
   }

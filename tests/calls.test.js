@@ -1461,3 +1461,73 @@ describe('telecallers', () => {
     expect(pass('/plivo/live/:uuid/hangup', 'post')).toBe(false);
   });
 });
+
+describe('telecaller performance', () => {
+  const owner = { _id: 'own1', role: 'owner', name: 'Manjunath' };
+  const santosh = { _id: '64b0000000000000000000b2', role: 'telecaller', name: 'santosh' };
+  const t0 = new Date('2026-10-26T04:00:00Z');
+  const at = (s) => new Date(t0.getTime() + s * 1000);
+  const CALLS = [
+    { direction: 'inbound', status: 'completed', agentUser: santosh._id, startedAt: at(0), answeredAt: at(10) },
+    { direction: 'inbound', status: 'completed', agentUser: santosh._id, startedAt: at(100), answeredAt: at(120) },
+    { direction: 'inbound', status: 'completed', agentUser: 'own1', startedAt: at(200), answeredAt: at(205) },
+    { direction: 'inbound', status: 'completed', startedAt: at(300) },               // answered, nobody recorded
+    { direction: 'inbound', status: 'missed', startedAt: at(400) },
+    { direction: 'inbound', status: 'no_agents', startedAt: at(500) },
+    { direction: 'outbound', status: 'completed', agentUser: santosh._id, startedAt: at(600) },
+    { direction: 'outbound', status: 'agent_missed', agentUser: santosh._id, startedAt: at(700) },
+  ];
+  const period = { from: '2026-10-26T00:00:00Z', to: '2026-10-27T00:00:00Z' };
+
+  it('owner: a row per person, missed counted once for the team', async () => {
+    CallLog.find.mockReturnValue(chain(CALLS));
+    User.find.mockReturnValue(chain([owner, santosh]));
+    const { res } = await run(ctrl.performance, { user: owner, query: period });
+    expect(res.body.scope).toBe('team');
+    expect(res.body.team).toEqual({ incoming: 6, answered: 4, answeredUnattributed: 1, missed: 2, inProgress: 0 });
+    const s = res.body.people.find((p) => p.name === 'santosh');
+    expect(s).toEqual(expect.objectContaining({ answered: 2, avgAnswerSec: 15, placed: 2, connected: 1 }));
+    expect(res.body.people.find((p) => p.name === 'Manjunath')).toEqual(expect.objectContaining({ answered: 1, avgAnswerSec: 5 }));
+    expect(CallLog.find.mock.calls[0][0].context).toEqual({ $ne: 'test_ring' });
+  });
+
+  it('telecaller: only their own row, never anyone else\'s', async () => {
+    CallLog.find.mockReturnValue(chain(CALLS));
+    const { res } = await run(ctrl.performance, { user: santosh, query: period });
+    expect(res.body.scope).toBe('self');
+    expect(res.body.people).toHaveLength(1);
+    expect(res.body.people[0]).toEqual(expect.objectContaining({ name: 'santosh', answered: 2 }));
+    expect(JSON.stringify(res.body)).not.toContain('Manjunath');
+    expect(User.find).not.toHaveBeenCalled();
+  });
+
+  it('refuses a bad or too-long period', async () => {
+    expect((await run(ctrl.performance, { user: owner, query: { from: 'x' } })).res.statusCode).toBe(400);
+    expect((await run(ctrl.performance, { user: owner, query: { from: '2026-01-01', to: '2026-10-01' } })).res.statusCode).toBe(400);
+  });
+
+  it('call list by telecaller: owner any, telecaller only themselves', async () => {
+    CallLog.find.mockReturnValue(chain([]));
+    await run(ctrl.listLogs, { user: owner, query: { agent: santosh._id } });
+    expect(CallLog.find.mock.calls[0][0].agentUser).toBe(santosh._id);
+    const other = await run(ctrl.listLogs, { user: santosh, query: { agent: '64b0000000000000000000b9' } });
+    expect(other.res.statusCode).toBe(403);
+    const self = await run(ctrl.listLogs, { user: santosh, query: { agent: santosh._id } });
+    expect(self.res.statusCode).toBe(200);
+  });
+
+  it('an incoming call answered on a ring phone is credited to that phone\'s owner', async () => {
+    const log = logDoc({ direction: 'inbound', status: 'ringing', flow: [] });
+    CallLog.findById.mockResolvedValue(log);
+    User.find.mockReturnValue(chain([
+      { _id: 'u-own', name: 'Manjunath', role: 'owner', phone: '9000000001', callPhone: '9986844442' },
+      { _id: 'u-san', name: 'santosh', role: 'telecaller', phone: '9901995897' },
+    ]));
+    await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'phone' },
+      body: { DialStatus: 'completed', DialBLegTo: '919901995897', DialBLegDuration: '42' },
+    });
+    expect(log).toEqual(expect.objectContaining({ status: 'completed', agentUser: 'u-san', agentName: 'santosh', talkSec: 42 }));
+    expect(log.answeredAt).toBeInstanceOf(Date);
+  });
+});

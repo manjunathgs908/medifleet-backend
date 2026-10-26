@@ -30,6 +30,8 @@ router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
 // cannot reach these. Telecallers (CRM_CALLS) take and return customer
 // calls; Plivo's live-call panel stays with the owner.
 router.get('/logs', protect, authorize(...CRM_CALLS), ctrl.listLogs);
+// Who took the calls: every person for the owner, only yourself otherwise.
+router.get('/performance', protect, authorize(...CRM_CALLS), ctrl.performance);
 router.get('/duty', protect, authorize(...CRM_CALLS), ctrl.getDuty);
 router.put('/duty', protect, authorize(...CRM_CALLS), ctrl.setDuty);
 router.get('/me',     protect, authorize(...CRM_CALLS), ctrl.getMe);

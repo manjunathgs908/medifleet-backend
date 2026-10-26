@@ -17,7 +17,7 @@ const express   = require('express');
 const rateLimit = require('express-rate-limit');
 const router    = express.Router();
 const ctrl      = require('../controllers/quoteController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 
 // Same shape and limits as routes/places.js — the page that calls these
 // also calls places autocomplete, at a similar rate. Relies on
@@ -36,7 +36,7 @@ router.post('/public/:token/estimate', publicLimiter, ctrl.estimatePublicQuote);
 router.post('/public/:token/confirm',  publicLimiter, ctrl.confirmPublicQuote);
 
 // Private [owner] — same CRM-only access as dispatch.
-router.post('/', protect, authorize('owner'), ctrl.createQuote);
-router.get ('/', protect, authorize('owner'), ctrl.listQuotes);
+router.post('/', protect, authorize(...OPERATIONS), ctrl.createQuote);
+router.get ('/', protect, authorize(...OPERATIONS), ctrl.listQuotes);
 
 module.exports = router;

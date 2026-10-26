@@ -11,10 +11,10 @@
 const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../controllers/whatsappLeadController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 
 // Private [owner] — same CRM-only access as /api/leads and /api/geofence-events.
-router.get  ('/',               protect, authorize('owner'), ctrl.getLeads);
-router.patch('/:id/status',     protect, authorize('owner'), ctrl.updateLeadStatus);
+router.get  ('/',               protect, authorize(...OPERATIONS), ctrl.getLeads);
+router.patch('/:id/status',     protect, authorize(...OPERATIONS), ctrl.updateLeadStatus);
 
 module.exports = router;

@@ -12,7 +12,7 @@ const router  = express.Router();
 const ctrl    = require('../controllers/callController');
 const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
-const CRM_CALLS = ['owner', 'telecaller'];
+const { OPERATIONS: CRM_CALLS } = require('../middleware/auth');
 
 // Drivers, fleet owners (Owner accounts) and CRM staff may all place a
 // masked call; controllers/callController.js decides whom each may reach.

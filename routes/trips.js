@@ -7,7 +7,7 @@ const paymentCtrl = require('../controllers/paymentController');
 // see their own trips, and protect() alone cannot serve them because it
 // looks subjects up in the User collection. Every other route here stays
 // on protect(). See middleware/auth.js.
-const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
+const { protect, protectUserOrOwner, authorize, OPERATIONS } = require('../middleware/auth');
 
 router.post('/send-otp',   tripCtrl.sendBookingOtp);
 router.post('/verify-otp', tripCtrl.verifyBookingOtp);
@@ -27,13 +27,13 @@ router.post('/:id/messages', protect, authorize('driver'), tripCtrl.postDriverMe
 router.post('/:id/payment/order',  paymentCtrl.createOrder);
 router.post('/:id/payment/verify', paymentCtrl.verifyPayment);
 router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
-router.get('/live', protect, authorize('owner','driver'), tripCtrl.getLiveBoard);
+router.get('/live', protect, authorize(...OPERATIONS, 'driver'), tripCtrl.getLiveBoard);
 router.get('/', protectUserOrOwner, tripCtrl.getTrips);
 router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);
 // Ranked list to help the dispatcher choose. CRM admin only (protect),
 // like the assign call it feeds.
-router.get('/:id/suggested-ambulances', protect, authorize('owner'), tripCtrl.getSuggestedAmbulances);
-router.put('/:id/assign', protect, authorize('owner'), tripCtrl.assignVehicle);
+router.get('/:id/suggested-ambulances', protect, authorize(...OPERATIONS), tripCtrl.getSuggestedAmbulances);
+router.put('/:id/assign', protect, authorize(...OPERATIONS), tripCtrl.assignVehicle);
 router.put('/:id/status', protect, tripCtrl.updateStatus);
 router.put('/:id/arrive-pickup', protect, tripCtrl.arrivePickup);
 router.put('/:id/reached-hospital', protect, tripCtrl.arriveDrop);
@@ -42,6 +42,6 @@ router.put('/:id/verify-otp', protect, tripCtrl.verifyPickupOtp);
 router.put('/:id/complete', protect, tripCtrl.completeTrip);
 router.put('/:id/confirm', protect, authorize('driver'), tripCtrl.confirmTrip);
 router.put('/:id/decline', protect, authorize('driver'), tripCtrl.declineTrip);
-router.put('/:id/cancel', protect, authorize('owner'), tripCtrl.cancelTrip);
+router.put('/:id/cancel', protect, authorize(...OPERATIONS), tripCtrl.cancelTrip);
 
 module.exports = router;

@@ -12,9 +12,10 @@
  *     — Must come AFTER protect() in the middleware chain.
  *     — Usage:  router.get('/report', protect, authorize('owner'), handler)
  *
- * Access Matrix. Telecallers reach only the CRM calling routes
- * (routes/calls.js: call logs, recordings, call back, their own ring
- * number, duty and in-app phone); everything below is owner-only:
+ * Access Matrix. Telecallers (operations) reach the routes guarded with
+ * authorize(...OPERATIONS) — calls, dispatch/trips, fleet list, SOS, trip
+ * and posting alerts, WhatsApp, leads, hospitals, quotes, and the staff
+ * list without pay fields; everything else below is owner-only:
  * ┌────────────────────────────┬───────┬────────┐
  * │ Resource                   │ owner │ driver │
  * ├────────────────────────────┼───────┼────────┤
@@ -303,6 +304,14 @@ const protectUserOrOwner = async (req, res, next) => {
 };
 
 
+// The operations desk: CRM admins and telecallers. Telecallers run
+// day-to-day operations — dispatch, trips, alerts, WhatsApp, leads,
+// hospitals, calls — via authorize(...OPERATIONS). Money and people (finance,
+// billing, salaries, advances, staff, owners, compliance, SEO, dashboard)
+// stay authorize('owner').
+const OPERATIONS = ['owner', 'telecaller'];
+
 module.exports = {
   protect, protectOwner, protectUserOrOwner, authorize, driverSelfOnly, requireKycApproved,
+  OPERATIONS,
 };

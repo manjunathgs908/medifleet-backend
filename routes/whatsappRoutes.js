@@ -31,7 +31,7 @@ const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { Trip, Lead } = require('../models');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { maskPhone, customerRef, phoneFromRef, isCustomerRef } = require('../utils/customerPhone');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 
 const CALL_OUTCOMES = ['booked', 'followup', 'not_interested', 'no_answer'];
 
@@ -341,7 +341,7 @@ router.get('/funnel', protect, authorize('owner'), async (req, res, next) => {
 //   the number (utils/customerPhone.js). A raw `phone` is still accepted
 //   for any older caller, but the CRM no longer has one to send.
 // ============================================================
-router.post('/call-outcome', protect, authorize('owner'), async (req, res, next) => {
+router.post('/call-outcome', protect, authorize(...OPERATIONS), async (req, res, next) => {
   try {
     const { outcome, followUpAt, note, tripId } = req.body;
     const phone = req.body.customerRef ? phoneFromRef(req.body.customerRef) : req.body.phone;
@@ -420,7 +420,7 @@ router.post('/call-outcome', protect, authorize('owner'), async (req, res, next)
 //            computed from WhatsAppCallLog, independent of status, and
 //            combine with it (both filters apply together).
 // ============================================================
-router.get('/conversations', protect, authorize('owner'), async (req, res, next) => {
+router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res, next) => {
   try {
     const parsedDays = parseInt(req.query.days, 10);
     const days = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 7;
@@ -662,7 +662,7 @@ router.get('/conversations', protect, authorize('owner'), async (req, res, next)
 // ============================================================
 // :phone is the customerRef from /conversations (a raw number is still
 // accepted for older callers). The response never contains the number.
-router.get('/customer/:phone', protect, authorize('owner'), async (req, res, next) => {
+router.get('/customer/:phone', protect, authorize(...OPERATIONS), async (req, res, next) => {
   try {
     const raw = isCustomerRef(req.params.phone) ? phoneFromRef(req.params.phone) : req.params.phone;
     const normalized = normalisePhone(raw);

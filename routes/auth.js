@@ -11,7 +11,7 @@ const mongoose  = require('mongoose');
 const router    = express.Router();
 const authCtrl  = require('../controllers/authController');
 const unifiedAuthCtrl = require('../controllers/unifiedAuthController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 const { sendOtpLimiter, verifyLimiter } = require('../middleware/otpRateLimit');
 
 router.post('/register',         protect, authorize('owner'), authCtrl.register);
@@ -37,12 +37,17 @@ const Ambulance  = require('../models/Ambulance');
 const Assignment = require('../models/Assignment');
 
 // GET /api/auth/users — list all staff
-router.get('/users', protect, authorize('owner'), async (req, res, next) => {
+// Telecallers (operations) read it too — Fleet and the alert pages need
+// driver names, phones and live availability — but never pay or device
+// fields; adding, editing and deactivating staff stay owner-only.
+const NOT_FOR_OPERATIONS = '-baseSalary -perTripBonus -deviceId -pin -pinChangeRequired';
+router.get('/users', protect, authorize(...OPERATIONS), async (req, res, next) => {
   try {
     const { role } = req.query;
     const filter = {};
     if (role) filter.role = role;
-    const users = await User.find(filter).select('-password -otp -otpExpiry -refreshToken');
+    const select = `-password -otp -otpExpiry -refreshToken${req.user.role === 'owner' ? '' : ` ${NOT_FOR_OPERATIONS}`}`;
+    const users = await User.find(filter).select(select);
     return res.json({ success: true, users });
   } catch (err) { next(err); }
 });

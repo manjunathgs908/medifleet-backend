@@ -109,6 +109,20 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // callController.js incoming).
     callDuty      : { type: Boolean, default: false },
 
+    // The phone Plivo rings for this user -- click-to-call and incoming
+    // calls while on call duty. Separate from `phone`, which is the login
+    // number and may not be the handset they carry. Unset falls back to
+    // `phone`. Customers never see it: every masked call shows them
+    // PLIVO_NUMBER.
+    callPhone     : {
+      type    : String,
+      trim    : true,
+      validate: {
+        validator: (v) => !v || /^[6-9]\d{9}$/.test(v),
+        message  : 'Call ring number must be a 10-digit Indian mobile number.',
+      },
+    },
+
     // â”€â”€ Driver current availability (synced from mobile app) â”€â”€
     availability  : {
       status   : { type: String, enum: ['available', 'on_trip', 'offline'], default: 'offline' },

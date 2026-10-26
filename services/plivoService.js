@@ -10,8 +10,10 @@
  *                                    every agent sees (918065591088)
  *   PUBLIC_API_BASE_URL              optional; https://api.savelife.health
  *
- * Exotel (services/exotelService.js) stays as the fallback: isConfigured()
- * is false until all three PLIVO_* variables are set.
+ * Every masked call goes through here when Plivo is configured, including
+ * the legacy /api/call/connect, so customers always see PLIVO_NUMBER.
+ * Exotel (services/exotelService.js) is only used by that legacy route,
+ * and only while the PLIVO_* variables are missing.
  * ============================================================
  */
 'use strict';
@@ -21,10 +23,13 @@ const { normalisePhone } = require('../utils/phone');
 
 const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE_URL || 'https://api.savelife.health').replace(/\/+$/, '');
 
-const isConfigured = () =>
-  !!(process.env.PLIVO_AUTH_ID && process.env.PLIVO_AUTH_TOKEN && process.env.PLIVO_NUMBER);
-
 const companyNumber = () => String(process.env.PLIVO_NUMBER || '').replace(/\D/g, '');
+
+// PLIVO_NUMBER must be a full Indian number (91 + 10 digits): it is the
+// caller ID on every leg of every call, so a malformed value refuses to
+// call rather than showing customers something else.
+const isConfigured = () =>
+  !!(process.env.PLIVO_AUTH_ID && process.env.PLIVO_AUTH_TOKEN && /^91\d{10}$/.test(companyNumber()));
 
 let client = null;
 function getClient() {
@@ -41,13 +46,16 @@ const toE164 = (raw) => {
 
 const apiUrl = (path) => `${PUBLIC_API_BASE}${path}`;
 
-// ── Outbound: ring the agent; /answer then dials the customer ─────────────
-// Only the call-log id travels in the URLs. The customer's number is looked
-// up again by /answer, so it is never in a URL, a query string or a client.
-async function callAgent({ agentPhone, logId }) {
+// ── Outbound: ring the first party; /answer then dials the other ──────────
+// The first party is the agent (click-to-call) or, for the legacy tracking-
+// page call, the customer. Either way the call comes FROM the company
+// number, and only the call-log id travels in the URLs: /answer looks the
+// other number up again, so it is never in a URL, a query string or a
+// client.
+async function callFirstLeg({ phone, logId }) {
   const res = await getClient().calls.create(
     companyNumber(),
-    toE164(agentPhone),
+    toE164(phone),
     apiUrl(`/api/calls/answer?log=${logId}`),
     {
       answerMethod : 'POST',
@@ -57,8 +65,13 @@ async function callAgent({ agentPhone, logId }) {
       timeLimit    : 3600,
     },
   );
-  return { requestId: res.requestUuid || res.request_uuid || null };
+  return { requestId: res.requestUuid || res.request_uuid || null, callerId: companyNumber() };
 }
+
+// One line per call in the Render log, so which provider and caller ID
+// handled a call can be read straight off production, never assumed.
+const logCall = (what, log) =>
+  console.info(`[calls] provider=${log.provider} ${what} log=${log._id} callerId=${log.callerId || '-'} agent=${log.agentType || '-'} context=${log.context}`);
 
 // Plivo's own message on failure is the most useful thing to show, but a
 // trial account's refusal deserves a plain explanation.
@@ -118,7 +131,7 @@ const emptyXml = () => xml('');
 
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
-  callAgent, friendlyError, isValidSignature,
+  callFirstLeg, logCall, friendlyError, isValidSignature,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

@@ -14,6 +14,8 @@
  *   GET  /logs            CRM call history (hasRecording, never the URL).
  *   GET  /:id/recording   streams a recording from Plivo (Basic Auth).
  *   GET/PUT /duty         CRM staff's own "On call duty" switch.
+ *   GET/PUT /me           CRM staff's own call settings: ring number + duty.
+ *   GET  /config          which provider is live and the caller ID it uses.
  *
  * The customer's number exists only here and in Plivo's XML. Clients send a
  * reference, never a number, and every response is the CallLog's JSON form,
@@ -21,8 +23,11 @@
  * Plivo's request signature before answering, because /answer's reply
  * contains the customer's number.
  *
- * Exotel stays as the fallback: with no PLIVO_* configuration, a trip call
- * goes through services/exotelService.js exactly as /api/call/connect does.
+ * Caller ID: every leg of every call here comes from PLIVO_NUMBER — the
+ * call to the agent, the <Dial> to the customer, and incoming calls
+ * forwarded to staff — and is recorded on the CallLog as callerId. There is
+ * deliberately no Exotel fallback on these routes: an Exotel call would
+ * show customers the Exotel number. Without Plivo configured they refuse.
  * ============================================================
  */
 'use strict';
@@ -35,7 +40,6 @@ const Quote        = require('../models/Quote');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
 const plivo        = require('../services/plivoService');
-const exotel       = require('../services/exotelService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef } = require('../utils/customerPhone');
 
@@ -48,6 +52,10 @@ const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isVal
 
 const sendXml = (res, body) => res.type('text/xml').send(body);
 
+// The phone Plivo rings for a User: their own call ring number when set,
+// otherwise the login number. (Fleet Owners have only the one number.)
+const ringPhoneOf = (u) => (u?.callPhone && isMobile(u.callPhone) ? u.callPhone : u?.phone);
+
 // Who is asking, and from which phone Plivo should ring them.
 function agentOf(req) {
   if (req.actorType === 'owner') {
@@ -57,9 +65,39 @@ function agentOf(req) {
     type : req.user.role === 'driver' ? 'driver' : 'staff',
     user : req.user._id,
     name : req.user.name,
-    phone: req.user.phone,
+    phone: ringPhoneOf(req.user),
   };
 }
+
+const NOT_CONFIGURED = 'Calling is not set up: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER (91 followed by 10 digits) are needed on the server.';
+
+// Logs the call, then has Plivo ring the first party from PLIVO_NUMBER.
+// Shared by click-to-call and the legacy /api/call/connect, so there is one
+// way a masked call gets placed. Returns { log } or { log, error }.
+async function placePlivoCall(fields, firstPhone) {
+  const log = await CallLog.create({
+    ...fields,
+    provider: 'plivo',
+    callerId: plivo.companyNumber(),
+    status  : 'initiated',
+  });
+  try {
+    const { requestId } = await plivo.callFirstLeg({ phone: firstPhone, logId: log._id });
+    log.providerRequestId = requestId;
+    await log.save();
+    plivo.logCall('outbound placed', log);
+    return { log };
+  } catch (plivoErr) {
+    console.error('[calls] Plivo call failed:', plivoErr?.message || plivoErr);
+    log.status = 'failed';
+    log.error = String(plivoErr?.message || plivoErr).slice(0, 500);
+    log.endedAt = new Date();
+    await log.save();
+    return { log, error: plivo.friendlyError(plivoErr) };
+  }
+}
+exports.placePlivoCall = placePlivoCall;
+exports.ringPhoneOf = ringPhoneOf;
 
 class CallError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -140,14 +178,21 @@ exports.clickToCall = async (req, res, next) => {
     }
 
     if (!isMobile(agent.phone)) {
-      return res.status(400).json({ success: false, message: 'Your account has no valid mobile number to ring. Ask an admin to update it.' });
+      return res.status(400).json({ success: false, message: 'Your account has no valid mobile number to ring. Set your call ring number on the Staff page.' });
     }
     if (!isMobile(customer.phone)) {
       return res.status(400).json({ success: false, message: 'This customer has no valid mobile number on record.' });
     }
 
-    const base = {
+    // Plivo only. No Exotel fallback here: it would show the customer the
+    // Exotel number instead of PLIVO_NUMBER.
+    if (!plivo.isConfigured()) {
+      return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+    }
+
+    const { log, error } = await placePlivoCall({
       direction    : 'outbound',
+      firstLeg     : 'agent',
       agentType    : agent.type,
       agentUser    : agent.user,
       agentOwner   : agent.owner,
@@ -156,54 +201,16 @@ exports.clickToCall = async (req, res, next) => {
       customerPhone: normalisePhone(customer.phone),
       context      : customer.context,
       ...customer.refs,
-    };
+    }, agent.phone);
 
-    // ── Plivo ──
-    if (plivo.isConfigured()) {
-      const log = await CallLog.create({ ...base, provider: 'plivo', status: 'initiated' });
-      try {
-        const { requestId } = await plivo.callAgent({ agentPhone: agent.phone, logId: log._id });
-        log.providerRequestId = requestId;
-        await log.save();
-      } catch (plivoErr) {
-        const message = plivo.friendlyError(plivoErr);
-        console.error('[calls] Plivo call failed:', plivoErr?.message || plivoErr);
-        log.status = 'failed';
-        log.error = String(plivoErr?.message || plivoErr).slice(0, 500);
-        log.endedAt = new Date();
-        await log.save();
-        return res.status(502).json({ success: false, message, callLogId: log._id });
-      }
-      return res.json({
-        success  : true,
-        provider : 'plivo',
-        callLogId: log._id,
-        message  : 'Your phone will ring now. Answer it and we will connect you to the customer.',
-      });
-    }
-
-    // ── Exotel fallback (no Plivo configuration) ──
-    if (process.env.EXOTEL_SID && process.env.EXOTEL_API_KEY) {
-      const log = await CallLog.create({ ...base, provider: 'exotel', status: 'initiated' });
-      try {
-        const call = await exotel.connectCall({
-          from: agent.phone,
-          to  : customer.phone,
-          statusCallbackUrl: plivo.apiUrl('/api/call/status'),
-        });
-        log.providerRequestId = call?.Sid || null;
-        await log.save();
-      } catch (exoErr) {
-        log.status = 'failed';
-        log.error = String(exoErr?.response?.data?.RestException?.Message || exoErr.message).slice(0, 500);
-        log.endedAt = new Date();
-        await log.save();
-        return res.status(502).json({ success: false, message: 'Could not connect the call right now. Please try again.' });
-      }
-      return res.json({ success: true, provider: 'exotel', callLogId: log._id, message: 'Your phone will ring now. Answer it to connect.' });
-    }
-
-    return res.status(503).json({ success: false, message: 'Calling is not set up yet: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER are needed on the server.' });
+    if (error) return res.status(502).json({ success: false, message: error, callLogId: log._id });
+    return res.json({
+      success  : true,
+      provider : 'plivo',
+      callerId : log.callerId,
+      callLogId: log._id,
+      message  : 'Your phone will ring now from 918065591088. Answer it and we will connect you to the customer.',
+    });
   } catch (err) {
     next(err);
   }
@@ -223,14 +230,17 @@ const logIdOf = (req) => (isObjectId(String(req.query.log || '')) ? String(req.q
 
 // ============================================================
 // @route   POST /api/calls/answer?log=<id>
-// @desc    The agent answered Plivo's call. Dial the customer, record it.
+// @desc    The first party answered Plivo's call. Dial the other one —
+//          normally the customer; the driver when the customer started it
+//          (legacy tracking-page call) — from PLIVO_NUMBER, recorded.
 // @access  Plivo (signature)
 // ============================================================
 exports.answer = async (req, res, next) => {
   try {
     const logId = logIdOf(req);
-    const log = logId ? await CallLog.findById(logId).select('+customerPhone') : null;
-    if (!log?.customerPhone || log.direction !== 'outbound') {
+    const log = logId ? await CallLog.findById(logId).select('+customerPhone +agentPhone') : null;
+    const other = log?.firstLeg === 'customer' ? log?.agentPhone : log?.customerPhone;
+    if (!other || log.direction !== 'outbound') {
       return sendXml(res, plivo.speakXml('Sorry, this call could not be connected.'));
     }
 
@@ -239,7 +249,7 @@ exports.answer = async (req, res, next) => {
     if (req.body?.CallUUID) log.providerCallId = req.body.CallUUID;
     await log.save();
 
-    return sendXml(res, plivo.bridgeXml({ numbers: [log.customerPhone], logId: log._id }));
+    return sendXml(res, plivo.bridgeXml({ numbers: [other], logId: log._id }));
   } catch (err) {
     next(err);
   }
@@ -264,9 +274,11 @@ exports.incoming = async (req, res, next) => {
       Lead.findOne({ phone: phoneSuffixQuery(from) }).sort({ createdAt: -1 }).select('_id'),
     ]) : [null, null];
 
+    // Each on-duty user's call ring number (else their login number). They
+    // see PLIVO_NUMBER as the caller, never the customer's number.
     const onDuty = await User.find({ role: 'owner', isActive: true, callDuty: true })
-      .select('name phone').limit(MAX_INCOMING_AGENTS).lean();
-    let agentPhones = onDuty.map((u) => u.phone).filter(isMobile);
+      .select('name phone callPhone').limit(MAX_INCOMING_AGENTS).lean();
+    let agentPhones = onDuty.map(ringPhoneOf).filter(isMobile);
     if (!agentPhones.length) {
       agentPhones = String(process.env.PLIVO_FALLBACK_AGENTS || '')
         .split(',').map((s) => s.trim()).filter(isMobile).slice(0, MAX_INCOMING_AGENTS);
@@ -274,6 +286,7 @@ exports.incoming = async (req, res, next) => {
 
     const log = await CallLog.create({
       provider     : 'plivo',
+      callerId     : plivo.companyNumber(),
       direction    : 'inbound',
       context      : 'incoming',
       customerPhone: from || undefined,
@@ -283,6 +296,7 @@ exports.incoming = async (req, res, next) => {
       status       : agentPhones.length ? 'ringing' : 'no_agents',
       endedAt      : agentPhones.length ? undefined : new Date(),
     });
+    plivo.logCall(`inbound ringing=${agentPhones.length}`, log);
 
     if (!agentPhones.length) {
       return sendXml(res, plivo.speakXml('Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.'));
@@ -517,8 +531,8 @@ exports.getDuty = async (req, res) => res.json({ success: true, onDuty: !!req.us
 exports.setDuty = async (req, res, next) => {
   try {
     const onDuty = !!req.body?.onDuty;
-    if (onDuty && !isMobile(req.user.phone)) {
-      return res.status(400).json({ success: false, message: 'Your account has no valid mobile number to ring.' });
+    if (onDuty && !isMobile(ringPhoneOf(req.user))) {
+      return res.status(400).json({ success: false, message: 'Your account has no valid mobile number to ring. Set your call ring number on the Staff page.' });
     }
     await User.updateOne({ _id: req.user._id }, { $set: { callDuty: onDuty } });
     return res.json({ success: true, onDuty });
@@ -526,3 +540,60 @@ exports.setDuty = async (req, res, next) => {
     next(err);
   }
 };
+
+
+// The signed-in user's own call settings. Their own numbers only — this is
+// not a customer number, and nobody else's.
+const meView = (u) => ({
+  callPhone  : u.callPhone || null,                // what they set
+  loginPhone : u.phone || null,                    // the fallback
+  ringPhone  : ringPhoneOf(u) || null,             // what Plivo actually rings
+  usingLogin : !u.callPhone,
+  onDuty     : !!u.callDuty,
+  callerId   : plivo.companyNumber() || null,      // what customers see
+});
+
+// ============================================================
+// @route   GET /api/calls/me   PUT /api/calls/me { callPhone }
+// @desc    View / set your own call ring number — the phone Plivo rings
+//          for your click-to-calls and, while on call duty, incoming calls.
+//          Separate from the login number. Empty clears it (back to the
+//          login number).
+// @access  Private [owner]
+// ============================================================
+exports.getMe = async (req, res) => res.json({ success: true, me: meView(req.user) });
+
+exports.setMe = async (req, res, next) => {
+  try {
+    const raw = req.body?.callPhone;
+    const cleared = raw === null || raw === undefined || String(raw).trim() === '';
+    const callPhone = cleared ? null : normalisePhone(raw);
+    if (!cleared && !/^[6-9]\d{9}$/.test(callPhone)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      cleared ? { $unset: { callPhone: 1 } } : { $set: { callPhone } },
+      { new: true, runValidators: true },
+    ).select('phone callPhone callDuty');
+    return res.json({ success: true, me: meView(user) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/calls/config
+// @desc    Which provider masked calls use right now, and the caller ID
+//          customers see — so the CRM can show it rather than assume it.
+// @access  Private [owner]
+// ============================================================
+exports.getConfig = async (req, res) => res.json({
+  success : true,
+  provider: plivo.isConfigured() ? 'plivo' : 'none',
+  callerId: plivo.isConfigured() ? plivo.companyNumber() : null,
+  // The only remaining Exotel path: /api/call/connect, and only while
+  // Plivo is not configured.
+  legacyExotelActive: !plivo.isConfigured() && !!(process.env.EXOTEL_SID && process.env.EXOTEL_API_KEY),
+});

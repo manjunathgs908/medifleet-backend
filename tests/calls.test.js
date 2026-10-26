@@ -170,13 +170,46 @@ describe('click-to-call', () => {
     expect(log.save).toHaveBeenCalled();
   });
 
-  it('says so when no calling provider is configured', async () => {
+  it('never falls back to Exotel — that would show the customer the Exotel number', async () => {
     const saved = process.env.PLIVO_AUTH_ID;
     delete process.env.PLIVO_AUTH_ID;
+    process.env.EXOTEL_SID = 'sid';
+    process.env.EXOTEL_API_KEY = 'key';
     Trip.findOne.mockReturnValue(chain(activeTrip()));
     const { res } = await run(ctrl.clickToCall, { user: driver, body: { tripId: 't1' } });
     process.env.PLIVO_AUTH_ID = saved;
+    delete process.env.EXOTEL_SID;
+    delete process.env.EXOTEL_API_KEY;
     expect(res.statusCode).toBe(503);
+    expect(require('../services/exotelService').connectCall).not.toHaveBeenCalled();
+    expect(CallLog.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses to call with a malformed PLIVO_NUMBER rather than show customers anything else', async () => {
+    const saved = process.env.PLIVO_NUMBER;
+    process.env.PLIVO_NUMBER = '8065591088'; // missing the 91
+    Trip.findOne.mockReturnValue(chain(activeTrip()));
+    const { res } = await run(ctrl.clickToCall, { user: driver, body: { tripId: 't1' } });
+    process.env.PLIVO_NUMBER = saved;
+    expect(res.statusCode).toBe(503);
+    expect(mockCreateCall).not.toHaveBeenCalled();
+  });
+
+  it('records which provider and caller ID handled the call', async () => {
+    Trip.findOne.mockReturnValue(chain(activeTrip()));
+    const { res } = await run(ctrl.clickToCall, { user: driver, body: { tripId: 't1' } });
+    expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({ provider: 'plivo', callerId: '918065591088' }));
+    expect(res.body).toEqual(expect.objectContaining({ provider: 'plivo', callerId: '918065591088' }));
+  });
+
+  it('rings the user\'s own call ring number, not their login number', async () => {
+    const { res } = await run(ctrl.clickToCall, {
+      user: { ...staff, phone: '8884092777', callPhone: '9876500000' },
+      body: { customerRef: customerRef(CUSTOMER) },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockCreateCall.mock.calls[0][0]).toBe('918065591088');
+    expect(mockCreateCall.mock.calls[0][1]).toBe('919876500000');
   });
 });
 
@@ -197,6 +230,15 @@ describe('answer', () => {
     expect(res.body.indexOf('<Record')).toBeLessThan(res.body.indexOf('<Dial'));
     expect(log.status).toBe('agent_answered');
     expect(log.providerCallId).toBe('ca-1');
+  });
+
+  it('dials the driver when the customer started it (legacy tracking-page call), still from the company number', async () => {
+    const log = logDoc({ firstLeg: 'customer', customerPhone: CUSTOMER, agentPhone: DRIVER_PHONE });
+    CallLog.findById.mockReturnValue(chain(log));
+    const { res } = await run(ctrl.answer, { method: 'POST', query: { log: '64b000000000000000000001' } });
+    expect(res.body).toContain(`<Number>91${DRIVER_PHONE}</Number>`);
+    expect(res.body).not.toContain(CUSTOMER);
+    expect(res.body).toContain('callerId="918065591088"');
   });
 
   it('never dials for an unknown call', async () => {
@@ -271,8 +313,15 @@ describe('incoming', () => {
     expect(res.body).toContain('callerId="918065591088"');
     expect(res.body).toContain('<Record ');
     expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({
-      direction: 'inbound', customerPhone: CUSTOMER, status: 'ringing',
+      direction: 'inbound', customerPhone: CUSTOMER, status: 'ringing', callerId: '918065591088',
     }));
+  });
+
+  it('rings each on-duty user\'s call ring number when they have one', async () => {
+    User.find.mockReturnValue(chain([{ phone: '8884092777', callPhone: '9876500000' }, { phone: '9000000002' }]));
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442' } });
+    expect(res.body).toContain('<Number>919876500000</Number><Number>919000000002</Number>');
+    expect(res.body).not.toContain('8884092777');
   });
 
   it('tells the caller everyone is busy when nobody is on duty', async () => {
@@ -392,5 +441,34 @@ describe('recording playback', () => {
     expect(res.statusCode).toBe(502);
     expect(res.body.message).toMatch(/PLIVO_AUTH_ID/);
     expect(up.data.pipe).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('own call settings', () => {
+  it('shows what Plivo rings and what customers see', async () => {
+    const { res } = await run(ctrl.getMe, { user: { phone: '8884092777', callPhone: '9876500000', callDuty: true } });
+    expect(res.body.me).toEqual(expect.objectContaining({
+      ringPhone: '9876500000', loginPhone: '8884092777', usingLogin: false, onDuty: true, callerId: '918065591088',
+    }));
+  });
+
+  it('saves a valid ring number, separately from the login number', async () => {
+    User.findByIdAndUpdate = jest.fn(() => chain({ phone: '8884092777', callPhone: '9876500000' }));
+    const { res } = await run(ctrl.setMe, { user: { _id: 'u1' }, body: { callPhone: '+91 98765 00000' } });
+    expect(User.findByIdAndUpdate).toHaveBeenCalledWith('u1', { $set: { callPhone: '9876500000' } }, expect.anything());
+    expect(res.body.me.ringPhone).toBe('9876500000');
+  });
+
+  it('rejects a number that is not an Indian mobile', async () => {
+    User.findByIdAndUpdate = jest.fn();
+    const { res } = await run(ctrl.setMe, { user: { _id: 'u1' }, body: { callPhone: '12345' } });
+    expect(res.statusCode).toBe(400);
+    expect(User.findByIdAndUpdate).not.toHaveBeenCalled();
+  });
+
+  it('reports the live provider and caller ID', async () => {
+    const { res } = await run(ctrl.getConfig, {});
+    expect(res.body).toEqual(expect.objectContaining({ provider: 'plivo', callerId: '918065591088', legacyExotelActive: false }));
   });
 });

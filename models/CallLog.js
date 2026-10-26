@@ -28,6 +28,15 @@ const CallLogSchema = new mongoose.Schema(
 
     customerPhone: { type: String, select: false, index: true },
 
+    // Who Plivo rang first. 'agent' for click-to-call and incoming;
+    // 'customer' only for the legacy /api/call/connect from the customer's
+    // tracking page, where the customer starts the call to the driver.
+    firstLeg: { type: String, enum: ['agent', 'customer'], default: 'agent' },
+
+    // The number both parties saw. Always PLIVO_NUMBER for a Plivo call --
+    // recorded per call so it can be checked, not assumed.
+    callerId: { type: String },
+
     // What the call was about.
     context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming'], required: true },
     trip        : { type: mongoose.Schema.Types.ObjectId, ref: 'Trip', index: true },

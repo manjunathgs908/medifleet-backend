@@ -1,8 +1,10 @@
 /**
  * routes/callRoutes.js
  * ============================================================
- * Exotel call masking — bridges a driver and customer on an active
- * trip without either side seeing the other's real number.
+ * Legacy masked call between a trip's driver and customer (the website's
+ * tracking page and older driver-app builds). Goes through Plivo whenever
+ * PLIVO_* is configured, so the customer sees PLIVO_NUMBER; the Exotel
+ * path below only runs while it is not.
  * ============================================================
  */
 
@@ -13,6 +15,9 @@ const router = express.Router();
 const mongoose = require('mongoose');
 const { Trip } = require('../models');
 const { connectCall } = require('../services/exotelService');
+const plivo = require('../services/plivoService');
+const { placePlivoCall, ringPhoneOf } = require('../controllers/callController');
+const { normalisePhone } = require('../utils/phone');
 
 // Public base URL Exotel posts call-status updates back to. Hardcoded
 // like the other external API URLs in this codebase (see
@@ -58,7 +63,7 @@ router.post('/connect', async (req, res, next) => {
     const query = mongoose.Types.ObjectId.isValid(tripId)
       ? { _id: tripId }
       : { tripNumber: tripId };
-    const trip = await Trip.findOne(query).populate('driver', 'name phone');
+    const trip = await Trip.findOne(query).populate('driver', 'name phone callPhone');
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
 
     const driverPhone   = trip.driver?.phone;
@@ -77,6 +82,29 @@ router.post('/connect', async (req, res, next) => {
         success: false,
         message: `${side} phone number is not valid on this trip (${value}).`,
       });
+    }
+
+    // Plivo whenever it is configured, so the customer sees PLIVO_NUMBER on
+    // this route too (the website's tracking page and older driver-app
+    // builds still call it). Plivo rings the initiator first, from the
+    // company number, then dials the other side from the same number.
+    // Exotel below only runs while Plivo is not configured.
+    if (plivo.isConfigured()) {
+      const ring = ringPhoneOf(trip.driver);
+      const { log, error } = await placePlivoCall({
+        direction    : 'outbound',
+        firstLeg     : initiator === 'driver' ? 'agent' : 'customer',
+        agentType    : 'driver',
+        agentUser    : trip.driver._id,
+        agentName    : trip.driver.name,
+        agentPhone   : normalisePhone(ring),
+        customerPhone: normalisePhone(customerPhone),
+        context      : 'trip',
+        trip         : trip._id,
+      }, initiator === 'driver' ? ring : customerPhone);
+      if (error) return res.status(502).json({ success: false, message: error });
+      // Same response shape this route always had.
+      return res.json({ success: true, call: { Sid: log.providerRequestId || String(log._id), Status: 'initiated' } });
     }
 
     const from = initiator === 'driver' ? driverPhone : customerPhone;

@@ -26,11 +26,23 @@ function phoneLegVerdict(phoneLeg, overlap) {
   const busy   = status === 'busy' || BUSY_CAUSES.includes(cause);
   const ours   = (overlap?.ourCalls?.length || 0) + (overlap?.liveLegs?.length || 0);
 
-  const out = (code, text, advice) => ({ code, rang, cause, overlapping: ours, text, ...(advice ? { advice } : {}) });
+  // Seconds from our phone Dial to Plivo's result: a busy within a few
+  // seconds of ringing was refused automatically, not by a person.
+  const dialAt = overlap?.dialAt ? new Date(overlap.dialAt).getTime() : NaN;
+  const doneAt = phoneLeg.receivedAt ? new Date(phoneLeg.receivedAt).getTime() : NaN;
+  const afterSec = Number.isFinite(dialAt) && Number.isFinite(doneAt) && doneAt >= dialAt ? Math.round((doneAt - dialAt) / 1000) : null;
+
+  const out = (code, text, advice) => ({ code, rang, cause, overlapping: ours, afterSec, text, ...(advice ? { advice } : {}) });
 
   if (status === 'completed') return out('answered', 'The phone rang and was answered.');
   if (busy && rang === true) {
-    return out('rang_then_busy', `The phone rang, then the call was declined (${cause || 'busy'}) — rejected on the handset, or it took another call.`);
+    if (afterSec != null && afterSec <= 6) {
+      return out('rang_then_auto_busy',
+        `The network reported ringing, then ${cause || 'busy'} only ${afterSec}s after dialling — too fast for a person. The phone or carrier refused it automatically.`,
+        'On that phone, check: spam/unknown-caller blocking (phone settings, Truecaller, Airtel/Jio spam filter) and whether 080 6559 1088 is blocked; "reject calls" or a call-blocking app; DND mode set to reject; dual-SIM with the other SIM busy; call forwarding (dial ##002#). Save +91 80655 91088 as a contact named SaveLife.');
+    }
+    return out('rang_then_busy', `The phone rang${afterSec != null ? ` for about ${afterSec}s` : ''}, then the call was declined (${cause || 'busy'}) — rejected on the handset, or it took another call.`,
+      'If nobody pressed reject: check spam/unknown-caller blocking and call-blocking apps on that phone, and whether 080 6559 1088 is blocked.');
   }
   if (busy && rang === false) {
     if (ours) {

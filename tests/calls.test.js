@@ -1408,3 +1408,17 @@ describe('"Ring my phone now (test)" and the caller-is-ring-phone note', () => {
     }
   });
 });
+
+describe('phone verdict timing', () => {
+  const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
+  const at = (s) => new Date(Date.UTC(2026, 9, 26, 14, 15, s)).toISOString();
+  it('busy seconds after ringing is called an automatic refusal; later is a decline', () => {
+    const leg = (s) => ({ DialStatus: 'busy', DialRingStatus: 'true', DialHangupCause: 'USER_BUSY', receivedAt: at(s) });
+    const ov = { dialAt: at(0), ourCalls: [], liveLegs: [] };
+    const fast = phoneLegVerdict(leg(3), ov);
+    expect(fast).toEqual(expect.objectContaining({ code: 'rang_then_auto_busy', afterSec: 3 }));
+    expect(fast.advice).toMatch(/spam/);
+    expect(phoneLegVerdict(leg(20), ov)).toEqual(expect.objectContaining({ code: 'rang_then_busy', afterSec: 20 }));
+    expect(phoneLegVerdict(leg(3), undefined).afterSec).toBeNull();
+  });
+});

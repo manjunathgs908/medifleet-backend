@@ -751,10 +751,38 @@ describe('in-app (WebRTC) calling', () => {
     expect(JSON.stringify(routing)).not.toMatch(/900000000/);
   });
 
-  it('login mode defaults to the token and hands out no credentials', async () => {
+  it('login mode defaults to password (the only login Plivo registers for us)', async () => {
     delete process.env.PLIVO_WEBRTC_LOGIN;
+    fakePlivo();
+    User.findById.mockReturnValue(chain({ _id: USER_ID, plivoEndpointId: 'ep1', plivoEndpointUsername: 'slexisting123', plivoEndpointPassword: 'stored-pw', save: jest.fn() }));
     const { res } = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: {} });
-    expect(res.body).toEqual({ success: true, mode: 'token' });
+    expect(res.body).toEqual(expect.objectContaining({ mode: 'password', username: 'slexisting123', password: 'stored-pw' }));
+  });
+
+  it('token mode, by flag or by request, hands out no credentials', async () => {
+    process.env.PLIVO_WEBRTC_LOGIN = 'token';
+    const byEnv = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: {} });
+    delete process.env.PLIVO_WEBRTC_LOGIN;
+    const byRequest = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: { mode: 'token' } });
+    expect(byEnv.res.body).toEqual({ success: true, mode: 'token' });
+    expect(byRequest.res.body).toEqual({ success: true, mode: 'token' });
+  });
+
+  it('reset=1 sets a new password on Plivo even when one is stored, and never logs it', async () => {
+    fakePlivo();
+    const userDoc = { _id: USER_ID, plivoEndpointId: 'ep1', plivoEndpointUsername: 'slexisting123', plivoEndpointPassword: 'old-pw', save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+    const logged = [];
+    const spies = ['info', 'warn', 'error', 'log'].map((m) => jest.spyOn(console, m).mockImplementation((...a) => logged.push(a.join(' '))));
+
+    const { res } = await run(ctrl.webrtcLogin, { user: { _id: USER_ID }, query: { reset: '1' } });
+    spies.forEach((s) => s.mockRestore());
+
+    const reset = restCalls('post', '/Endpoint/ep1/').find((c) => c.data.password);
+    expect(reset.data.password).not.toBe('old-pw');
+    expect(userDoc.plivoEndpointPassword).toBe(reset.data.password);
+    expect(res.body.password).toBe(reset.data.password);
+    expect(logged.join('\n')).not.toContain(reset.data.password);
   });
 
   it('password mode gives the user their OWN endpoint username and password', async () => {

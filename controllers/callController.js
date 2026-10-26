@@ -984,20 +984,26 @@ async function ensureUserEndpoint(user, res) {
 }
 
 // How the CRM logs in to Plivo for in-app calling:
-//   'token'    — access token from Plivo's JWT API (the default);
 //   'password' — classic SIP registration with the endpoint's own
-//                username/password.
+//                username/password. The default: on our (India-region)
+//                account it is the only login Plivo actually registers —
+//                with a token, Plivo kept the endpoint "Not registered"
+//                and inbound calls never reached the browser.
+//   'token'    — access token from Plivo's JWT API. Kept, behind the flag,
+//                to switch back to if Plivo fixes token registration.
 // Set with PLIVO_WEBRTC_LOGIN on Render; a browser may also ask for one
 // explicitly (localStorage plivoLoginMode) to compare the two.
 const LOGIN_MODES = ['token', 'password'];
-const serverLoginMode = () => (LOGIN_MODES.includes(process.env.PLIVO_WEBRTC_LOGIN) ? process.env.PLIVO_WEBRTC_LOGIN : 'token');
+const serverLoginMode = () => (LOGIN_MODES.includes(process.env.PLIVO_WEBRTC_LOGIN) ? process.env.PLIVO_WEBRTC_LOGIN : 'password');
 
 // ============================================================
-// @route   GET /api/calls/webrtc/login?mode=token|password
+// @route   GET /api/calls/webrtc/login?mode=token|password[&reset=1]
 // @desc    Which login the CRM should use for in-app calling, and for
 //          'password' the signed-in user's OWN endpoint username and
-//          password (over HTTPS, to that user only — never anyone else's).
-//          A missing stored password is reset on Plivo and stored first.
+//          password (over HTTPS, to that user only — never anyone else's,
+//          never cached, never logged). A missing stored password is set
+//          on Plivo and stored first; reset=1 (sent by the CRM after Plivo
+//          rejects a login) does the same even if one is stored.
 // @access  Private [owner]
 // ============================================================
 exports.webrtcLogin = async (req, res, next) => {
@@ -1011,11 +1017,13 @@ exports.webrtcLogin = async (req, res, next) => {
     if (failed) return failed;
     const endpointCheck = await verifyEndpoint(user);
 
-    if (!user.plivoEndpointPassword) {
+    const forceReset = req.query.reset === '1';
+    if (!user.plivoEndpointPassword || forceReset) {
       try {
         user.plivoEndpointPassword = await plivo.resetEndpointPassword(user.plivoEndpointId);
         await user.save();
-        console.info(`[calls] reset Plivo endpoint password for user=${user._id} (none stored)`);
+        // Never the password itself — only that it changed.
+        console.info(`[calls] set new Plivo endpoint password for user=${user._id} (${forceReset ? 'login rejected' : 'none stored'})`);
       } catch (err) {
         const { status, text } = plivoErrorDetail(err);
         console.error(`[calls] endpoint password reset failed: status=${status ?? '-'} detail=${text}`);

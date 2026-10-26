@@ -694,6 +694,24 @@ exports.setMe = async (req, res, next) => {
 //          it before expiresAt.
 // @access  Private [owner]
 // ============================================================
+// The Plivo SDK rejects with errors whose `message` can itself be an object
+// (Plivo's JSON error body), which printed as "[object Object]". Pull out
+// the HTTP status and the real body, whatever shape the error took.
+function plivoErrorDetail(err) {
+  const status = err?.response?.status ?? err?.status ?? err?.statusCode ?? null;
+  const raw = err?.response?.data ?? err?.response?.body ?? err?.message ?? err;
+  let text;
+  try {
+    text = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  } catch {
+    text = String(raw);
+  }
+  // An Error instance stringifies to "{}"; fall back to its own fields.
+  if (!text || text === '{}') text = String(err?.message || err?.name || err);
+  return { status, text };
+}
+exports.plivoErrorDetail = plivoErrorDetail;
+
 exports.webrtcToken = async (req, res, next) => {
   try {
     if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
@@ -708,13 +726,32 @@ exports.webrtcToken = async (req, res, next) => {
         await user.save();
         console.info(`[calls] created Plivo endpoint for user=${user._id}`);
       } catch (err) {
-        console.error('[calls] endpoint create failed:', err?.message || err);
-        return res.status(502).json({ success: false, message: `Could not set up in-app calling with Plivo${err?.message ? ` (${String(err.message).slice(0, 140)})` : ''}.` });
+        const { status, text } = plivoErrorDetail(err);
+        console.error(`[calls] endpoint create failed: status=${status ?? '-'} detail=${text}`, err);
+        // TEMPORARY: Plivo's own error text in the response, to diagnose
+        // in-app calling setup. Trim back to a plain message once fixed.
+        return res.status(502).json({
+          success: false,
+          stage  : 'endpoint',
+          plivoStatus: status,
+          message: `Could not set up in-app calling with Plivo (endpoint create, status ${status ?? '-'}): ${text.slice(0, 500)}`,
+        });
       }
     }
 
-    const { token, expiresAt } = plivo.accessToken(user.plivoEndpointUsername);
-    return res.json({ success: true, token, expiresAt });
+    let issued;
+    try {
+      issued = plivo.accessToken(user.plivoEndpointUsername);
+    } catch (err) {
+      const { status, text } = plivoErrorDetail(err);
+      console.error(`[calls] access token failed: status=${status ?? '-'} detail=${text}`, err);
+      return res.status(502).json({
+        success: false,
+        stage  : 'token',
+        message: `Could not issue an in-app calling token (status ${status ?? '-'}): ${text.slice(0, 500)}`,
+      });
+    }
+    return res.json({ success: true, token: issued.token, expiresAt: issued.expiresAt });
   } catch (err) {
     next(err);
   }

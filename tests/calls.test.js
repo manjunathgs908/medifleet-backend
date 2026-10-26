@@ -615,3 +615,29 @@ describe('in-app (WebRTC) calling', () => {
     expect(bad.res.statusCode).toBe(400);
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+describe('in-app token errors say what Plivo said', () => {
+  it('reports Plivo\'s error body instead of "[object Object]"', async () => {
+    User.findById.mockReturnValue(chain({ _id: 'u1', name: 'Desk', save: jest.fn() }));
+    const plivoErr = Object.assign(new Error('x'), {
+      message: { api_id: 'abc', error: 'endpoint creation not permitted for this account' },
+      status : 400,
+    });
+    mockCreateEndpoint.mockRejectedValue(plivoErr);
+
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.body.message).not.toContain('[object Object]');
+    expect(res.body.message).toContain('endpoint creation not permitted for this account');
+    expect(res.body.message).toContain('status 400');
+    expect(res.body.stage).toBe('endpoint');
+  });
+
+  it('reads an axios-style response body and status', () => {
+    const { status, text } = ctrl.plivoErrorDetail({ response: { status: 401, data: { error: 'authentication failed' } } });
+    expect(status).toBe(401);
+    expect(text).toBe('{"error":"authentication failed"}');
+  });
+});

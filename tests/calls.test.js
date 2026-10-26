@@ -551,21 +551,76 @@ describe('in-app (WebRTC) calling', () => {
     expect(phones).toEqual(['9000000002', '9000000003', '9876500000']);
   });
 
-  it('dials app users and phone users together, with the call id as a SIP header', async () => {
+  const mixedDuty = () => [
+    { callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: now(), phone: '9000000001' },
+    { callMode: 'phone', phone: '9000000002' },
+  ];
+
+  it('stage 1: rings only the in-app endpoints, for 15 seconds, with the call id as a SIP header', async () => {
     Trip.findOne.mockReturnValue(chain(null));
     require('../models').Lead.findOne.mockReturnValue(chain(null));
-    User.find.mockReturnValue(chain([
-      { callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: now(), phone: '9000000001' },
-      { callMode: 'phone', phone: '9000000002' },
-    ]));
+    User.find.mockReturnValue(chain(mixedDuty()));
 
     const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'in-app' } });
 
     expect(res.body).toContain('<User>sip:slaaaa1@phone.plivo.com</User>');
-    expect(res.body).toContain('<Number>919000000002</Number>');
+    expect(res.body).not.toContain('<Number>');
+    expect(res.body).toContain('timeout="15"');
+    expect(res.body).toContain('stage=app');
     expect(res.body).toContain('sipHeaders="logId=64b000000000000000000001"');
     expect(res.body).toContain('callerId="918065591088"');
     expect(res.body).toContain('<Record ');
+  });
+
+  // The guarantee: whatever the in-app leg reports — or nothing at all —
+  // the next thing is every on-duty phone ringing, never a dropped caller.
+  it.each([['no-answer'], ['busy'], ['failed'], ['timeout'], ['cancel'], ['']])(
+    'stage 2: an in-app leg ending "%s" rings every on-duty phone, recorded, from the company number',
+    async (dialStatus) => {
+      const log = logDoc({ direction: 'inbound', status: 'ringing' });
+      CallLog.findById.mockResolvedValue(log);
+      User.find.mockReturnValue(chain(mixedDuty()));
+
+      const { res } = await run(ctrl.events, {
+        method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'app' },
+        body: { DialStatus: dialStatus, DialBLegHangupCause: 'USER_NOT_REGISTERED' },
+      });
+
+      expect(res.body).toContain('<Number>919000000001</Number><Number>919000000002</Number>');
+      expect(res.body).not.toContain('<User>');
+      expect(res.body).toContain('callerId="918065591088"');
+      expect(res.body).toMatch(/<Record [^>]*startOnDialAnswer="true"/);
+      expect(res.body).toContain('stage=phone');
+      expect(res.body).not.toContain('<Speak');
+      expect(log.status).toBe('ringing');
+    },
+  );
+
+  it('an answered in-app leg ends the call normally, no phones rung', async () => {
+    const log = logDoc({ direction: 'inbound', status: 'ringing' });
+    CallLog.findById.mockResolvedValue(log);
+    const { res } = await run(ctrl.events, {
+      method: 'POST', query: { log: '64b000000000000000000001', leg: 'dial', stage: 'app' },
+      body: { DialStatus: 'completed', DialBLegDuration: '30' },
+    });
+    expect(res.body).toContain('<Hangup/>');
+    expect(log.status).toBe('completed');
+    expect(User.find).not.toHaveBeenCalled();
+  });
+
+  it('with nobody online in the app, phones ring straight away', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: stale(), phone: '9000000001' },
+      { callMode: 'phone', phone: '9000000002' },
+    ]));
+
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'in-off' } });
+
+    expect(res.body).toContain('<Number>919000000001</Number><Number>919000000002</Number>');
+    expect(res.body).not.toContain('<User>');
+    expect(res.body).toContain('stage=phone');
   });
 
   // A fake Plivo REST API: answers by method + path, records every call.

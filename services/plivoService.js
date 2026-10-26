@@ -246,15 +246,21 @@ async function issueToken(username) {
 // time (first to answer takes the call). The call-log id rides along to
 // the in-app legs as a SIP header (X-PH-logId), which is how the CRM's
 // ringing screen knows which call it is -- never the customer's number.
-function bridgeXml({ numbers = [], sipUsers = [], logId }) {
+// stage tags the Dial's action URL so /events knows what just finished:
+// 'app' (the in-app try, short timeout, phones follow if nobody answers)
+// or 'phone' (the last try). Every stage records whichever leg answers.
+const APP_RING_SECONDS = 15;
+const PHONE_RING_SECONDS = 40;
+
+function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
-  const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial`));
+  const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
   const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
     + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
   const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}"` : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
-    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="40" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
+    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
   );
 }
 
@@ -266,6 +272,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
+  APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

@@ -86,6 +86,24 @@ function routeIncoming(users) {
 }
 exports.routeIncoming = routeIncoming;
 
+// Every on-duty user's phone — in-app users included — for when nobody
+// answers in the app. Then PLIVO_FALLBACK_AGENTS if nobody has one.
+function fallbackPhones(users) {
+  let phones = [...new Set(users.map(ringPhoneOf).filter(isMobile))];
+  if (!phones.length) {
+    phones = String(process.env.PLIVO_FALLBACK_AGENTS || '')
+      .split(',').map((s) => s.trim()).filter(isMobile);
+  }
+  return phones.slice(0, MAX_INCOMING_AGENTS);
+}
+exports.fallbackPhones = fallbackPhones;
+
+const loadOnDuty = () => User.find({ role: 'owner', isActive: true, callDuty: true })
+  .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername')
+  .limit(MAX_INCOMING_AGENTS).lean();
+
+const BUSY_MESSAGE = 'Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.';
+
 const NOT_CONFIGURED = 'Calling is not set up: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER (91 followed by 10 digits) are needed on the server.';
 
 // Logs the call, then has Plivo ring the first party from PLIVO_NUMBER.
@@ -320,20 +338,18 @@ exports.incoming = async (req, res, next) => {
       Lead.findOne({ phone: phoneSuffixQuery(from) }).sort({ createdAt: -1 }).select('_id'),
     ]) : [null, null];
 
-    // Everyone on duty rings at once; the first to answer takes it. Each
-    // is rung the way they chose: in the CRM app (only while it is open and
-    // checking in) or on their phone. An in-app user whose app is closed or
-    // whose microphone is blocked falls back to their phone, so choosing
-    // "app" never means missing a call. All see PLIVO_NUMBER as the caller.
-    const onDuty = await User.find({ role: 'owner', isActive: true, callDuty: true })
-      .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername')
-      .limit(MAX_INCOMING_AGENTS).lean();
-    const { sipUsers, phones } = routeIncoming(onDuty);
-    let agentPhones = phones;
-    if (!agentPhones.length && !sipUsers.length) {
-      agentPhones = String(process.env.PLIVO_FALLBACK_AGENTS || '')
-        .split(',').map((s) => s.trim()).filter(isMobile).slice(0, MAX_INCOMING_AGENTS);
-    }
+    // Two stages, so a call is never dropped because an app wasn't there:
+    //   1. In-app users whose CRM is checking in ring in the app for
+    //      APP_RING_SECONDS (first to answer takes it).
+    //   2. If nobody answers in the app — logged out, backgrounded and
+    //      asleep, offline, mic blocked, anything — the Dial's action
+    //      (/events, stage=app) rings every on-duty phone instead, in-app
+    //      users' own phones included.
+    // With nobody online in the app, stage 2 runs straight away. All legs
+    // show PLIVO_NUMBER as the caller and are recorded.
+    const onDuty = await loadOnDuty();
+    const { sipUsers } = routeIncoming(onDuty);
+    const agentPhones = fallbackPhones(onDuty);
     const ringing = agentPhones.length + sipUsers.length;
 
     const log = await CallLog.create({
@@ -348,12 +364,13 @@ exports.incoming = async (req, res, next) => {
       status       : ringing ? 'ringing' : 'no_agents',
       endedAt      : ringing ? undefined : new Date(),
     });
-    plivo.logCall(`inbound ringing=${ringing} app=${sipUsers.length} phone=${agentPhones.length}`, log);
+    plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
 
-    if (!ringing) {
-      return sendXml(res, plivo.speakXml('Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.'));
+    if (!ringing) return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
+    if (sipUsers.length) {
+      return sendXml(res, plivo.bridgeXml({ sipUsers, logId: log._id, stage: 'app', timeout: plivo.APP_RING_SECONDS }));
     }
-    return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, sipUsers, logId: log._id }));
+    return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, logId: log._id, stage: 'phone' }));
   } catch (err) {
     next(err);
   }
@@ -381,6 +398,24 @@ exports.events = async (req, res, next) => {
 
     if (req.query.leg === 'dial') {
       const dialStatus = String(b.DialStatus || '').toLowerCase();
+
+      // Stage 1 (in-app) ended without an answer — for ANY reason, or with
+      // no status at all. Never strand the caller: ring every on-duty phone
+      // now. Only a completed app leg ends the call here.
+      if (req.query.stage === 'app' && dialStatus !== 'completed') {
+        const phones = fallbackPhones(await loadOnDuty());
+        console.info(`[calls] in-app leg not answered (DialStatus=${dialStatus || '-'} cause=${b.DialBLegHangupCause || '-'}) log=${logId || '-'} — ringing ${phones.length} phone(s)`);
+        if (log) {
+          log.status = phones.length ? 'ringing' : 'missed';
+          if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
+          await log.save();
+        }
+        if (phones.length && logId) {
+          return sendXml(res, plivo.bridgeXml({ numbers: phones, logId, stage: 'phone' }));
+        }
+        return sendXml(res, plivo.speakXml(BUSY_MESSAGE));
+      }
+
       if (log) {
         if (dialStatus === 'completed') {
           log.status = 'completed';

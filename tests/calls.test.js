@@ -33,7 +33,7 @@ const chain = (value) => {
 jest.mock('../models', () => ({
   Trip: { findOne: jest.fn() },
   Lead: { findById: jest.fn(), findOne: jest.fn() },
-  User: { find: jest.fn(), updateOne: jest.fn() },
+  User: { find: jest.fn(), updateOne: jest.fn(), findById: jest.fn() },
 }));
 jest.mock('../models/Ambulance', () => ({ exists: jest.fn() }));
 jest.mock('../models/Quote', () => ({ findById: jest.fn() }));
@@ -51,11 +51,12 @@ jest.mock('axios', () => {
 });
 
 const mockCreateCall = jest.fn();
+const mockCreateEndpoint = jest.fn();
 jest.mock('plivo', () => {
   const actual = jest.requireActual('plivo');
   return {
     ...actual,
-    Client: jest.fn(() => ({ calls: { create: mockCreateCall } })),
+    Client: jest.fn(() => ({ calls: { create: mockCreateCall }, endpoints: { create: mockCreateEndpoint } })),
   };
 });
 
@@ -531,5 +532,86 @@ describe('incoming calls always reach the CRM log', () => {
     expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({
       customerPhone: CUSTOMER, providerCallId: 'in-get', direction: 'inbound',
     }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('in-app (WebRTC) calling', () => {
+  const now = () => new Date();
+  const stale = () => new Date(Date.now() - 5 * 60 * 1000);
+
+  it('rings in the app only while it is open; otherwise falls back to the phone', () => {
+    const { sipUsers, phones } = ctrl.routeIncoming([
+      { callMode: 'app',   plivoEndpointUsername: 'slaaaa1', appOnlineAt: now(),   phone: '9000000001' },
+      { callMode: 'app',   plivoEndpointUsername: 'slbbbb2', appOnlineAt: stale(), phone: '9000000002' },
+      { callMode: 'app',   plivoEndpointUsername: null,      appOnlineAt: now(),   phone: '9000000003' },
+      { callMode: 'phone', plivoEndpointUsername: 'slcccc4', appOnlineAt: now(),   phone: '9000000004', callPhone: '9876500000' },
+    ]);
+    expect(sipUsers).toEqual(['slaaaa1']);
+    expect(phones).toEqual(['9000000002', '9000000003', '9876500000']);
+  });
+
+  it('dials app users and phone users together, with the call id as a SIP header', async () => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+    User.find.mockReturnValue(chain([
+      { callMode: 'app', plivoEndpointUsername: 'slaaaa1', appOnlineAt: now(), phone: '9000000001' },
+      { callMode: 'phone', phone: '9000000002' },
+    ]));
+
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'in-app' } });
+
+    expect(res.body).toContain('<User>sip:slaaaa1@phone.plivo.com</User>');
+    expect(res.body).toContain('<Number>919000000002</Number>');
+    expect(res.body).toContain('sipHeaders="logId=64b000000000000000000001"');
+    expect(res.body).toContain('callerId="918065591088"');
+    expect(res.body).toContain('<Record ');
+  });
+
+  it('issues a receive-only token, creating the user\'s endpoint the first time', async () => {
+    const userDoc = { _id: 'u1', name: 'Desk', save: jest.fn() };
+    User.findById.mockReturnValue(chain(userDoc));
+    mockCreateEndpoint.mockResolvedValue({ endpointId: 'ep1', username: 'slu1000123' });
+
+    const { res } = await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
+
+    expect(userDoc.plivoEndpointUsername).toBe('slu1000123');
+    expect(userDoc.save).toHaveBeenCalled();
+    const payload = JSON.parse(Buffer.from(res.body.token.split('.')[1], 'base64url').toString());
+    expect(payload.sub).toBe('slu1000123');
+    expect(payload.iss).toBe('MAXXXXXXXXXXXXXXXXXX');
+    expect(payload.grants.voice).toEqual({ incoming_allow: true, outgoing_allow: false });
+    expect(JSON.stringify(res.body)).not.toMatch(/password/i);
+  });
+
+  it('reuses an existing endpoint', async () => {
+    User.findById.mockReturnValue(chain({ _id: 'u1', plivoEndpointUsername: 'slu1000123', save: jest.fn() }));
+    await run(ctrl.webrtcToken, { user: { _id: 'u1' } });
+    expect(mockCreateEndpoint).not.toHaveBeenCalled();
+  });
+
+  it('records who answered in the app; a second claim changes nothing', async () => {
+    CallLog.findOneAndUpdate = jest.fn().mockResolvedValueOnce({ _id: 'l1' }).mockResolvedValueOnce(null);
+    const first  = await run(ctrl.markAnswered, { params: { id: '64b000000000000000000001' }, user: { _id: 'u1', name: 'A' } });
+    const second = await run(ctrl.markAnswered, { params: { id: '64b000000000000000000001' }, user: { _id: 'u2', name: 'B' } });
+    expect(CallLog.findOneAndUpdate.mock.calls[0][0]).toEqual(expect.objectContaining({ agentUser: { $exists: false } }));
+    expect(first.res.body.claimed).toBe(true);
+    expect(second.res.body.claimed).toBe(false);
+  });
+
+  it('presence check-ins mark the app open; leaving clears it', async () => {
+    await run(ctrl.webrtcPresence, { user: { _id: 'u1' }, body: { online: true } });
+    expect(User.updateOne.mock.calls[0][1]).toEqual({ $set: { appOnlineAt: expect.any(Date) } });
+    await run(ctrl.webrtcPresence, { user: { _id: 'u1' }, body: { online: false } });
+    expect(User.updateOne.mock.calls[1][1]).toEqual({ $unset: { appOnlineAt: 1 } });
+  });
+
+  it('lets a user choose to ring in the app', async () => {
+    User.findByIdAndUpdate = jest.fn(() => chain({ phone: '9000000001', callMode: 'app' }));
+    const { res } = await run(ctrl.setMe, { user: { _id: 'u1' }, body: { callMode: 'app' } });
+    expect(User.findByIdAndUpdate.mock.calls[0][1]).toEqual({ $set: { callMode: 'app' } });
+    expect(res.body.me.callMode).toBe('app');
+    const bad = await run(ctrl.setMe, { user: { _id: 'u1' }, body: { callMode: 'carrier-pigeon' } });
+    expect(bad.res.statusCode).toBe(400);
   });
 });

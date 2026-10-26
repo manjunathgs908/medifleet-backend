@@ -31,6 +31,12 @@ router.put('/duty', protect, authorize('owner'), ctrl.setDuty);
 router.get('/me',     protect, authorize('owner'), ctrl.getMe);
 router.put('/me',     protect, authorize('owner'), ctrl.setMe);
 router.get('/config', protect, authorize('owner'), ctrl.getConfig);
+
+// In-app (WebRTC) calling for CRM staff.
+router.get ('/webrtc/token',    protect, authorize('owner'), ctrl.webrtcToken);
+router.post('/webrtc/presence', protect, authorize('owner'), ctrl.webrtcPresence);
+router.get ('/:id',             protect, authorize('owner'), ctrl.getCall);
+router.post('/:id/answered',    protect, authorize('owner'), ctrl.markAnswered);
 // Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
 // sent to the browser).
 router.get('/:id/recording', protect, authorize('owner'), ctrl.streamRecording);

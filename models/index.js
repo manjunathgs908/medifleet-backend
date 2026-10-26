@@ -123,6 +123,22 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
       },
     },
 
+    // How incoming calls reach this user while on call duty:
+    //   'phone' -- Plivo rings their call ring number (above).
+    //   'app'   -- Plivo rings the CRM itself over WebRTC (Plivo Browser
+    //              SDK). Only while the CRM is open and checking in
+    //              (appOnlineAt); otherwise it falls back to their phone.
+    callMode      : { type: String, enum: ['phone', 'app'], default: 'phone' },
+
+    // Their own Plivo endpoint, created on first use of in-app calling.
+    // The browser never gets its password -- it logs in with a short-lived
+    // access token issued for this username (GET /api/calls/webrtc/token).
+    plivoEndpointId      : { type: String, select: false },
+    plivoEndpointUsername: { type: String, select: false },
+
+    // Last check-in from an open, registered CRM tab. Server time.
+    appOnlineAt   : { type: Date },
+
     // â”€â”€ Driver current availability (synced from mobile app) â”€â”€
     availability  : {
       status   : { type: String, enum: ['available', 'on_trip', 'offline'], default: 'offline' },

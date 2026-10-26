@@ -69,6 +69,23 @@ function agentOf(req) {
   };
 }
 
+// An open CRM tab checks in every 30s; two missed check-ins and it counts
+// as closed (its user is rung on their phone instead).
+const APP_ONLINE_WINDOW_MS = 75 * 1000;
+const isAppOnline = (u) => !!u.appOnlineAt && Date.now() - new Date(u.appOnlineAt).getTime() < APP_ONLINE_WINDOW_MS;
+
+// Splits on-duty users into in-app endpoints to ring and phones to ring.
+function routeIncoming(users) {
+  const sipUsers = [];
+  const phones = [];
+  for (const u of users) {
+    if (u.callMode === 'app' && u.plivoEndpointUsername && isAppOnline(u)) sipUsers.push(u.plivoEndpointUsername);
+    else if (isMobile(ringPhoneOf(u))) phones.push(ringPhoneOf(u));
+  }
+  return { sipUsers, phones };
+}
+exports.routeIncoming = routeIncoming;
+
 const NOT_CONFIGURED = 'Calling is not set up: PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN and PLIVO_NUMBER (91 followed by 10 digits) are needed on the server.';
 
 // Logs the call, then has Plivo ring the first party from PLIVO_NUMBER.
@@ -303,15 +320,21 @@ exports.incoming = async (req, res, next) => {
       Lead.findOne({ phone: phoneSuffixQuery(from) }).sort({ createdAt: -1 }).select('_id'),
     ]) : [null, null];
 
-    // Each on-duty user's call ring number (else their login number). They
-    // see PLIVO_NUMBER as the caller, never the customer's number.
+    // Everyone on duty rings at once; the first to answer takes it. Each
+    // is rung the way they chose: in the CRM app (only while it is open and
+    // checking in) or on their phone. An in-app user whose app is closed or
+    // whose microphone is blocked falls back to their phone, so choosing
+    // "app" never means missing a call. All see PLIVO_NUMBER as the caller.
     const onDuty = await User.find({ role: 'owner', isActive: true, callDuty: true })
-      .select('name phone callPhone').limit(MAX_INCOMING_AGENTS).lean();
-    let agentPhones = onDuty.map(ringPhoneOf).filter(isMobile);
-    if (!agentPhones.length) {
+      .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername')
+      .limit(MAX_INCOMING_AGENTS).lean();
+    const { sipUsers, phones } = routeIncoming(onDuty);
+    let agentPhones = phones;
+    if (!agentPhones.length && !sipUsers.length) {
       agentPhones = String(process.env.PLIVO_FALLBACK_AGENTS || '')
         .split(',').map((s) => s.trim()).filter(isMobile).slice(0, MAX_INCOMING_AGENTS);
     }
+    const ringing = agentPhones.length + sipUsers.length;
 
     const log = await CallLog.create({
       provider     : 'plivo',
@@ -322,15 +345,15 @@ exports.incoming = async (req, res, next) => {
       providerCallId: plivoParams(req).CallUUID,
       trip         : trip?._id,
       lead         : lead?._id,
-      status       : agentPhones.length ? 'ringing' : 'no_agents',
-      endedAt      : agentPhones.length ? undefined : new Date(),
+      status       : ringing ? 'ringing' : 'no_agents',
+      endedAt      : ringing ? undefined : new Date(),
     });
-    plivo.logCall(`inbound ringing=${agentPhones.length}`, log);
+    plivo.logCall(`inbound ringing=${ringing} app=${sipUsers.length} phone=${agentPhones.length}`, log);
 
-    if (!agentPhones.length) {
+    if (!ringing) {
       return sendXml(res, plivo.speakXml('Thank you for calling SaveLife. All our team members are busy right now. Please call again in a few minutes, or message us on WhatsApp.'));
     }
-    return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, logId: log._id }));
+    return sendXml(res, plivo.bridgeXml({ numbers: agentPhones, sipUsers, logId: log._id }));
   } catch (err) {
     next(err);
   }
@@ -594,7 +617,10 @@ exports.setDuty = async (req, res, next) => {
     if (onDuty && !isMobile(ringPhoneOf(req.user))) {
       return res.status(400).json({ success: false, message: 'Your account has no valid mobile number to ring. Set your call ring number on the Staff page.' });
     }
-    await User.updateOne({ _id: req.user._id }, { $set: { callDuty: onDuty } });
+    // Going off duty also drops in-app presence, so nothing rings this app.
+    await User.updateOne({ _id: req.user._id }, onDuty
+      ? { $set: { callDuty: true } }
+      : { $set: { callDuty: false }, $unset: { appOnlineAt: 1 } });
     return res.json({ success: true, onDuty });
   } catch (err) {
     next(err);
@@ -610,6 +636,8 @@ const meView = (u) => ({
   ringPhone  : ringPhoneOf(u) || null,             // what Plivo actually rings
   usingLogin : !u.callPhone,
   onDuty     : !!u.callDuty,
+  callMode   : u.callMode || 'phone',              // 'app' | 'phone'
+  appOnline  : isAppOnline(u),                     // an open CRM is checking in
   callerId   : plivo.companyNumber() || null,      // what customers see
 });
 
@@ -623,20 +651,133 @@ const meView = (u) => ({
 // ============================================================
 exports.getMe = async (req, res) => res.json({ success: true, me: meView(req.user) });
 
+// Body may carry callPhone, callMode, or both; whatever is absent is left
+// as it is.
 exports.setMe = async (req, res, next) => {
   try {
-    const raw = req.body?.callPhone;
-    const cleared = raw === null || raw === undefined || String(raw).trim() === '';
-    const callPhone = cleared ? null : normalisePhone(raw);
-    if (!cleared && !/^[6-9]\d{9}$/.test(callPhone)) {
-      return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
+    const update = { $set: {}, $unset: {} };
+
+    if ('callPhone' in (req.body || {})) {
+      const raw = req.body.callPhone;
+      const cleared = raw === null || raw === undefined || String(raw).trim() === '';
+      const callPhone = cleared ? null : normalisePhone(raw);
+      if (!cleared && !/^[6-9]\d{9}$/.test(callPhone)) {
+        return res.status(400).json({ success: false, message: 'Enter a valid 10-digit Indian mobile number.' });
+      }
+      if (cleared) update.$unset.callPhone = 1; else update.$set.callPhone = callPhone;
     }
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      cleared ? { $unset: { callPhone: 1 } } : { $set: { callPhone } },
-      { new: true, runValidators: true },
-    ).select('phone callPhone callDuty');
+    if ('callMode' in (req.body || {})) {
+      if (!['app', 'phone'].includes(req.body.callMode)) {
+        return res.status(400).json({ success: false, message: 'callMode must be "app" or "phone".' });
+      }
+      update.$set.callMode = req.body.callMode;
+      if (req.body.callMode === 'phone') update.$unset.appOnlineAt = 1;
+    }
+    if (!Object.keys(update.$set).length) delete update.$set;
+    if (!Object.keys(update.$unset).length) delete update.$unset;
+    if (!update.$set && !update.$unset) return res.json({ success: true, me: meView(req.user) });
+
+    const user = await User.findByIdAndUpdate(req.user._id, update, { new: true, runValidators: true })
+      .select('phone callPhone callDuty callMode appOnlineAt');
     return res.json({ success: true, me: meView(user) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/calls/webrtc/token
+// @desc    Lets this CRM tab register with Plivo to receive calls in the
+//          browser. Creates the user's endpoint on first use; returns a
+//          receive-only access token for it (no password). The CRM renews
+//          it before expiresAt.
+// @access  Private [owner]
+// ============================================================
+exports.webrtcToken = async (req, res, next) => {
+  try {
+    if (!plivo.isConfigured()) return res.status(503).json({ success: false, message: NOT_CONFIGURED });
+
+    const user = await User.findById(req.user._id).select('name +plivoEndpointId +plivoEndpointUsername');
+    if (!user.plivoEndpointUsername) {
+      try {
+        const ep = await plivo.createEndpoint({ userId: user._id, name: user.name });
+        if (!ep.username) throw new Error('Plivo returned no endpoint username');
+        user.plivoEndpointId = ep.id;
+        user.plivoEndpointUsername = ep.username;
+        await user.save();
+        console.info(`[calls] created Plivo endpoint for user=${user._id}`);
+      } catch (err) {
+        console.error('[calls] endpoint create failed:', err?.message || err);
+        return res.status(502).json({ success: false, message: `Could not set up in-app calling with Plivo${err?.message ? ` (${String(err.message).slice(0, 140)})` : ''}.` });
+      }
+    }
+
+    const { token, expiresAt } = plivo.accessToken(user.plivoEndpointUsername);
+    return res.json({ success: true, token, expiresAt });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/calls/webrtc/presence { online }
+// @desc    Check-in from a CRM tab that is registered with Plivo and has
+//          microphone access (online: true, every 30s), or leaving
+//          (online: false). Incoming calls ring this user in the app only
+//          while check-ins are fresh; otherwise on their phone.
+// @access  Private [owner]
+// ============================================================
+exports.webrtcPresence = async (req, res, next) => {
+  try {
+    const online = !!req.body?.online;
+    await User.updateOne({ _id: req.user._id }, online
+      ? { $set: { appOnlineAt: new Date() } }
+      : { $unset: { appOnlineAt: 1 } });
+    return res.json({ success: true, online });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/calls/:id
+// @desc    One call, masked — what the in-app ringing screen shows.
+// @access  Private [owner]
+// ============================================================
+exports.getCall = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const log = await CallLog.findById(req.params.id)
+      .select('+customerPhone') // only so toJSON can mask it
+      .populate('trip', 'tripNumber patientName status')
+      .populate('lead', 'patientName');
+    if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });
+    return res.json({ success: true, log });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   POST /api/calls/:id/answered
+// @desc    The CRM user who answered an incoming call in the app — Plivo's
+//          Dial does not say which of the ringing legs picked up.
+// @access  Private [owner]
+// ============================================================
+exports.markAnswered = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const updated = await CallLog.findOneAndUpdate(
+      // First answer wins, matching Plivo: a later claim changes nothing.
+      { _id: req.params.id, direction: 'inbound', agentUser: { $exists: false } },
+      { $set: { agentUser: req.user._id, agentName: req.user.name, agentType: 'staff', answeredAt: new Date() } },
+      { new: true },
+    );
+    return res.json({ success: true, claimed: !!updated });
   } catch (err) {
     next(err);
   }

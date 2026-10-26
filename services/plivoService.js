@@ -134,19 +134,56 @@ const esc = (v) => String(v)
 
 const xml = (body) => `<?xml version="1.0" encoding="UTF-8"?>\n<Response>${body}</Response>`;
 
+// ── In-app (WebRTC) calling ────────────────────────────────────────────────
+// Each CRM user who rings in the app gets their own Plivo endpoint. Plivo
+// rings it with <User>sip:<username>@phone.plivo.com</User>, and the
+// browser registers as that username with an access token: a JWT signed
+// with our auth token whose only grant is RECEIVING calls. The endpoint's
+// password is random, never stored, never sent anywhere.
+const SIP_DOMAIN = 'phone.plivo.com';
+const sipUri = (username) => `sip:${username}@${SIP_DOMAIN}`;
+
+const TOKEN_LIFETIME_SEC = 12 * 60 * 60; // one long shift; the CRM renews before it lapses
+
+async function createEndpoint({ userId, name }) {
+  const crypto = require('crypto');
+  // Plivo appends digits to whatever username it is given; the real one
+  // comes back in the response and is what we store.
+  const base = `sl${String(userId).slice(-8)}`;
+  const password = crypto.randomBytes(18).toString('base64url');
+  const alias = `SaveLife CRM ${String(name || '').replace(/[^\w ]/g, '').slice(0, 30) || String(userId).slice(-6)}`;
+  const res = await getClient().endpoints.create(base, password, alias);
+  return { id: res.endpointId || res.endpoint_id, username: res.username };
+}
+
+function accessToken(username) {
+  const token = new plivo.AccessToken(
+    process.env.PLIVO_AUTH_ID, process.env.PLIVO_AUTH_TOKEN, username,
+    { lifetime: TOKEN_LIFETIME_SEC },
+  );
+  token.addVoiceGrants(true, false); // receive only
+  return { token: token.toJwt(), expiresAt: new Date(Date.now() + TOKEN_LIFETIME_SEC * 1000) };
+}
+
 // Record + Dial is Plivo's way to record a bridged call: <Record> placed
 // before <Dial> with startOnDialAnswer records the whole conversation from
 // the moment the other side picks up, and redirect="false" keeps it from
 // taking over the call flow. Both sides see only the company number.
 // Dial's action is told the outcome; with redirect it also decides what the
 // caller hears after (see dialFinished).
-function bridgeXml({ numbers, logId }) {
+// numbers: phones to ring; sipUsers: in-app endpoints to ring at the same
+// time (first to answer takes the call). The call-log id rides along to
+// the in-app legs as a SIP header (X-PH-logId), which is how the CRM's
+// ringing screen knows which call it is -- never the customer's number.
+function bridgeXml({ numbers = [], sipUsers = [], logId }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
   const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial`));
-  const nums = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('');
+  const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
+    + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
+  const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}"` : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
-    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="40" timeLimit="3600">${nums}</Dial>`,
+    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="40" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
   );
 }
 
@@ -157,6 +194,7 @@ const emptyXml = () => xml('');
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
+  createEndpoint, accessToken, sipUri,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

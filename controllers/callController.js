@@ -218,12 +218,41 @@ exports.clickToCall = async (req, res, next) => {
 
 
 // ── Plivo webhooks ─────────────────────────────────────────────────────────
+// Every hit is logged and counted BEFORE the signature check, so "Plivo
+// never called us" and "Plivo called us and we refused it" can be told
+// apart — from the Render log, or from the CRM via GET /api/calls/config.
+// In memory: it covers this server process since its last deploy, which is
+// the window anyone checking "did the call just now reach us?" needs.
+const WEBHOOKS = ['answer', 'incoming', 'events', 'recording'];
+const SERVER_STARTED_AT = new Date();
+const webhookStats = Object.fromEntries(WEBHOOKS.map((w) => [w, {
+  hits: 0, accepted: 0, rejected: 0, lastHitAt: null, lastAcceptedAt: null, lastRejectedAt: null, lastRejectReason: null,
+}]));
+exports.webhookStats = webhookStats;
+
+const webhookName = (req) => String(req.path || '').replace(/^\/+|\/+$/g, '') || 'unknown';
+
 // Signed by Plivo; anything else gets a 403 and no XML.
 exports.requirePlivoSignature = (req, res, next) => {
-  if (plivo.isValidSignature(req)) return next();
-  console.warn('[calls] Rejected unsigned Plivo webhook:', req.method, req.originalUrl);
+  const name = webhookName(req);
+  const stats = webhookStats[name];
+  const b = plivoParams(req);
+  console.info(`[calls] ${name} webhook hit method=${req.method} callUUID=${b.CallUUID || '-'} direction=${b.Direction || '-'} status=${b.CallStatus || b.DialStatus || '-'} log=${req.query?.log || '-'}`);
+  if (stats) { stats.hits += 1; stats.lastHitAt = new Date(); }
+
+  const check = plivo.checkSignature(req);
+  if (check.ok) {
+    if (stats) { stats.accepted += 1; stats.lastAcceptedAt = new Date(); }
+    return next();
+  }
+  console.warn(`[calls] ${name} webhook REJECTED: ${check.reason}`);
+  if (stats) { stats.rejected += 1; stats.lastRejectedAt = new Date(); stats.lastRejectReason = check.reason; }
   return res.status(403).type('text/plain').send('Forbidden');
 };
+
+// Plivo sends its fields in the body for POST and in the query for GET --
+// whichever the Plivo console is set to.
+const plivoParams = (req) => (req.method === 'POST' ? (req.body || {}) : (req.query || {}));
 
 const logIdOf = (req) => (isObjectId(String(req.query.log || '')) ? String(req.query.log) : null);
 
@@ -246,7 +275,7 @@ exports.answer = async (req, res, next) => {
 
     log.status = 'agent_answered';
     log.answeredAt = new Date();
-    if (req.body?.CallUUID) log.providerCallId = req.body.CallUUID;
+    if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
     await log.save();
 
     return sendXml(res, plivo.bridgeXml({ numbers: [other], logId: log._id }));
@@ -265,7 +294,7 @@ exports.answer = async (req, res, next) => {
 // ============================================================
 exports.incoming = async (req, res, next) => {
   try {
-    const from = normalisePhone(req.body?.From);
+    const from = normalisePhone(plivoParams(req).From);
 
     // Link it to what we know about this caller, so the CRM's call history
     // shows "Trip TRP-…" rather than a bare masked number.
@@ -290,7 +319,7 @@ exports.incoming = async (req, res, next) => {
       direction    : 'inbound',
       context      : 'incoming',
       customerPhone: from || undefined,
-      providerCallId: req.body?.CallUUID,
+      providerCallId: plivoParams(req).CallUUID,
       trip         : trip?._id,
       lead         : lead?._id,
       status       : agentPhones.length ? 'ringing' : 'no_agents',
@@ -321,7 +350,7 @@ const DIAL_FAIL      = { busy: 'customer_busy', 'no-answer': 'customer_missed', 
 // ============================================================
 exports.events = async (req, res, next) => {
   try {
-    const b = req.body || {};
+    const b = plivoParams(req);
     const logId = logIdOf(req);
     const log = logId
       ? await CallLog.findById(logId)
@@ -366,6 +395,37 @@ exports.events = async (req, res, next) => {
       if (b.HangupCause && !log.hangupCause) log.hangupCause = b.HangupCause;
       log.endedAt = new Date();
       await log.save();
+      plivo.logCall(`hangup status=${log.status}`, log);
+    } else if (String(b.Direction || '').toLowerCase() === 'inbound' && b.CallUUID) {
+      // An incoming call we have no log for: /incoming never ran for it
+      // (Plivo's number not linked to our application, or the answer
+      // webhook was rejected). Log it from the hangup anyway, so it shows
+      // in the CRM's Call Logs instead of vanishing — marked as not routed
+      // by the CRM, since nothing here decided who it rang.
+      const from = normalisePhone(b.From);
+      const [trip, lead] = from.length === 10 ? await Promise.all([
+        Trip.findOne({ patientPhone: phoneSuffixQuery(from) }).sort({ createdAt: -1 }).select('_id'),
+        Lead.findOne({ phone: phoneSuffixQuery(from) }).sort({ createdAt: -1 }).select('_id'),
+      ]) : [null, null];
+      const total = Number(b.Duration);
+      const created = await CallLog.create({
+        provider      : 'plivo',
+        callerId      : normalisePhone(b.To).length === 10 ? `91${normalisePhone(b.To)}` : plivo.companyNumber(),
+        direction     : 'inbound',
+        context       : 'incoming',
+        customerPhone : from || undefined,
+        providerCallId: b.CallUUID,
+        trip          : trip?._id,
+        lead          : lead?._id,
+        status        : 'not_routed',
+        hangupCause   : b.HangupCause,
+        totalSec      : Number.isFinite(total) ? total : undefined,
+        startedAt     : b.StartTime ? new Date(b.StartTime) : new Date(),
+        endedAt       : new Date(),
+      });
+      console.warn(`[calls] inbound call ${b.CallUUID} reached hangup with no /incoming log — logged as not_routed (log=${created._id}). Check the Plivo number is linked to the "SaveLife CRM" application.`);
+    } else {
+      console.info(`[calls] events webhook: no call log for callUUID=${b.CallUUID || '-'} direction=${b.Direction || '-'}`);
     }
     return sendXml(res, plivo.emptyXml());
   } catch (err) {
@@ -382,7 +442,7 @@ exports.events = async (req, res, next) => {
 // ============================================================
 exports.recording = async (req, res, next) => {
   try {
-    const b = req.body || {};
+    const b = plivoParams(req);
     const logId = logIdOf(req);
     if (logId && (b.RecordUrl || b.RecordingID)) {
       const update = {};
@@ -596,4 +656,11 @@ exports.getConfig = async (req, res) => res.json({
   // The only remaining Exotel path: /api/call/connect, and only while
   // Plivo is not configured.
   legacyExotelActive: !plivo.isConfigured() && !!(process.env.EXOTEL_SID && process.env.EXOTEL_API_KEY),
+  // The URLs the Plivo application must use, and what each webhook has
+  // seen since this server last started — "never hit" means Plivo is not
+  // sending to us; "rejected" carries the reason.
+  incomingAnswerUrl: plivo.apiUrl('/api/calls/incoming'),
+  hangupUrl        : plivo.apiUrl('/api/calls/events'),
+  webhooks         : webhookStats,
+  serverStartedAt  : SERVER_STARTED_AT,
 });

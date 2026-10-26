@@ -86,21 +86,46 @@ function friendlyError(err) {
 
 // ── Request signatures ─────────────────────────────────────────────────────
 // Every webhook below hands Plivo a customer's number inside its XML, so an
-// unsigned request must get nothing. Plivo signs the exact URL it called,
-// which is our public URL -- rebuilt from PUBLIC_API_BASE rather than from
-// the request's own host, which Render's proxy rewrites.
-function isValidSignature(req) {
+// unsigned request must get nothing. Plivo signs the exact URL it called --
+// which is whatever was typed into the Plivo console, so http vs https, a
+// trailing slash, or the Render hostname all change it. Each of those
+// spellings of OUR endpoint is tried; the HMAC with our auth token is still
+// what decides. Returns { ok, reason } so a rejection can say why: a
+// silent 403 here is exactly how an incoming call goes unlogged.
+function signatureCandidates(req) {
+  const [path, query] = req.originalUrl.split('?');
+  const q = query ? `?${query}` : '';
+  const paths = new Set([path, path.endsWith('/') ? path.slice(0, -1) : `${path}/`]);
+  const bases = new Set([PUBLIC_API_BASE, PUBLIC_API_BASE.replace(/^https:/, 'http:')]);
+  const host = req.get?.('x-forwarded-host') || req.get?.('host');
+  if (host) {
+    bases.add(`https://${host}`);
+    bases.add(`http://${host}`);
+  }
+  const urls = [];
+  for (const b of bases) for (const p of paths) urls.push(`${b}${p}${q}`);
+  return urls;
+}
+
+function checkSignature(req) {
   const token = process.env.PLIVO_AUTH_TOKEN;
   const signature = req.get('X-Plivo-Signature-V3');
   const nonce = req.get('X-Plivo-Signature-V3-Nonce');
-  if (!token || !signature || !nonce) return false;
-  try {
-    const params = req.method === 'POST' ? (req.body || {}) : {};
-    return plivo.validateV3Signature(req.method, apiUrl(req.originalUrl), nonce, token, signature, params);
-  } catch {
-    return false;
+  if (!token) return { ok: false, reason: 'PLIVO_AUTH_TOKEN is not set on the server' };
+  if (!signature || !nonce) return { ok: false, reason: 'request carried no X-Plivo-Signature-V3 headers (not from Plivo)' };
+  const params = req.method === 'POST' ? (req.body || {}) : {};
+  for (const url of signatureCandidates(req)) {
+    try {
+      if (plivo.validateV3Signature(req.method, url, nonce, token, signature, params)) return { ok: true, url };
+    } catch { /* try the next spelling */ }
   }
+  return {
+    ok    : false,
+    reason: `signature did not match ${apiUrl(req.originalUrl)} (or its http/trailing-slash/host variants) — check the URL in the Plivo console and PLIVO_AUTH_TOKEN`,
+  };
 }
+
+const isValidSignature = (req) => checkSignature(req).ok;
 
 // ── XML ────────────────────────────────────────────────────────────────────
 const esc = (v) => String(v)
@@ -131,7 +156,7 @@ const emptyXml = () => xml('');
 
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
-  callFirstLeg, logCall, friendlyError, isValidSignature,
+  callFirstLeg, logCall, friendlyError, isValidSignature, checkSignature,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

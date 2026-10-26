@@ -257,7 +257,8 @@ function sign(url, params, nonce, token) {
   const body = keys.map((k) => `${k}${params[k]}`).join('');
   const [base, query] = url.split('?');
   const sortedQuery = query ? query.split('&').sort().join('&') : '';
-  let signed = sortedQuery ? `${base}?${sortedQuery}` : base;
+  // A POST with parameters always gets the '?', even with no query string.
+  let signed = (sortedQuery || keys.length) ? `${base}?${sortedQuery}` : base;
   if (sortedQuery && keys.length) signed += '.';
   signed += body;
   return crypto.createHmac('sha256', token).update(`${signed}.${nonce}`).digest('base64');
@@ -470,5 +471,65 @@ describe('own call settings', () => {
   it('reports the live provider and caller ID', async () => {
     const { res } = await run(ctrl.getConfig, {});
     expect(res.body).toEqual(expect.objectContaining({ provider: 'plivo', callerId: '918065591088', legacyExotelActive: false }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('incoming calls always reach the CRM log', () => {
+  const body = { CallUUID: 'in-9', From: '919986844442', To: '918065591088', Direction: 'inbound' };
+  const signedReq = (url, path) => ({
+    method: 'POST', originalUrl: path, path: '/incoming', body, query: {},
+    get: (h) => ({
+      'X-Plivo-Signature-V3'      : sign(url, body, 'n-2', 'plivo-test-token'),
+      'X-Plivo-Signature-V3-Nonce': 'n-2',
+    })[h],
+  });
+
+  it('accepts Plivo\'s signature when the console URL has a trailing slash', () => {
+    const next = jest.fn();
+    const req = signedReq('https://api.savelife.health/api/calls/incoming/', '/api/calls/incoming');
+    ctrl.requirePlivoSignature(req, mockRes(), next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('counts every hit and records WHY one was rejected', () => {
+    const before = ctrl.webhookStats.incoming.rejected;
+    const res = mockRes();
+    ctrl.requirePlivoSignature({
+      method: 'POST', originalUrl: '/api/calls/incoming', path: '/incoming', body, query: {},
+      get: () => undefined,
+    }, res, jest.fn());
+    expect(res.statusCode).toBe(403);
+    expect(ctrl.webhookStats.incoming.rejected).toBe(before + 1);
+    expect(ctrl.webhookStats.incoming.lastRejectReason).toMatch(/no X-Plivo-Signature-V3/);
+    expect(ctrl.webhookStats.incoming.lastHitAt).toBeInstanceOf(Date);
+  });
+
+  it('logs an incoming call from its hangup when /incoming never ran for it', async () => {
+    CallLog.findOne.mockResolvedValue(null);
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+
+    await run(ctrl.events, {
+      method: 'POST', query: {},
+      body: { ...body, CallStatus: 'completed', Duration: '42', HangupCause: 'NORMAL_CLEARING' },
+    });
+
+    expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      direction: 'inbound', status: 'not_routed', customerPhone: CUSTOMER, providerCallId: 'in-9',
+      callerId: '918065591088', totalSec: 42,
+    }));
+  });
+
+  it('reads Plivo\'s fields from the query when the console is set to GET', async () => {
+    User.find.mockReturnValue(chain([{ phone: '9000000001' }]));
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+
+    await run(ctrl.incoming, { method: 'GET', query: { From: '919986844442', CallUUID: 'in-get' }, body: {} });
+
+    expect(CallLog.create.mock.calls[0][0]).toEqual(expect.objectContaining({
+      customerPhone: CUSTOMER, providerCallId: 'in-get', direction: 'inbound',
+    }));
   });
 });

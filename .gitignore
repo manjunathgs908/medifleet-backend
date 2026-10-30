@@ -6,3 +6,9 @@ body.json
 
 # Local database dumps from scripts/backup-db.js — never commit production data.
 backups/
+
+# One-off migration backups. scripts/updateGuidePhoneNumber.js writes a full
+# snapshot of every document it is about to touch; that is the restore path and
+# belongs on disk, not in the repo -- they are large article dumps and a stray
+# `git add -A` would otherwise sweep them in.
+scripts/guides-backup-*.json

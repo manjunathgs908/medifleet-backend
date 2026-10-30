@@ -131,13 +131,31 @@ function walkStrings(node, prefix, out) {
   return out;
 }
 
+/**
+ * "faqs[0].a" -> "faqs.0.a"
+ *
+ * walkStrings() reports array positions in bracket form because it reads
+ * better in the report; MongoDB's $set wants dot-and-index. Converting here
+ * keeps the readable form in the log and the correct form on the wire.
+ */
+const toMongoPath = (p) => p.replace(/\[(\d+)\]/g, '.$1');
+
+/**
+ * Host and database only, never credentials.
+ *
+ * new URL() cannot parse a multi-host replica-set URI --
+ * mongodb://a:27017,b:27017,c:27017/db -- because of the commas, so the
+ * previous version printed "(unparseable MONGO_URI)" for a perfectly valid
+ * connection string and told the operator nothing about which database they
+ * were about to write to. Parsed by hand instead.
+ */
 const safeTarget = (uri) => {
-  try {
-    const u = new URL(uri);
-    return `${u.protocol}//${u.host}${u.pathname}`;
-  } catch {
-    return '(unparseable MONGO_URI)';
-  }
+  const scheme = uri.split('://')[0] || '?';
+  const rest = uri.includes('@') ? uri.split('@').slice(1).join('@') : (uri.split('://')[1] || '');
+  const hosts = (rest.split('/')[0] || '').split(',');
+  const db = ((rest.split('/')[1] || '').split('?')[0]) || '(driver default)';
+  const host = hosts.length > 1 ? `${hosts[0]} (+${hosts.length - 1} more)` : hosts[0];
+  return `${scheme}://${host}  db=${db}`;
 };
 
 (async () => {
@@ -222,21 +240,44 @@ const safeTarget = (uri) => {
     let fieldsWritten = 0;
     for (const r of inScope) {
       console.log(`  ${r.slug}`);
-      // Mutate through the hydrated document and let Mongoose cast and write.
-      // A hand-built $set cannot address a nested array element on a Mixed
-      // subtree reliably, and doc.set() handles the dotted/indexed path.
-      const fresh = await SeoArticle.findById(r.doc._id);
+
+      // One explicit $set per changed field, through the NATIVE driver.
+      //
+      // The first run used a hydrated document and doc.set(path, value), and
+      // it silently lost every nested edit: content and metaDescription saved,
+      // faqs[].a, schema[...] and jsonLd[...] did not. Two reasons, both fatal
+      // on their own:
+      //
+      //   - the paths here are bracket-indexed ("faqs[0].a"), which is not a
+      //     Mongoose path. Mongoose wants "faqs.0.a", so the set either landed
+      //     on a literal key or did nothing.
+      //   - jsonLd is Schema.Types.Mixed and `schema` is the legacy name that
+      //     is not in the schema at all. Mongoose cannot change-track a Mixed
+      //     subtree, so even a correct path needs markModified() to persist.
+      //
+      // $set with dot-and-index notation addresses nested paths explicitly, so
+      // neither problem applies. Going through SeoArticle.collection rather
+      // than the model is deliberate: strict mode would strip `schema.*` from
+      // the update because that path is not in the schema, which is exactly
+      // the legacy field that still renders.
+      const $set = {};
       for (const h of r.content) {
         const before = countIn(h.value);
         const next = rewrite(h.value);
         if (next === h.value) continue;
-        fresh.set(h.path, next);
+        $set[toMongoPath(h.path)] = next;
         fieldsWritten += 1;
-        console.log(`      ${h.path.padEnd(34)} ${before} -> ${countIn(next)}`);
+        console.log(`      ${h.path.padEnd(42)} ${before} -> ${countIn(next)}`);
       }
-      // validateBeforeSave:false — these documents predate some required
-      // fields and we are editing prose, not fixing their schema.
-      await fresh.save({ validateBeforeSave: false });
+      if (!Object.keys($set).length) {
+        console.log('      (nothing to change)');
+      } else {
+        const res = await SeoArticle.collection.updateOne({ _id: r.doc._id }, { $set });
+        console.log(`      -> matched ${res.matchedCount}, modified ${res.modifiedCount}, ${Object.keys($set).length} field(s)`);
+        if (res.matchedCount !== 1) {
+          throw new Error(`${r.slug}: expected to match 1 document, matched ${res.matchedCount}`);
+        }
+      }
       if (r.history.length) {
         console.log(`      (${r.history.length} history field(s) left untouched by design)`);
       }

@@ -117,6 +117,13 @@ const CallLogSchema = new mongoose.Schema(
     // A queued missed call later reported answered: taken off its task's
     // missed count at this time.
     callbackRetractedAt: { type: Date },
+    // A transfer of this call ended with nobody taking it — nobody answered,
+    // ring-back included, or the caller hung up while on hold. The call is
+    // "completed" (someone spoke to the caller first), but the caller still
+    // needs help: it is queued for a callback like a missed call, and never
+    // retracted as "answered after all". Cleared if Plivo then reports the
+    // transfer answered after all.
+    transferUnanswered: { type: Date },
   },
   { timestamps: true },
 );

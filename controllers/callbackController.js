@@ -73,13 +73,14 @@ async function decorate(tasks, { now = Date.now() } = {}) {
       .select('callbackTask direction context status startedAt answeredAt endedAt talkSec agentName error')
       .sort({ startedAt: 1 }).lean(),
     phones.length
-      ? CallLog.find({ customerPhone: { $in: phones }, status: 'completed', startedAt: { $gte: since } })
+      // (A transfer nobody took is not "got through".)
+      ? CallLog.find({ customerPhone: { $in: phones }, status: 'completed', transferUnanswered: null, startedAt: { $gte: since } })
         .select('+customerPhone direction context status startedAt answeredAt endedAt talkSec agentName callbackTask')
         .sort({ startedAt: 1 }).lean()
       : [],
-    CallLog.find({ _id: { $in: missedIds } }).select('status').lean(),
+    CallLog.find({ _id: { $in: missedIds } }).select('status transferUnanswered').lean(),
   ]);
-  const statusNow = new Map(missedNow.map((c) => [String(c._id), c.status]));
+  const statusNow = new Map(missedNow.map((c) => [String(c._id), c.transferUnanswered ? queue.TRANSFER_UNANSWERED : c.status]));
 
   return tasks.map((t) => {
     const json = t.toJSON();

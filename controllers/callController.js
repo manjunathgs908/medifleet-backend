@@ -890,7 +890,9 @@ exports.events = async (req, res, next) => {
       if (ringingTransfer >= 0) {
         await CallLog.updateOne(
           { _id: log._id, [`transfers.${ringingTransfer}.outcome`]: 'ringing' },
-          { $set: { [`transfers.${ringingTransfer}.outcome`]: 'caller_hung_up', [`transfers.${ringingTransfer}.endedAt`]: new Date() } },
+          // Nobody took it: queued for a callback (unless Plivo then reports
+          // it answered — see transferAnswer).
+          { $set: { [`transfers.${ringingTransfer}.outcome`]: 'caller_hung_up', [`transfers.${ringingTransfer}.endedAt`]: new Date(), transferUnanswered: new Date() } },
         );
       }
       plivo.logCall(`hangup status=${log.status} cause=${b.HangupCauseName || b.HangupCause || '-'} code=${b.HangupCauseCode || '-'} source=${b.HangupSource || '-'}`, log);
@@ -1059,7 +1061,8 @@ async function serveTransferFrom(log, t, fromIdx) {
   }
   await CallLog.updateOne(
     { _id: log._id, [`transfers.${t}.outcome`]: 'ringing' },
-    { $set: { [`transfers.${t}.outcome`]: 'not_answered', [`transfers.${t}.endedAt`]: new Date() }, $push: { flow: `transfer${t}:nobody→sorry_message` } },
+    // The caller needed help and got none: queued for a callback.
+    { $set: { [`transfers.${t}.outcome`]: 'not_answered', [`transfers.${t}.endedAt`]: new Date(), transferUnanswered: new Date() }, $push: { flow: `transfer${t}:nobody→sorry_message` } },
   );
   console.warn(`[calls] transfer ${t} of log=${log._id}: nobody answered, ring-back included — sorry message`);
   return plivo.speakXml(SORRY_MESSAGE);
@@ -1248,7 +1251,12 @@ exports.transferAnswer = async (req, res, next) => {
         }
         if (!entry.answeredAt) set[`transfers.${t}.answeredAt`] = new Date(Date.now() - (Number.isFinite(talk) ? talk * 1000 : 0));
       }
-      await CallLog.updateOne({ _id: log._id }, { $set: set, $push: { flow: `transfer${t}:${done}:answered` } });
+      // Answered after all (its report came after the hang-up): not a
+      // caller to call back. Off the queue if it was already put there.
+      await CallLog.updateOne({ _id: log._id }, { $set: set, $unset: { transferUnanswered: '' }, $push: { flow: `transfer${t}:${done}:answered` } });
+      if (log.transferUnanswered && log.callbackTask) {
+        callbackQueue.retractAnswered(log._id).catch((err) => console.error(`[calls] callback retract failed log=${log._id}:`, err?.message || err));
+      }
       return sendXml(res, plivo.hangupXml());
     }
 

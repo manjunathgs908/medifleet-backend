@@ -9,6 +9,8 @@
 //     staff test from their own phone);
 //   - final status 'missed' (nobody answered) or 'no_agents' (nobody was on
 //     duty — the caller heard the busy message);
+//   - or: answered, then transferred from the CRM, and nobody took the
+//     transfer (CallLog.transferUnanswered) — the caller still needs help;
 //   - over for at least CALLBACK_SETTLE_SECONDS, so a late "completed" from
 //     Plivo can still win (an early hang-up writes "missed" first).
 // Never queued: ringing / in call / "Status unconfirmed" (still 'ringing'
@@ -49,6 +51,8 @@ const { normalisePhone } = require('../utils/phone');
 const { settleSeconds } = require('../utils/callbackDue');
 
 const FINAL_MISSED = ['missed', 'no_agents'];
+// The status a queued call's entry carries when a transfer went unanswered.
+const TRANSFER_UNANSWERED = 'transfer_unanswered';
 // How far back a sweep looks. Bounds every sweep's query; a CRM left
 // closed for longer than this leaves older misses unqueued (logged).
 const LOOKBACK_MS = 7 * 24 * 3600 * 1000;
@@ -96,6 +100,7 @@ function queueableReason(call, { manual } = {}) {
   if (manual) return call.status === 'not_routed' ? null : 'not_not_routed';
   if (call.context !== 'incoming') return 'not_incoming';
   if (call.callbackEligible !== true) return 'not_eligible';
+  if (call.transferUnanswered && call.status === 'completed') return null;
   if (!FINAL_MISSED.includes(call.status)) return 'not_missed';
   return null;
 }
@@ -107,14 +112,14 @@ function queueableReason(call, { manual } = {}) {
 async function queueCall(callId, { manual = null, now = new Date() } = {}) {
   if (!(await indexReady())) throw new Error('callback queue unavailable: open-task index not confirmed');
   const call = await CallLog.findById(callId)
-    .select('+customerPhone direction context status callbackEligible callbackTask startedAt endedAt createdAt trip lead');
+    .select('+customerPhone direction context status callbackEligible callbackTask transferUnanswered startedAt endedAt createdAt trip lead');
   const reason = queueableReason(call, { manual });
   if (reason) return { skipped: reason };
   const phone = normalisePhone(call.customerPhone);
   if (!isMobile(phone)) return { skipped: 'no_mobile_number' };
 
   const at = call.startedAt || call.createdAt || now;
-  const entry = { call: call._id, at, status: call.status };
+  const entry = { call: call._id, at, status: call.transferUnanswered ? TRANSFER_UNANSWERED : call.status };
   const who = manual ? { by: manual._id, byName: manual.name } : {};
   const about = { ...(call.trip ? { trip: call.trip } : {}), ...(call.lead ? { lead: call.lead } : {}) };
 
@@ -193,9 +198,10 @@ async function queueCall(callId, { manual = null, now = new Date() } = {}) {
 // task left with none is withdrawn. Idempotent; safe to call for any call.
 // -> 'marked' | 'withdrawn' | 'not_queued' | 'not_answered' | 'already'
 async function retractAnswered(callId, { now = new Date() } = {}) {
-  const call = await CallLog.findById(callId).select('status direction callbackTask callbackRetractedAt');
+  const call = await CallLog.findById(callId).select('status direction callbackTask callbackRetractedAt transferUnanswered');
   if (!call?.callbackTask || call.direction !== 'inbound') return 'not_queued';
-  if (call.status !== 'completed') return 'not_answered';
+  // Answered, then a transfer nobody took: still a caller to call back.
+  if (call.status !== 'completed' || call.transferUnanswered) return 'not_answered';
 
   const marked = await CallbackTask.findOneAndUpdate(
     { _id: call.callbackTask, calls: { $elemMatch: { call: call._id, answeredLater: { $ne: true } } } },
@@ -241,11 +247,13 @@ async function sweep({ now = new Date() } = {}) {
       callbackEligible: true,
       callbackTask    : null,
       direction       : 'inbound',
-      status          : { $in: FINAL_MISSED },
       startedAt       : { $gte: since },
-      $or: [
-        { endedAt: { $ne: null, $lte: settled } },
-        { endedAt: null, startedAt: { $lte: new Date(now.getTime() - NO_END_GRACE_MS) } },
+      $and: [
+        { $or: [{ status: { $in: FINAL_MISSED } }, { status: 'completed', transferUnanswered: { $ne: null } }] },
+        { $or: [
+          { endedAt: { $ne: null, $lte: settled } },
+          { endedAt: null, startedAt: { $lte: new Date(now.getTime() - NO_END_GRACE_MS) } },
+        ] },
       ],
     }).select('_id').sort({ startedAt: 1 }).limit(SWEEP_BATCH).lean(),
     CallLog.find({
@@ -254,6 +262,7 @@ async function sweep({ now = new Date() } = {}) {
       startedAt          : { $gte: since },
       callbackTask       : { $ne: null },
       callbackRetractedAt: null,
+      transferUnanswered : null,
     }).select('_id').sort({ startedAt: 1 }).limit(SWEEP_BATCH).lean(),
   ]);
 
@@ -296,6 +305,6 @@ function sweepSoon({ now = Date.now() } = {}) {
 const _resetSweepThrottle = () => { lastSweepAt = 0; inFlight = null; };
 
 module.exports = {
-  FINAL_MISSED, SWEEP_BATCH, LOOKBACK_MS, queueableReason, queueCall, retractAnswered, sweep, sweepSoon,
+  FINAL_MISSED, TRANSFER_UNANSWERED, SWEEP_BATCH, LOOKBACK_MS, queueableReason, queueCall, retractAnswered, sweep, sweepSoon,
   indexReady, indexError, _resetSweepThrottle, _resetIndexCheck,
 };

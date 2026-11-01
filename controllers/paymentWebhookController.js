@@ -22,7 +22,8 @@
 
 const crypto = require('crypto');
 const { Bill } = require('../models');
-const { markBillPaidOnce } = require('./paymentController');
+const { markBillPaidOnce, orderOf } = require('./paymentController');
+const { noteProviderIssue } = require('../services/payments');
 
 exports.handleWebhook = async (req, res) => {
   try {
@@ -36,20 +37,39 @@ exports.handleWebhook = async (req, res) => {
       .update(req.rawBody)
       .digest('hex');
 
-    const valid = expected.length === signature.length &&
+    const valid = typeof signature === 'string' && expected.length === signature.length &&
       crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 
     if (!valid) {
       return res.status(400).json({ success: false, message: 'Invalid webhook signature.' });
     }
 
+    // A captured payment is money taken. It is recorded as a receipt when it
+    // matches one of a bill's orders in INR; anything else is kept as a
+    // provider issue for the owner to review — never silently dropped.
     const event = req.body;
-    if (event.event === 'payment.captured') {
-      const payment = event.payload?.payment?.entity;
-      const orderId = payment?.order_id;
-      if (orderId) {
-        const bill = await Bill.findOne({ razorpayOrderId: orderId });
-        if (bill) await markBillPaidOnce(bill, { paymentId: payment.id });
+    if (event?.event === 'payment.captured') {
+      const payment = event.payload?.payment?.entity || {};
+      const paymentId = typeof payment.id === 'string' ? payment.id : null;
+      const orderId = typeof payment.order_id === 'string' ? payment.order_id : null;
+      const amount = payment.amount;
+      if (!paymentId) {
+        console.error('Razorpay webhook: payment.captured without a payment id — ignored');
+        return res.status(200).json({ success: true });
+      }
+      const issue = (reason, extra = {}) => noteProviderIssue({ paymentId, orderId, reason, amount, currency: payment.currency, ...extra });
+      const bill = orderId ? await Bill.findOne({ $or: [{ 'razorpayOrders.orderId': orderId }, { razorpayOrderId: orderId }] }) : null;
+      const order = bill && orderOf(bill, orderId);
+      if (!bill || !order) {
+        await issue('unknown_order');
+      } else if (payment.currency !== 'INR' || (order.currency && order.currency !== 'INR')) {
+        await issue('currency', { bill: bill._id });
+      } else if (!Number.isInteger(amount) || amount <= 0) {
+        await issue('bad_amount', { bill: bill._id });
+      } else {
+        const capturedAt = Number.isInteger(payment.created_at) ? new Date(payment.created_at * 1000) : undefined;
+        await markBillPaidOnce(bill, { paymentId, orderId, amountPaise: amount, capturedAt });
+        if (amount !== order.amountPaise) await issue('amount_differs_from_order', { bill: bill._id, detail: { orderAmountPaise: order.amountPaise } });
       }
     }
 

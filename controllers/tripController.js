@@ -25,6 +25,7 @@ const { sendFullScreenTrip } = require('../utils/fcmService');
 const TripCallEvent = require('../models/TripCallEvent');
 const BookingOtp = require('../models/BookingOtp');
 const fareCalculator = require('../utils/fareCalculator');
+const { applyAdvancesToNewBill } = require('../services/payments');
 const smsService = require('../utils/smsService');
 const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
@@ -1276,6 +1277,10 @@ exports.completeTrip = async (req, res, next) => {
       waitCharge      : trip.waitCharge,
       grandTotal      : trip.grandTotal,
     }], { session }))[0];
+
+    // Advances received before completion become the new bill's paid
+    // amount — counted once, in this same transaction (services/payments.js).
+    if (!existingBill) await applyAdvancesToNewBill(trip, bill, session);
 
     // Link bill to trip
     trip.billId = bill._id;

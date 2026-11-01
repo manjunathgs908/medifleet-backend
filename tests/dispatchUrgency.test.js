@@ -39,6 +39,8 @@ jest.mock('../models/Owner',         () => stub());
 jest.mock('../models/GeofenceEvent', () => stub());
 jest.mock('../models/BookingOtp',    () => stub());
 jest.mock('../models/TripCallEvent', () => ({ create: jest.fn(async () => ({})) }));
+// Completion counts advances into the new bill; these trips have none.
+jest.mock('../models/Payment', () => ({ find: () => ({ session: () => ({ sort: async () => [] }) }), updateMany: jest.fn() }));
 jest.mock('../utils/cloudinary',    () => ({ uploadToCloudinary: jest.fn() }));
 jest.mock('../utils/smsService',    () => ({ sendOtp: jest.fn() }));
 jest.mock('../utils/platformOwner', () => ({ isPlatformDriver: jest.fn(), platformDriverIds: jest.fn(), platformOwnerIds: jest.fn() }));

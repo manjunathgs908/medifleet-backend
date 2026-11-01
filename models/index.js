@@ -807,6 +807,10 @@ const tripSchema = new Schema(
     // â”€â”€ Billing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
+    // Bumped inside every payment transaction for this trip (and written by
+    // completion's), so two payments — or a payment and the trip's billing —
+    // can never commit from the same stale balance (services/payments.js).
+    paymentRev    : { type: Number },
 
     // ── Payment preference — captured at booking, purely informational
     // (never gates booking/dispatch/completion). 'cash'/'upi' mean the
@@ -992,7 +996,12 @@ const billSchema = new Schema(
     // manual/CRM-recorded collection exactly as before. Razorpay itself
     // may have used any underlying method (card/UPI/netbanking/wallet);
     // 'online' just means "the gateway verified it," not which one.
-    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'online', 'insurance', 'hospital_credit'] },
+    // 'bank_transfer' appended (a recorded receipt's method); existing
+    // values unchanged.
+    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'online', 'insurance', 'hospital_credit', 'bank_transfer'] },
+    // Rupees, as before. Since itemised receipts (models/Payment.js) it is
+    // always the sum of this bill's receipts, kept in step in one
+    // transaction; older bills keep the figure they had.
     paidAmount  : { type: Number, default: 0 },
     paidAt      : { type: Date },
 
@@ -1001,6 +1010,16 @@ const billSchema = new Schema(
     // stay undefined for cash/manual-UPI bills. ──
     razorpayOrderId  : { type: String },
     razorpayPaymentId: { type: String },
+    razorpayOrderAmountPaise: { type: Number }, // what the latest order asks for (the balance when it was created)
+    // Every order made for this bill: an older one can still be paid after a
+    // newer one replaced it, and that money must still be found and recorded.
+    razorpayOrders: [{
+      orderId    : String,
+      amountPaise: Number,
+      currency   : String,
+      createdAt  : Date,
+      _id        : false,
+    }],
 
     // â”€â”€ Hospital Invoice Reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     invoiceId   : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },

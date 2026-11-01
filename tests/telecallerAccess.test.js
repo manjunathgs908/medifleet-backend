@@ -94,7 +94,7 @@ const ALLOWED = {
   Fleet            : [['GET', '/api/ambulances/admin'], ['GET', '/api/auth/users?role=driver']],
   Dispatch         : [['GET', '/api/trips/live'], ['POST', '/api/trips/estimate'], ['GET', `/api/trips/${ID}/suggested-ambulances`],
                       ['PUT', `/api/trips/${ID}/assign`], ['PUT', `/api/trips/${ID}/cancel`], ['PUT', `/api/trips/${ID}/complete`],
-                      ['GET', '/api/quotes'], ['POST', '/api/quotes'], ['GET', '/api/hospitals']],
+                      ['GET', '/api/quotes'], ['POST', '/api/quotes'], ['GET', '/api/hospitals'], ['GET', '/api/billing/issuer']],
   Trips            : [['GET', '/api/trips']],
   'Trip Alerts'    : [['GET', '/api/trip-call-events?type=NO_RESPONSE']],
   'Posting Alerts' : [['GET', '/api/geofence-events']],
@@ -119,7 +119,9 @@ const BLOCKED = {
                ['PUT', `/api/auth/users/${ID}/password`], ['PUT', `/api/auth/users/${ID}/owner`]],
   Advances  : [['GET', '/api/advances'], ['PUT', `/api/advances/${ID}/approve`]],
   Owners    : [['GET', '/api/owners']],
-  Billing   : [['GET', '/api/billing/bills'], ['GET', '/api/billing/hospital-invoices']],
+  Billing   : [['GET', '/api/billing/bills'], ['GET', '/api/billing/hospital-invoices'], ['GET', `/api/billing/bills/${ID}`],
+               ['POST', '/api/billing/payments'], ['GET', `/api/billing/payments/${ID}`], ['GET', '/api/billing/advances'],
+               ['PUT', `/api/billing/bills/${ID}/payment`], ['GET', '/api/finance/summary'], ['GET', '/api/billing/provider-issues']],
   SEO       : [['GET', '/api/seo/articles']],
   'Plivo live calls': [['GET', '/api/calls/plivo/live']],
 };
@@ -151,7 +153,8 @@ describe('telecaller (operations) access', () => {
   it('a driver gets none of the operations pages', async () => {
     for (const [method, path] of [['GET', '/api/sos'], ['GET', '/api/leads'], ['GET', '/api/whatsapp-leads'], ['GET', '/api/auth/users'],
       ['GET', '/api/leads/summary'], ['PATCH', `/api/leads/${ID}/assign`], ['PATCH', `/api/leads/${ID}/follow-up`],
-      ['PATCH', `/api/leads/${ID}/status`], ['POST', `/api/leads/${ID}/notes`]]) {
+      ['PATCH', `/api/leads/${ID}/status`], ['POST', `/api/leads/${ID}/notes`],
+      ['GET', `/api/billing/payments/${ID}`], ['POST', '/api/billing/payments'], ['GET', '/api/billing/provider-issues']]) {
       expect([method, path, await call('driver', method, path)]).toEqual([method, path, 403]);
     }
   });

@@ -96,6 +96,9 @@ const CallLogSchema = new mongoose.Schema(
 
 CallLogSchema.index({ createdAt: -1 });
 
+// Whether an "active" stored status can still be true (display only).
+const { liveStateOf } = require('../utils/callLiveness');
+
 CallLogSchema.set('toJSON', {
   transform(doc, ret) {
     if ('customerPhone' in ret) {
@@ -107,6 +110,15 @@ CallLogSchema.set('toJSON', {
     delete ret.agentPhone;
     delete ret.dialledPhones;
     ret.phoneVerdict = phoneLegVerdict(ret.phoneLeg, ret.overlap);
+    // Display-only (see liveStateOf); `status` itself is never rewritten.
+    const live = liveStateOf(ret, { notLiveOnPlivo: !!doc.$locals?.notLiveOnPlivo });
+    if (live) {
+      ret.liveState = live.state;
+      if (live.state === 'unconfirmed') {
+        ret.statusUnconfirmed = true;
+        ret.statusUnconfirmedReason = live.reason;
+      }
+    }
     // The Plivo recording URL stays server-side too: with Plivo's Basic Auth
     // for recordings on, it needs our credentials, and either way the CRM
     // plays it through GET /api/calls/:id/recording, which checks the login.

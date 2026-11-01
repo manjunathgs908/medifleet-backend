@@ -286,6 +286,21 @@ async function listLiveCalls({ max = 25 } = {}) {
   return { total: ids.length, calls: details };
 }
 
+// Just the ids of the calls Plivo has live right now (one request, no
+// per-call details) — for telling the CRM whether a call still marked
+// "ringing" can really still be going. Plivo answers {"calls": [uuid, ...]}.
+// Anything else — another shape, or a page of a longer list — THROWS: a
+// partial list must never make a live call look gone.
+async function listLiveCallIds() {
+  const { data } = await plivoRest('get', '/Call/?status=live');
+  if (Array.isArray(data?.calls) && data.calls.every((id) => typeof id === 'string')) return data.calls;
+  if (Array.isArray(data?.objects) && data.meta && !data.meta.next
+    && Number(data.meta.total_count ?? data.objects.length) <= data.objects.length) {
+    return data.objects.map((c) => c.call_uuid);
+  }
+  throw Object.assign(new Error('Plivo live-call list was incomplete or in an unexpected format'), { incomplete: true });
+}
+
 const hangupCall = (uuid) => plivoRest('delete', `/Call/${encodeURIComponent(uuid)}/`);
 
 const deleteEndpoint = (endpointId) => plivoRest('delete', `/Endpoint/${encodeURIComponent(endpointId)}/`);
@@ -346,7 +361,7 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
-  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall, deleteEndpoint,
+  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, listLiveCallIds, hangupCall, deleteEndpoint,
   APP_RING_SECONDS, PHONE_RING_SECONDS,
   bridgeXml, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,

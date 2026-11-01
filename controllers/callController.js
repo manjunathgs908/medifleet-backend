@@ -45,6 +45,7 @@ const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
+const { ACTIVE_STATUSES, callHasEnded, liveStateOf, PLIVO_CHECK_AFTER_MS } = require('../utils/callLiveness');
 
 // Statuses during which a driver or partner may still reach the customer.
 const ACTIVE_TRIP_STATUSES = ['booked', 'dispatched', 'en_route'];
@@ -555,10 +556,10 @@ exports.answer = async (req, res, next) => {
       return sendXml(res, plivo.speakXml('Sorry, this call could not be connected.'));
     }
 
-    log.status = 'agent_answered';
     log.answeredAt = new Date();
     if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
     await log.save();
+    await setStatusIf(log, 'agent_answered', { $in: ['initiated'] });
 
     return sendXml(res, plivo.bridgeXml({ numbers: [other], logId: log._id }));
   } catch (err) {
@@ -696,6 +697,22 @@ exports.incoming = async (req, res, next) => {
 };
 
 
+// Status and end time are written ONLY by these single conditional updates,
+// never by log.save(): two Plivo webhooks handled at the same moment each
+// load the call, and a plain save of the later one would overwrite the
+// other's outcome. The condition is checked by MongoDB atomically, so a
+// final outcome cannot be reopened. The in-memory log follows only when the
+// update applied.
+async function setStatusIf(log, status, whenStatus) {
+  const r = await CallLog.updateOne({ _id: log._id, status: whenStatus }, { $set: { status } });
+  if (r?.matchedCount > 0) log.status = status;
+  return r?.matchedCount > 0;
+}
+async function markEndedIfNot(log, at) {
+  const r = await CallLog.updateOne({ _id: log._id, endedAt: null }, { $set: { endedAt: at } });
+  if (r?.matchedCount > 0 && !log.endedAt) log.endedAt = at;
+}
+
 // Plivo's outcome words -> ours.
 const AGENT_LEG_FAIL = { busy: 'agent_busy', 'no-answer': 'agent_missed', timeout: 'agent_missed', failed: 'failed', cancel: 'cancelled' };
 const DIAL_FAIL      = { busy: 'customer_busy', 'no-answer': 'customer_missed', timeout: 'customer_missed', failed: 'customer_failed', cancel: 'cancelled' };
@@ -722,6 +739,17 @@ exports.events = async (req, res, next) => {
       // no status at all. Never strand the caller: ring every on-duty phone
       // now. Only a completed app leg ends the call here.
       if (req.query.stage === 'app' && dialStatus !== 'completed') {
+        // Plivo's hang-up for the whole call can arrive BEFORE this report
+        // (the caller hung up while the app was ringing). The call is over:
+        // don't set it back to "ringing" and don't dial phones for it — that
+        // left calls stuck as Ringing with nothing ever reporting again.
+        if (log && callHasEnded(log)) {
+          log.appLeg = { sipUris: (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri), ...dialResult(b) };
+          log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}(after hangup — not redialled)`];
+          await log.save();
+          console.info(`[calls] in-app leg report after the call ended log=${logId} status=${log.status} — no phone dial`);
+          return sendXml(res, plivo.hangupXml());
+        }
         const onDuty = await loadOnDuty();
         const phones = fallbackPhones(onDuty, b.From);
         const callerWasRingPhone = callerIsRingPhone(onDuty, b.From);
@@ -736,10 +764,12 @@ exports.events = async (req, res, next) => {
           serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, DialHangupCause: b.DialHangupCause || b.DialBLegHangupCause || null, fellBackToPhones: phones.length });
           log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : callerWasRingPhone ? 'skipped_caller_ring_phone→busy_message' : 'busy_message'}`];
           if (callerWasRingPhone) log.routing = { ...(log.routing || {}), skippedCaller: skippedCallerNote(onDuty, b.From, phones.length) };
-          log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
           if (phones.length) log.dialledPhones = phones.map(normalisePhone);
           await log.save();
+          // Still active: it stays "ringing" while phones ring. Nobody to ring:
+          // missed — unless a concurrent report already ended it.
+          if (!phones.length) await setStatusIf(log, 'missed', { $in: ACTIVE_STATUSES });
         }
         if (phones.length && logId) {
           sendXml(res, plivo.bridgeXml({ numbers: phones, logId, stage: 'phone' }));
@@ -762,8 +792,9 @@ exports.events = async (req, res, next) => {
         const stage = req.query.stage || 'dial';
         const endsWithSorry = log.direction === 'inbound' && dialStatus && dialStatus !== 'completed';
         log.flow = [...(log.flow || []), `${stage}:${dialStatus === 'completed' ? 'answered' : (dialStatus || 'none')}${endsWithSorry ? '→sorry_message' : ''}`];
+        let nextStatus = null;
         if (dialStatus === 'completed') {
-          log.status = 'completed';
+          nextStatus = 'completed';
           const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
           if (Number.isFinite(talk)) log.talkSec = talk;
           // An incoming call answered on a ring PHONE: Plivo says which
@@ -780,13 +811,17 @@ exports.events = async (req, res, next) => {
             if (!log.answeredAt) log.answeredAt = new Date(Date.now() - (Number.isFinite(talk) ? talk * 1000 : 0));
           }
         } else if (dialStatus) {
-          log.status = log.direction === 'inbound'
+          nextStatus = log.direction === 'inbound'
             ? 'missed'
             : (DIAL_FAIL[dialStatus] || `customer_${dialStatus}`);
         }
         if (b.DialBLegUUID) log.customerLegId = b.DialBLegUUID;
         if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
         await log.save();
+        // A connected call is never turned back into a failure by a late,
+        // repeated or concurrent report; "completed" may replace a missed
+        // set by a hang-up that arrived first.
+        if (nextStatus) await setStatusIf(log, nextStatus, { $ne: 'completed' });
       }
       // A customer whose call nobody picked up hears why before hanging up.
       if (log?.direction === 'inbound' && dialStatus && dialStatus !== 'completed') {
@@ -795,16 +830,20 @@ exports.events = async (req, res, next) => {
       return sendXml(res, plivo.hangupXml());
     }
 
-    // hangup_url for the whole call.
+    // hangup_url for the whole call. A hang-up for some OTHER leg (a dialled
+    // phone or app) is noted, but does not end this call.
+    if (log && log.providerCallId && b.CallUUID && b.CallUUID !== log.providerCallId) {
+      console.info(`[calls] hang-up of another leg (${b.CallUUID}) for log=${log._id} — call left as ${log.status}`);
+      return sendXml(res, plivo.emptyXml());
+    }
     if (log) {
       const callStatus = String(b.CallStatus || '').toLowerCase();
-      if (['initiated', 'agent_answered', 'ringing'].includes(log.status)) {
-        // Ended before the Dial reported anything: the agent never answered
-        // (outbound), or the caller gave up while it rang (inbound).
-        log.status = log.direction === 'inbound'
-          ? 'missed'
-          : (log.status === 'agent_answered' ? 'customer_missed' : (AGENT_LEG_FAIL[callStatus] || 'agent_missed'));
-      }
+      // Ended before the Dial reported anything: the agent never answered
+      // (outbound), or the caller gave up while it rang (inbound). Applied
+      // below only if the call is STILL active at that moment.
+      const finalStatus = log.direction === 'inbound'
+        ? 'missed'
+        : (log.status === 'agent_answered' ? 'customer_missed' : (AGENT_LEG_FAIL[callStatus] || 'agent_missed'));
       if (log.context === 'test_ring') log.flow = [...(log.flow || []), `test_ring:${callStatus || 'ended'}`];
       if (b.CallUUID && !log.providerCallId) log.providerCallId = b.CallUUID;
       const total = Number(b.Duration);
@@ -813,8 +852,10 @@ exports.events = async (req, res, next) => {
       // TEMPORARY diagnostic: Plivo's full hang-up report for the whole
       // call — e.g. HangupCauseCode 5030 is its concurrency limit.
       log.hangup = hangupDetail(b);
-      log.endedAt = new Date();
       await log.save();
+      await setStatusIf(log, finalStatus, { $in: ACTIVE_STATUSES });
+      // A repeated hang-up report keeps the first end time.
+      await markEndedIfNot(log, new Date());
       plivo.logCall(`hangup status=${log.status} cause=${b.HangupCauseName || b.HangupCause || '-'} code=${b.HangupCauseCode || '-'} source=${b.HangupSource || '-'}`, log);
       // No leg of this call may outlive it.
       if (log.direction === 'inbound') releaseLegs(log._id).catch(() => {});
@@ -881,6 +922,51 @@ exports.recording = async (req, res, next) => {
 };
 
 
+// Plivo's live call ids, cached briefly — the Call Logs page polls every 30s.
+// At most one Plivo request per 20s across all open CRMs: concurrent
+// requests share one lookup, and a failure is remembered for the same 20s
+// (it then flags nothing).
+const LIVE_IDS_TTL_MS = 20 * 1000;
+let liveIdsCache = { at: 0, ids: null, error: null, inFlight: null };
+async function liveCallIds() {
+  const fresh = Date.now() - liveIdsCache.at < LIVE_IDS_TTL_MS;
+  if (fresh && liveIdsCache.error) throw liveIdsCache.error;
+  if (fresh && liveIdsCache.ids) return liveIdsCache.ids;
+  if (!liveIdsCache.inFlight) {
+    liveIdsCache.inFlight = plivo.listLiveCallIds()
+      .then((ids) => { liveIdsCache = { at: Date.now(), ids: new Set(ids), error: null, inFlight: null }; return liveIdsCache.ids; })
+      .catch((err) => { liveIdsCache = { at: Date.now(), ids: null, error: err, inFlight: null }; throw err; });
+  }
+  return liveIdsCache.inFlight;
+}
+exports._resetLiveIdsCache = () => { liveIdsCache = { at: 0, ids: null, error: null, inFlight: null }; };
+
+// For calls still marked active, older than a few minutes, with a Plivo id:
+// flag those Plivo no longer has live (doc.$locals, read by toJSON). If
+// Plivo can't be asked, nothing is flagged.
+async function markNotLiveOnPlivo(logs) {
+  const now = Date.now();
+  const candidates = (logs || []).filter((l) => {
+    const state = liveStateOf(l, { now })?.state;
+    return l.providerCallId && (state === 'active' || state === 'in_call')
+      && now - new Date(l.startedAt || l.createdAt || now).getTime() > PLIVO_CHECK_AFTER_MS;
+  });
+  if (!candidates.length || !plivo.isConfigured()) return;
+  try {
+    const live = await liveCallIds();
+    for (const l of candidates) {
+      if (!live.has(l.providerCallId)) {
+        l.$locals = l.$locals || {};
+        l.$locals.notLiveOnPlivo = true;
+      }
+    }
+  } catch (err) {
+    console.warn(`[calls] could not read Plivo live calls for status check (status ${plivoErrorDetail(err).status ?? '-'})`);
+  }
+}
+exports.markNotLiveOnPlivo = markNotLiveOnPlivo;
+
+
 // ============================================================
 // @route   GET /api/calls/logs?tripId=&leadId=&quoteId=&whatsappLeadId=&customerRef=&direction=&limit=
 // @desc    CRM call history, newest first, with recordings. Numbers are
@@ -921,6 +1007,11 @@ exports.listLogs = async (req, res, next) => {
       .populate('trip', 'tripNumber patientName')
       .populate('lead', 'patientName');
 
+    // A call still marked active that Plivo no longer has live has ended
+    // without its final report: shown as "Status unconfirmed" (read only —
+    // nothing is written back).
+    await markNotLiveOnPlivo(logs);
+
     return res.json({ success: true, logs });
   } catch (err) {
     next(err);
@@ -957,7 +1048,7 @@ exports.performance = async (req, res, next) => {
 
     const [calls, staff] = await Promise.all([
       CallLog.find({ startedAt: { $gte: from, $lt: to }, context: { $ne: 'test_ring' } })
-        .select('direction status agentUser startedAt answeredAt').lean(),
+        .select('direction status agentUser startedAt answeredAt endedAt createdAt').lean(),
       isOwner
         ? User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true }).select('name role').lean()
         : Promise.resolve([{ _id: req.user._id, name: req.user.name, role: req.user.role }]),
@@ -967,7 +1058,7 @@ exports.performance = async (req, res, next) => {
       user: u._id, name: u.name, role: u.role,
       answered: 0, answerSecTotal: 0, answerSecCount: 0, placed: 0, connected: 0,
     }]));
-    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0 };
+    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0, unconfirmed: 0 };
 
     for (const c of calls || []) {
       const row = c.agentUser ? rows.get(String(c.agentUser)) : null;
@@ -985,6 +1076,9 @@ exports.performance = async (req, res, next) => {
           }
         } else if (MISSED_STATUSES.includes(c.status)) {
           team.missed += 1;
+        } else if (liveStateOf(c)?.state === 'unconfirmed') {
+          // Ended, but its outcome never arrived — neither answered nor missed.
+          team.unconfirmed += 1;
         } else {
           team.inProgress += 1;
         }
@@ -1821,11 +1915,11 @@ exports.testAnswer = async (req, res, next) => {
     const logId = logIdOf(req);
     const log = logId ? await CallLog.findById(logId) : null;
     if (log?.context === 'test_ring') {
-      log.status = 'completed';
       log.answeredAt = new Date();
       if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
       log.flow = [...(log.flow || []), 'test_ring:answered'];
       await log.save();
+      await setStatusIf(log, 'completed', { $ne: 'completed' });
     }
     return sendXml(res, plivo.speakXml(TEST_RING_MESSAGE));
   } catch (err) {

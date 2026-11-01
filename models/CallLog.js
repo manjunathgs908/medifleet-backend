@@ -91,6 +91,18 @@ const CallLogSchema = new mongoose.Schema(
     recordingId : { type: String },
     recordingSec: { type: Number },
 
+    // Live transfers of an incoming call from the CRM (callController.js
+    // transferCall), oldest first. Each: {by, byName, at, targets (user ids
+    // rung), steps (e.g. ["english","all","back_app"]), outcome, answeredBy,
+    // answeredByName, answeredAt, error}. outcome: 'ringing' while it rings,
+    // then 'answered', 'rang_back' (answered by the ring-back group),
+    // 'not_answered', 'caller_hung_up' or 'failed'. At most one is ringing.
+    transfers : { type: [mongoose.Schema.Types.Mixed], default: undefined },
+    // The recording of each part after a transfer: {part (the transfer's
+    // index), url, id, sec}. The part before any transfer stays in
+    // recordingUrl/recordingSec. url and id stay server-side.
+    recordings: { type: [mongoose.Schema.Types.Mixed], default: undefined },
+
     // Missed-call callback queue (services/callbackQueue.js).
     //   callbackEligible: set by /incoming on a real customer's call (a
     //     mobile number that is not one of our ring phones). Only calls
@@ -147,6 +159,16 @@ CallLogSchema.set('toJSON', {
     ret.recordingState = ret.hasRecording ? 'available' : answered ? 'none' : 'not_answered';
     delete ret.recordingUrl;
     delete ret.recordingId;
+    // A transfer's part was answered by someone if Plivo gave it a length,
+    // or (length not reported yet) its transfer was answered.
+    if (Array.isArray(ret.recordings)) {
+      const answeredParts = new Set((ret.transfers || [])
+        .map((t, i) => (['answered', 'rang_back'].includes(t?.outcome) ? i : null)).filter((i) => i != null));
+      ret.recordings = ret.recordings
+        .filter((r) => r?.url && (Number(r.sec) > 0 || (r.sec == null && answeredParts.has(Number(r.part)))))
+        .map((r) => ({ part: Number(r.part), sec: r.sec ?? null }));
+    }
+    if (Array.isArray(ret.transfers)) ret.transfers = ret.transfers.map(({ targets, englishRung, ...t }) => ({ ...t, targetCount: (targets || []).length }));
     return ret;
   },
 });

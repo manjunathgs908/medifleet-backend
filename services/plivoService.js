@@ -353,6 +353,32 @@ function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_
   );
 }
 
+// A live transfer: moves the customer's leg (the A leg) out of its current
+// <Dial> onto new XML from `url` — the person who had the call is dropped,
+// the customer stays on the line.
+const transferCall = (uuid, url) => plivoRest('post', `/Call/${encodeURIComponent(uuid)}/`, {
+  legs: 'aleg', aleg_url: url, aleg_method: 'POST',
+});
+
+// One step of a transfer: the customer hears `say`, then the targets ring
+// (first to answer takes the call). Recorded as its own part of the call.
+// The in-app legs get the call-log id and transfer=1 as SIP headers, so the
+// CRM's ringing screen says it is a transferred call. The Dial's action is
+// /transfer-answer again with done=<step>, which decides the next step.
+const TRANSFER_RING_SECONDS = 25;
+function transferXml({ numbers = [], sipUsers = [], logId, transfer, step, say, timeout = TRANSFER_RING_SECONDS }) {
+  const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}&part=${transfer}`));
+  const dialUrl = esc(apiUrl(`/api/calls/transfer-answer?log=${logId}&t=${transfer}&done=${step}`));
+  const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
+    + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
+  const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)},transfer=1"` : '';
+  return xml(
+    (say ? `<Speak language="en-IN">${esc(say)}</Speak>` : '')
+    + `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
+    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
+  );
+}
+
 const speakXml = (text) => xml(`<Speak language="en-IN">${esc(text)}</Speak><Hangup/>`);
 const hangupXml = () => xml('<Hangup/>');
 const emptyXml = () => xml('');
@@ -362,7 +388,7 @@ module.exports = {
   callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
   getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, listLiveCallIds, hangupCall, deleteEndpoint,
-  APP_RING_SECONDS, PHONE_RING_SECONDS,
-  bridgeXml, speakXml, hangupXml, emptyXml,
+  APP_RING_SECONDS, PHONE_RING_SECONDS, TRANSFER_RING_SECONDS,
+  bridgeXml, transferXml, transferCall, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

@@ -1511,7 +1511,9 @@ describe('telecaller performance', () => {
   it('call list by telecaller: owner any, telecaller only themselves', async () => {
     CallLog.find.mockReturnValue(chain([]));
     await run(ctrl.listLogs, { user: owner, query: { agent: santosh._id } });
-    expect(CallLog.find.mock.calls[0][0].agentUser).toBe(santosh._id);
+    // Calls they answered, or took as a transfer.
+    expect(CallLog.find.mock.calls[0][0].$or[0].agentUser).toBe(santosh._id);
+    expect(String(CallLog.find.mock.calls[0][0].$or[1]['transfers.answeredBy'])).toBe(santosh._id);
     const other = await run(ctrl.listLogs, { user: santosh, query: { agent: '64b0000000000000000000b9' } });
     expect(other.res.statusCode).toBe(403);
     const self = await run(ctrl.listLogs, { user: santosh, query: { agent: santosh._id } });

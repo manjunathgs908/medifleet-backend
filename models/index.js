@@ -108,6 +108,11 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // callController.js incoming).
     callDuty      : { type: Boolean, default: false },
 
+    // CRM staff only, set by the owner on the Staff page: this person takes
+    // calls in English. A live call transferred from the CRM rings the
+    // on-duty English speakers first (callController.js transferCall).
+    speaksEnglish : { type: Boolean, default: false },
+
     // The phone Plivo rings for this user -- click-to-call and incoming
     // calls while on call duty. Separate from `phone`, which is the login
     // number and may not be the handset they carry. Unset falls back to

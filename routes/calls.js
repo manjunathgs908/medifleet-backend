@@ -25,6 +25,8 @@ router.all('/incoming',  ctrl.requirePlivoSignature, ctrl.incoming);
 router.all('/events',    ctrl.requirePlivoSignature, ctrl.events);
 router.all('/recording', ctrl.requirePlivoSignature, ctrl.recording);
 router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
+// The customer's XML while their call is being transferred.
+router.all('/transfer-answer', ctrl.requirePlivoSignature, ctrl.transferAnswer);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
 // cannot reach these. Telecallers (CRM_CALLS) take and return customer
@@ -55,6 +57,8 @@ router.get ('/webrtc/debug',    protect, authorize(...CRM_CALLS), ctrl.getWebrtc
 router.get ('/:id',             protect, authorize(...CRM_CALLS), ctrl.getCall);
 router.get ('/:id/trail',       protect, authorize(...CRM_CALLS), ctrl.getCallTrail);
 router.post('/:id/answered',    protect, authorize(...CRM_CALLS), ctrl.markAnswered);
+// Live transfer of a connected incoming call (only by the person on it).
+router.post('/:id/transfer',    protect, authorize(...CRM_CALLS), ctrl.transferCall);
 // Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
 // sent to the browser).
 router.get('/:id/recording', protect, authorize(...CRM_CALLS), ctrl.streamRecording);

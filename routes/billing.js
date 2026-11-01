@@ -11,8 +11,11 @@ router.put('/bills/:id/payment', protect, authorize('owner'), billingCtrl.legacy
 // Receipts: advances and payments (owner only, like the rest of billing).
 router.post('/payments', protect, authorize('owner'), billingCtrl.recordPayment);
 router.get('/payments/:id', protect, authorize('owner'), billingCtrl.getReceipt);
+// Owner only: reverse a mistaken staff-recorded receipt (accounting correction, no refund).
+router.post('/payments/:id/reverse', protect, authorize('owner'), billingCtrl.reversePayment);
 router.get('/advances', protect, authorize('owner'), billingCtrl.getAdvances);
 router.get('/issuer', protect, authorize(...OPERATIONS), billingCtrl.getIssuer);
+router.get('/payment-readiness', protect, authorize('owner'), billingCtrl.getPaymentReadiness);
 router.get('/provider-issues', protect, authorize('owner'), billingCtrl.getProviderIssues);
 router.post('/hospital-invoice/generate', protect, authorize('owner'), billingCtrl.generateHospitalInvoice);
 router.get('/hospital-invoices', protect, authorize('owner'), billingCtrl.getHospitalInvoices);

@@ -155,3 +155,79 @@ describe('customer-facing issuer (bills and receipts)', () => {
     expect(BUSINESS.legalName).toBe('SaveLife Health Services (Proprietorship)');
   });
 });
+
+describe('receipt reversal rules', () => {
+  const { reversalBlock } = require('../services/payments');
+  const Payment = require('../models/Payment');
+  const staff = { kind: 'payment', verification: 'staff_recorded', method: 'cash', amountPaise: 50000 };
+  const okBal = { onHospitalInvoice: false, state: 'paid', notItemisedPaise: 0, reconcile: [], paidPaise: 100000 };
+
+  it('a staff-recorded cash / UPI / bank receipt (or advance) can be reversed', () => {
+    for (const method of ['cash', 'upi', 'bank_transfer']) expect(reversalBlock({ ...staff, method }, { bal: okBal })).toBe(null);
+    expect(reversalBlock({ ...staff, kind: 'advance' })).toBe(null);
+    expect(reversalBlock(staff, { bal: { ...okBal, reconcile: ['overpaid'] } })).toBe(null); // e.g. an advance above the final bill
+  });
+
+  it.each([
+    ['a Razorpay-verified receipt', { ...staff, verification: 'provider_verified', method: 'online' }, {}, /Razorpay/],
+    ['a reversal', { ...staff, kind: 'reversal', amountPaise: -50000 }, {}, /can't itself be reversed/],
+    ['one already reversed', staff, { reversedBy: { receiptNumber: 'REV/2026-27/000001' } }, /Already reversed \(REV/],
+    ['a bill on a hospital invoice', staff, { bal: { ...okBal, onHospitalInvoice: true } }, /hospital invoice/],
+    ['a bill with older un-itemised payments', staff, { bal: { ...okBal, notItemisedPaise: 10000 } }, /ambiguous/],
+    ['a bill needing reconciliation', staff, { bal: { ...okBal, reconcile: ['marked_paid_short'] } }, /reconciling/],
+    ['a waived bill', staff, { bal: { ...okBal, state: 'waived' } }, /waived/],
+    ['a bill showing less received than the receipt', staff, { bal: { ...okBal, paidPaise: 1000 } }, /reconciling/],
+  ])('refused: %s', (_, p, opts, why) => {
+    expect(reversalBlock(p, opts)).toMatch(why);
+  });
+
+  it('amounts: positive receipts, negative reversals, whole paise, never zero', () => {
+    const v = (o) => new Payment({ receiptNumber: 'x', trip: '64b000000000000000000001', method: 'cash', verification: 'staff_recorded', receivedAt: new Date(), ...o }).validateSync()?.errors?.amountPaise;
+    expect(v({ kind: 'payment', amountPaise: 100 })).toBeUndefined();
+    expect(v({ kind: 'reversal', amountPaise: -100 })).toBeUndefined();
+    expect(v({ kind: 'payment', amountPaise: -100 })).toBeDefined();
+    expect(v({ kind: 'reversal', amountPaise: 100 })).toBeDefined();
+    expect(v({ kind: 'payment', amountPaise: 0 })).toBeDefined();
+    expect(v({ kind: 'payment', amountPaise: 1.5 })).toBeDefined();
+  });
+});
+
+describe('POST /api/billing/payments/:id/reverse input', () => {
+  jest.resetModules();
+  const mockReverse = jest.fn();
+  jest.doMock('../services/payments', () => ({ ...jest.requireActual('../services/payments'), reversePayment: mockReverse }));
+  const ctrl = require('../controllers/billingController');
+  const run = async (params, body) => {
+    const res = { statusCode: 200 }; res.status = (c) => { res.statusCode = c; return res; }; res.json = (b) => { res.body = b; return res; };
+    await ctrl.reversePayment({ params, body, user: { _id: 'o1', name: 'Owner', role: 'owner' } }, res, (e) => { throw e; });
+    return res;
+  };
+  it.each([
+    ['bad id', { id: 'x' }, { reason: 'Entered twice by mistake', requestId: 'abcd-1234' }, 404],
+    ['no form key', { id: '64b000000000000000000001' }, { reason: 'Entered twice by mistake' }, 400],
+    ['form key object', { id: '64b000000000000000000001' }, { reason: 'Entered twice by mistake', requestId: { $ne: 1 } }, 400],
+  ])('%s -> %d, nothing reversed', async (_, params, body, code) => {
+    expect((await run(params, body)).statusCode).toBe(code);
+    expect(mockReverse).not.toHaveBeenCalled();
+  });
+  it('the response says no money was refunded', async () => {
+    mockReverse.mockResolvedValueOnce({ reversal: { receiptNumber: 'REV/2026-27/000001' }, created: true });
+    const res = await run({ id: '64b000000000000000000001' }, { reason: 'Entered twice by mistake', requestId: 'abcd-1234' });
+    expect(res.statusCode).toBe(201);
+    expect(res.body.message).toMatch(/no money was refunded/);
+  });
+});
+
+describe('reference reuse slot (refSeq)', () => {
+  const Payment = require('../models/Payment');
+  const doc = (refSeq) => new Payment({ receiptNumber: 'x', trip: '64b000000000000000000001', kind: 'payment', amountPaise: 1, method: 'upi', reference: 'R1', receivedAt: new Date(), verification: 'staff_recorded', ...(refSeq === 'absent' ? {} : { refSeq }) });
+  it('first use stores no refSeq (no default)', () => {
+    expect(doc('absent').toObject().refSeq).toBeUndefined();
+  });
+  it.each([0, -1, 1.5])('refSeq %p is rejected — "absent" is the only first-use slot', (v) => {
+    expect(doc(v).validateSync()?.errors?.refSeq).toBeDefined();
+  });
+  it.each([1, 2, 30])('refSeq %p is accepted', (v) => {
+    expect(doc(v).validateSync()?.errors?.refSeq).toBeUndefined();
+  });
+});

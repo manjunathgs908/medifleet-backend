@@ -121,7 +121,8 @@ const BLOCKED = {
   Owners    : [['GET', '/api/owners']],
   Billing   : [['GET', '/api/billing/bills'], ['GET', '/api/billing/hospital-invoices'], ['GET', `/api/billing/bills/${ID}`],
                ['POST', '/api/billing/payments'], ['GET', `/api/billing/payments/${ID}`], ['GET', '/api/billing/advances'],
-               ['PUT', `/api/billing/bills/${ID}/payment`], ['GET', '/api/finance/summary'], ['GET', '/api/billing/provider-issues']],
+               ['PUT', `/api/billing/bills/${ID}/payment`], ['GET', '/api/finance/summary'], ['GET', '/api/billing/provider-issues'],
+               ['POST', `/api/billing/payments/${ID}/reverse`], ['GET', '/api/billing/payment-readiness']],
   SEO       : [['GET', '/api/seo/articles']],
   'Plivo live calls': [['GET', '/api/calls/plivo/live']],
 };
@@ -154,7 +155,8 @@ describe('telecaller (operations) access', () => {
     for (const [method, path] of [['GET', '/api/sos'], ['GET', '/api/leads'], ['GET', '/api/whatsapp-leads'], ['GET', '/api/auth/users'],
       ['GET', '/api/leads/summary'], ['PATCH', `/api/leads/${ID}/assign`], ['PATCH', `/api/leads/${ID}/follow-up`],
       ['PATCH', `/api/leads/${ID}/status`], ['POST', `/api/leads/${ID}/notes`],
-      ['GET', `/api/billing/payments/${ID}`], ['POST', '/api/billing/payments'], ['GET', '/api/billing/provider-issues']]) {
+      ['GET', `/api/billing/payments/${ID}`], ['POST', '/api/billing/payments'], ['GET', '/api/billing/provider-issues'],
+      ['POST', `/api/billing/payments/${ID}/reverse`]]) {
       expect([method, path, await call('driver', method, path)]).toEqual([method, path, 403]);
     }
   });

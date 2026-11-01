@@ -28,9 +28,20 @@ const paymentSchema = new Schema(
     receiptNumber: { type: String, required: true, unique: true }, // RCT/2026-27/000001
     trip  : { type: Schema.Types.ObjectId, ref: 'Trip', required: true, index: true },
     bill  : { type: Schema.Types.ObjectId, ref: 'Bill', index: true }, // unset for an advance until the trip is billed
-    kind  : { type: String, enum: ['advance', 'payment'], required: true },
+    // 'reversal': an owner's correction of a mistaken staff-recorded receipt
+    // (services/payments.js reversePayment). It is its own record — the
+    // original is never changed — with the negative of the original amount,
+    // so every balance and total that adds receipts up nets it out, on the
+    // date it was made (receivedAt = when the reversal was recorded).
+    kind  : { type: String, enum: ['advance', 'payment', 'reversal'], required: true },
 
-    amountPaise: { type: Number, required: true, min: 1, validate: Number.isInteger },
+    amountPaise: {
+      type: Number, required: true,
+      validate: {
+        validator(v) { return Number.isInteger(v) && (this.kind === 'reversal' ? v < 0 : v > 0); },
+        message: 'amountPaise must be a whole number of paise: positive, or negative for a reversal.',
+      },
+    },
     method     : { type: String, enum: Object.keys(METHODS), required: true },
     reference  : { type: String, trim: true },  // UPI ref / bank UTR / gateway payment id
     receivedAt : { type: Date, required: true }, // when the money was received (may be before recordedAt)
@@ -51,6 +62,21 @@ const paymentSchema = new Schema(
     // The form's one-time key: a double click or a retry of the same
     // submission finds this receipt instead of recording a second one.
     requestId: { type: String },
+
+    // ── Reversal only ──
+    reverses: { type: Schema.Types.ObjectId, ref: 'Payment' }, // the receipt it corrects
+    reason  : { type: String, trim: true },                    // owner's reason — internal, never on customer documents
+
+    // How many earlier receipts with this method + reference were reversed
+    // when this one was recorded (unset = none). A genuine payment can carry
+    // the reference of a reversed mistaken entry; a live one still can't
+    // be recorded twice.
+    // Never 0: "no refSeq" is the only first-use slot (a stored 0 would be a
+    // second, different tuple — and a second live receipt).
+    refSeq: {
+      type: Number,
+      validate: { validator: (v) => v == null || (Number.isInteger(v) && v >= 1), message: 'refSeq must be a whole number ≥ 1, or absent.' },
+    },
   },
   { timestamps: { createdAt: 'recordedAt', updatedAt: false } },
 );
@@ -59,8 +85,13 @@ paymentSchema.index({ requestId: 1 }, { unique: true, partialFilterExpression: {
 paymentSchema.index({ 'provider.paymentId': 1 }, { unique: true, partialFilterExpression: { 'provider.paymentId': { $type: 'string' } } });
 // A UPI reference / bank UTR / gateway payment id is one payment: the same
 // one can't be recorded twice, even by two people at once. (Cash has no
-// reference.)
-paymentSchema.index({ method: 1, reference: 1 }, { unique: true, partialFilterExpression: { reference: { $type: 'string' } } });
+// reference.) refSeq lets a genuine payment reuse the reference of a
+// reversed mistaken entry — services/payments.js decides it in the
+// transaction. Replaces the earlier { method, reference } index, which
+// services/payments.js drops once this one is confirmed.
+paymentSchema.index({ method: 1, reference: 1, refSeq: 1 }, { unique: true, partialFilterExpression: { reference: { $type: 'string' } } });
+// One reversal per receipt, however many requests arrive at once.
+paymentSchema.index({ reverses: 1 }, { unique: true, partialFilterExpression: { reverses: { $type: 'objectId' } } });
 paymentSchema.index({ receivedAt: -1 });
 
 paymentSchema.set('toJSON', {

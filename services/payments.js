@@ -38,37 +38,29 @@ class PaymentRefused extends Error {
 // are built and read back from MongoDB, nothing is recorded: a staff
 // payment gets a clear 503, a gateway callback a 500 (so Razorpay retries
 // later — the money stays on record at Razorpay). Re-checked at most once a
-// minute after a failure.
-const REQUIRED_INDEXES = [
-  [Payment, { receiptNumber: 1 }, null],
-  [Payment, { requestId: 1 }, 'requestId'],
-  [Payment, { 'provider.paymentId': 1 }, 'provider.paymentId'],
-  [Payment, { method: 1, reference: 1 }, 'reference'],
-  [Payment.Issue, { provider: 1, paymentId: 1, reason: 1 }, null],
-];
+// minute after a failure. The check also verifies the stored receipts keep
+// the one-live-receipt-per-reference rule (services/paymentIndexMigration.js).
+// The app only ever CREATES indexes: retiring the first release's reference
+// index is a separate, explicit step (scripts/migrate-payment-reference-index.js).
+const indexMigration = require('./paymentIndexMigration');
 let indexState = { ok: false, checkedAt: 0, error: null };
+let indexCheck = null; // one check at a time
 const INDEX_RETRY_MS = 60 * 1000;
+const checkIndexes = () => indexMigration.verifyProtections();
 async function indexesReady() {
   if (indexState.ok) return true;
   if (indexState.checkedAt && Date.now() - indexState.checkedAt < INDEX_RETRY_MS) return false;
-  try {
-    await Payment.createIndexes();
-    await Payment.Issue.createIndexes();
-    const missing = [];
-    for (const [model, key, partialField] of REQUIRED_INDEXES) {
-      const list = await model.collection.indexes();
-      const found = list.find((ix) => JSON.stringify(ix.key) === JSON.stringify(key) && ix.unique === true
-        && (!partialField || ix.partialFilterExpression?.[partialField]));
-      if (!found) missing.push(`${model.modelName} ${JSON.stringify(key)}`);
-    }
-    if (missing.length) throw new Error(`unique index not confirmed: ${missing.join(', ')}`);
-    indexState = { ok: true, checkedAt: Date.now(), error: null };
-    return true;
-  } catch (err) {
-    indexState = { ok: false, checkedAt: Date.now(), error: err.message };
-    console.error(`[payments] NOT recording payments — uniqueness protection could not be confirmed: ${err.message}`);
-    return false;
+  if (!indexCheck) {
+    indexCheck = checkIndexes()
+      .then(() => { indexState = { ok: true, checkedAt: Date.now(), error: null }; })
+      .catch((err) => {
+        indexState = { ok: false, checkedAt: Date.now(), error: err.message };
+        console.error(`[payments] NOT recording payments — uniqueness protection could not be confirmed: ${err.message}`);
+      })
+      .finally(() => { indexCheck = null; });
   }
+  await indexCheck;
+  return indexState.ok;
 }
 const NOT_READY = 'Payments cannot be recorded right now: the database protections against duplicate receipts could not be confirmed. Nothing was recorded — try again in a minute, and tell the developer if it continues.';
 async function requireIndexes() {
@@ -173,12 +165,26 @@ async function recordPayment({ tripId, amountPaise, method, reference, receivedA
   const earlier = await replay();
   if (earlier) return earlier;
 
-  const refTaken = async () => {
-    const dup = reference && await Payment.findOne({ method, reference }).select('receiptNumber trip');
-    return dup && new PaymentRefused(409, `That reference is already on receipt ${dup.receiptNumber}${String(dup.trip) === String(tripId) ? '' : ' for another trip'} — check it is not the same payment.`);
+  // A reference already on a receipt is refused — unless every receipt that
+  // carried it was reversed as a mistake: then this is the genuine payment
+  // and gets the next refSeq (the unique index still stops two at once).
+  const refCheck = async (session) => {
+    if (!reference) return { refSeq: undefined };
+    const prior = await Payment.find({ method, reference, kind: { $ne: 'reversal' } }).select('_id receiptNumber trip').session(session || null).lean();
+    if (!prior.length) return { refSeq: undefined };
+    const reversed = new Set((await Payment.find({ reverses: { $in: prior.map((p) => p._id) } }).select('reverses').session(session || null).lean()).map((r) => String(r.reverses)));
+    const live = prior.find((p) => !reversed.has(String(p._id)));
+    if (live) {
+      return { taken: new PaymentRefused(409, `That reference is already on receipt ${live.receiptNumber}${String(live.trip) === String(tripId) ? '' : ' for another trip'} — check it is not the same payment.`) };
+    }
+    return { refSeq: prior.length };
   };
-  const taken = await refTaken();
-  if (taken) throw taken;
+  const pre = await refCheck();
+  if (pre.taken) throw pre.taken;
+  // Reusing a reversed receipt's reference needs the old index retired
+  // (an explicit migration step); until then it is refused, clearly.
+  const REUSE_PENDING = 'That reference belongs to a reversed receipt. Reusing it needs the one-time payment index migration, which has not been run yet — nothing was recorded. Ask the developer to run it, or record this payment without the reference for now.';
+  if (pre.refSeq && (await indexMigration.readiness()).oldIndexPresent) throw new PaymentRefused(409, REUSE_PENDING);
 
   const fy = financialYear(now);
   await ensureCounter(fy);
@@ -224,10 +230,12 @@ async function recordPayment({ tripId, amountPaise, method, reference, receivedA
         throw new PaymentRefused(409, `That is more than ${kind === 'advance' ? 'the fare estimate still uncovered' : 'the outstanding balance'} (${formatRupees(limitPaise)}).`, { limitPaise });
       }
 
+      const ref = await refCheck(session);
+      if (ref.taken) throw ref.taken;
       const receiptNumber = await nextReceiptNumber(session, fy);
       const [payment] = await Payment.create([{
         receiptNumber, trip: trip._id, bill: bill?._id, kind, amountPaise, method,
-        reference: reference || undefined, receivedAt, note: note || undefined,
+        reference: reference || undefined, refSeq: ref.refSeq, receivedAt, note: note || undefined,
         verification: 'staff_recorded', recordedBy: user._id, recordedByName: user.name, requestId,
       }], { session });
 
@@ -246,10 +254,14 @@ async function recordPayment({ tripId, amountPaise, method, reference, receivedA
       const again = await replay();
       if (again) return again;
     }
+    // The old (method, reference) index still in place: reuse not yet possible.
+    if (err?.code === 11000 && new RegExp(`index: ${indexMigration.OLD_INDEX} `).test(err.message || '')) {
+      throw new PaymentRefused(409, REUSE_PENDING);
+    }
     // The same reference committed by someone else at the same moment.
     if (err?.code === 11000 && /reference/.test(err.message || '')) {
-      const dup = await refTaken();
-      if (dup) throw dup;
+      const again = await refCheck();
+      throw again.taken || new PaymentRefused(409, 'Someone recorded a payment with that reference at the same moment — reload and check.');
     }
     throw err;
   } finally {
@@ -258,19 +270,168 @@ async function recordPayment({ tripId, amountPaise, method, reference, receivedA
   return result;
 }
 
+// ── Reversal of a mistaken staff-recorded receipt ────────────────
+// Owner-only (routes). Corrects the accounting record — no money moves.
+// The original receipt is never changed: a new reversal record (REV/…)
+// links to it, carries the negative amount, the owner, the time, the
+// reason and its own request key, and the bill's paid amount / status are
+// updated in the same transaction. One full reversal per receipt (unique
+// index on `reverses`); a reversal can't itself be reversed.
+const REVERSIBLE_METHODS = ['cash', 'upi', 'bank_transfer'];
+const REASON_MIN = 10;
+const REASON_MAX = 300;
+
+// Why this receipt can't be reversed, or null. `bal` is its bill's balance
+// (when it is on a bill); `reversedBy` its existing reversal, if any.
+function reversalBlock(p, { bal = null, reversedBy = null } = {}) {
+  if (p.kind === 'reversal') return 'A reversal can\'t itself be reversed.';
+  if (p.verification !== 'staff_recorded' || !REVERSIBLE_METHODS.includes(p.method)) {
+    return 'Only staff-recorded cash, UPI or bank receipts can be reversed here — a Razorpay-verified payment needs the Razorpay dashboard.';
+  }
+  if (reversedBy) return `Already reversed (${reversedBy.receiptNumber}).`;
+  if (bal) {
+    if (bal.onHospitalInvoice) return 'This bill is on a hospital invoice — sort out the invoice first; the receipt can\'t be reversed here.';
+    if (bal.state === 'waived') return 'This bill was waived — the receipt can\'t be reversed here.';
+    if (bal.notItemisedPaise > 0) return 'This bill also carries older payments with no receipts behind them — the result would be ambiguous, so it needs reconciling first.';
+    const other = bal.reconcile.filter((r) => r !== 'overpaid');
+    if (other.length) return 'This bill\'s payment record needs reconciling first — a reversal would make it more ambiguous.';
+    if (bal.paidPaise < p.amountPaise) return 'This bill shows less received than the receipt — it needs reconciling first.';
+  }
+  return null;
+}
+
+async function nextReversalNumber(session, fy) {
+  const c = await Payment.Counter.findOneAndUpdate({ _id: `reversal:${fy}` }, { $inc: { seq: 1 } }, { new: true, session });
+  return `REV/${fy}/${String(c.seq).padStart(6, '0')}`;
+}
+
+// Returns { reversal, created } — created:false when `requestId` was already
+// used for this very reversal (a double click or retry).
+async function reversePayment({ paymentId, reason, requestId, user, now = new Date() }) {
+  await requireIndexes();
+  const text = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ') : '';
+  if (text.length < REASON_MIN) throw new PaymentRefused(400, `Give a reason of at least ${REASON_MIN} characters.`);
+  if (text.length > REASON_MAX) throw new PaymentRefused(400, `Keep the reason under ${REASON_MAX} characters.`);
+
+  const replay = async () => {
+    const prior = await Payment.findOne({ requestId });
+    if (!prior) return null;
+    if (prior.kind !== 'reversal' || String(prior.reverses) !== String(paymentId)) {
+      throw new PaymentRefused(409, 'This form was already used for something else. Reload and try again.');
+    }
+    return { reversal: prior, created: false };
+  };
+  const earlier = await replay();
+  if (earlier) return earlier;
+
+  const original = await Payment.findById(paymentId);
+  if (!original) throw new PaymentRefused(404, 'Receipt not found.');
+  const already = await Payment.findOne({ reverses: original._id }).select('receiptNumber');
+  const pre = reversalBlock(original, { reversedBy: already });
+  if (pre) throw new PaymentRefused(already ? 409 : 400, pre);
+
+  const fy = financialYear(now);
+  await Payment.Counter.updateOne({ _id: `reversal:${fy}` }, { $setOnInsert: { seq: 0 } }, { upsert: true }).catch((e) => { if (e?.code !== 11000) throw e; });
+  const session = await Payment.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      // Serialised with every other payment, reversal and the trip's billing.
+      const trip = await Trip.findOneAndUpdate({ _id: original.trip }, { $inc: { paymentRev: 1 } }, { new: true, session }).select('_id');
+      if (!trip) throw new PaymentRefused(404, 'Trip not found.');
+      if (await Payment.exists({ requestId }).session(session)) throw new PaymentRefused(0, 'replay', { replay: true });
+      const prior = await Payment.findOne({ reverses: original._id }).select('receiptNumber').session(session);
+      if (prior) throw new PaymentRefused(409, `Already reversed (${prior.receiptNumber}).`);
+      // Re-read: billing may have linked an advance to a bill meanwhile.
+      const orig = await Payment.findById(original._id).session(session);
+
+      let bill = null;
+      if (orig.bill) {
+        bill = await Bill.findById(orig.bill).session(session);
+        if (!bill) throw new PaymentRefused(409, 'This receipt\'s bill could not be found — it needs reconciling first.');
+        const onInvoice = !!(await HospitalInvoice.exists({ bills: bill._id }).session(session));
+        const bal = balanceOf(bill, await receiptsTotal({ bill: bill._id }, session), { onInvoice });
+        const why = reversalBlock(orig, { bal });
+        if (why) throw new PaymentRefused(409, why);
+      } else if (await receiptsTotal({ trip: orig.trip, bill: null }, session) < orig.amountPaise) {
+        throw new PaymentRefused(409, 'The advances on this trip don\'t add up to this receipt — it needs reconciling first.');
+      }
+
+      const receiptNumber = await nextReversalNumber(session, fy);
+      const [reversal] = await Payment.create([{
+        receiptNumber, trip: orig.trip, bill: orig.bill || undefined, kind: 'reversal',
+        amountPaise: -orig.amountPaise, method: orig.method, receivedAt: now,
+        verification: 'staff_recorded', recordedBy: user._id, recordedByName: user.name,
+        requestId, reverses: orig._id, reason: text,
+      }], { session });
+
+      if (bill) {
+        const paidPaise = (toPaise(bill.paidAmount) || 0) - orig.amountPaise;
+        const status = statusFor(paidPaise, toPaise(bill.grandTotal));
+        await Bill.updateOne({ _id: bill._id }, {
+          $set: { paidAmount: toRupees(paidPaise), paymentStatus: status },
+          ...(status === 'paid' ? {} : { $unset: { paidAt: 1 } }),
+        }, { session });
+      }
+      result = { reversal, created: true };
+    });
+  } catch (err) {
+    if (err?.replay || (err?.code === 11000 && /requestId/.test(err.message || ''))) {
+      const again = await replay();
+      if (again) return again;
+    }
+    // Another owner reversed it at the same moment.
+    if (err?.code === 11000 && /reverses/.test(err.message || '')) {
+      const r = await Payment.findOne({ reverses: original._id }).select('receiptNumber');
+      throw new PaymentRefused(409, `Already reversed${r ? ` (${r.receiptNumber})` : ''}.`);
+    }
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+  return result;
+}
+
+// Adds each receipt's reversal link (and, for reversals, what they reverse)
+// to a list of receipts; `balFor(p)` gives the bill balance when on a bill.
+async function withReversalLinks(list, balFor = () => null) {
+  const ids = list.map((p) => p._id);
+  const [reversals, reversed] = await Promise.all([
+    Payment.find({ reverses: { $in: ids } }).select('receiptNumber receivedAt reverses').lean(),
+    Payment.find({ _id: { $in: list.filter((p) => p.reverses).map((p) => p.reverses) } }).select('receiptNumber receivedAt amountPaise').lean(),
+  ]);
+  const byOriginal = new Map(reversals.map((r) => [String(r.reverses), r]));
+  const originals = new Map(reversed.map((o) => [String(o._id), o]));
+  return list.map((p) => {
+    const json = typeof p.toJSON === 'function' ? p.toJSON() : { ...p };
+    const rev = byOriginal.get(String(p._id));
+    if (rev) json.reversedBy = { _id: rev._id, receiptNumber: rev.receiptNumber, at: rev.receivedAt };
+    if (p.reverses) {
+      const o = originals.get(String(p.reverses));
+      if (o) json.reversesReceipt = { _id: o._id, receiptNumber: o.receiptNumber, receivedAt: o.receivedAt, amountPaise: o.amountPaise };
+    }
+    const why = reversalBlock(p, { bal: p.bill ? balFor(p) : null, reversedBy: rev });
+    json.canReverse = !why;
+    if (why && p.kind !== 'reversal') json.reverseBlockedWhy = why;
+    return json;
+  });
+}
+
 // ── Inside trip completion's transaction ─────────────────────────
 // Only for a bill created in that same transaction: its paidAmount
 // becomes the advances already received, and they are linked to it.
 async function applyAdvancesToNewBill(trip, bill, session) {
   await Trip.updateOne({ _id: trip._id }, { $inc: { paymentRev: 1 } }, { session });
+  // (Reversals of advances are included: their negative amounts net out.)
   const advances = await Payment.find({ trip: trip._id, bill: null }).session(session).sort({ receivedAt: 1 });
   if (!advances.length) return bill;
   const paidPaise = advances.reduce((s, p) => s + p.amountPaise, 0);
   const totalPaise = toPaise(bill.grandTotal);
+  const lastReceived = advances.filter((p) => p.kind !== 'reversal').at(-1);
   bill.paidAmount = toRupees(paidPaise);
   bill.paymentStatus = statusFor(paidPaise, totalPaise);
-  bill.paymentMode = advances.at(-1).method;
-  if (bill.paymentStatus === 'paid') bill.paidAt = advances.at(-1).receivedAt;
+  if (paidPaise > 0) bill.paymentMode = lastReceived.method;
+  if (bill.paymentStatus === 'paid') bill.paidAt = lastReceived.receivedAt;
   await bill.save({ session });
   await Payment.updateMany({ _id: { $in: advances.map((p) => p._id) } }, { $set: { bill: bill._id } }, { session });
   return bill;
@@ -384,12 +545,20 @@ async function collectionTotals({ from, to }) {
     { $group: { _id: '$verification', paise: { $sum: '$amountPaise' }, n: { $sum: 1 } } },
   ]);
   const v = Object.fromEntries(byVerification.map((r) => [r._id, r.paise]));
+  // Reversals made in the period (already netted into collected above,
+  // because their amounts are negative and dated when they were made).
+  const [rev] = await Payment.aggregate([
+    { $match: { kind: 'reversal', receivedAt: { $gte: from, $lt: to } } },
+    { $group: { _id: null, paise: { $sum: '$amountPaise' }, n: { $sum: 1 } } },
+  ]);
   const [held] = await Payment.aggregate([{ $match: { bill: null } }, { $group: { _id: null, paise: { $sum: '$amountPaise' } } }]);
   const providerIssues = await Payment.Issue.countDocuments({ resolvedAt: null });
   return {
     period: { from, to },
     billedPaise, billedCount,
-    collectedPaise: (v.staff_recorded || 0) + (v.provider_verified || 0),
+    collectedPaise: (v.staff_recorded || 0) + (v.provider_verified || 0), // net of reversals
+    reversedPaise: -(rev?.paise || 0),
+    reversalsCount: rev?.n || 0,
     collectedStaffRecordedPaise: v.staff_recorded || 0,
     collectedProviderVerifiedPaise: v.provider_verified || 0,
     // All-time, not in any month: recorded as received, timing unverified.
@@ -413,5 +582,6 @@ async function collectionTotals({ from, to }) {
 module.exports = {
   istMonth, collectionTotals, balanceOf, invoicedBills, recordPayment, applyAdvancesToNewBill, applyProviderPayment,
   noteProviderIssue, receiptsTotal, financialYear, indexesReady, requireIndexes, PaymentRefused,
+  reversePayment, reversalBlock, withReversalLinks, REASON_MIN,
   _resetIndexCheck: () => { indexState = { ok: false, checkedAt: 0, error: null }; },
 };

@@ -136,7 +136,8 @@ exports.getBillById = async (req, res, next) => {
     const invoice = await HospitalInvoice.findOne({ bills: bill._id }).select('status billingPeriod netPayable').lean();
     const balance = payments.balanceOf(bill, receipts.reduce((s, p) => s + p.amountPaise, 0), { onInvoice: !!invoice });
     if (invoice) balance.hospitalInvoice = invoice;
-    return res.json({ success: true, bill: { ...bill.toJSON(), balance }, payments: receipts });
+    // Each receipt with its reversal link and whether it can be reversed.
+    return res.json({ success: true, bill: { ...bill.toJSON(), balance }, payments: await payments.withReversalLinks(receipts, () => balance) });
   } catch (err) {
     next(err);
   }
@@ -220,12 +221,64 @@ exports.getReceipt = async (req, res, next) => {
       const onInvoice = !!(await HospitalInvoice.exists({ bills: payment.bill._id }));
       balance = payments.balanceOf(payment.bill, await payments.receiptsTotal({ bill: payment.bill._id }), { onInvoice });
     }
-    return res.json({ success: true, payment, balance, issuer: CUSTOMER_ISSUER });
+    // With its reversal link (an original shows it was reversed; a reversal
+    // what it reverses). The reason is internal: the customer document
+    // never prints it.
+    const [linked] = await payments.withReversalLinks([payment], () => balance);
+    return res.json({ success: true, payment: linked, balance, issuer: CUSTOMER_ISSUER });
   } catch (err) {
     next(err);
   }
 };
 
+// ============================================================
+// @route   POST /api/billing/payments/:id/reverse  { reason, requestId }
+// @desc    Owner only. Reverses a mistaken staff-recorded cash/UPI/bank
+//          receipt: a linked reversal record (REV/…) with the reason, the
+//          original left unchanged, the bill's balance corrected. An
+//          accounting correction only — no money is refunded or moved.
+//          A repeat of the same requestId returns the same reversal.
+// ============================================================
+exports.reversePayment = async (req, res, next) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Receipt not found.' });
+    const { reason, requestId } = req.body || {};
+    if (typeof requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(requestId)) {
+      return res.status(400).json({ success: false, message: 'Reload the page and try again.' });
+    }
+    const { reversal, created } = await payments.reversePayment({ paymentId: req.params.id, reason, requestId, user: req.user });
+    return res.status(created ? 201 : 200).json({
+      success: true,
+      duplicate: !created,
+      message: created
+        ? `Receipt reversed — ${reversal.receiptNumber}. Accounting record corrected; no money was refunded.`
+        : `Already reversed — ${reversal.receiptNumber}.`,
+      reversal,
+    });
+  } catch (err) {
+    if (err instanceof payments.PaymentRefused && err.status) {
+      return res.status(err.status).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/billing/payment-readiness — owner only, read-only.
+// @desc    Are the receipt uniqueness protections in place (indexes and the
+//          one-live-receipt-per-reference rule in the stored data), and has
+//          the one-time reference-index migration been run? Creates,
+//          changes or drops nothing — no payment needed to check it.
+// ============================================================
+exports.getPaymentReadiness = async (req, res, next) => {
+  try {
+    const r = await require('../services/paymentIndexMigration').readiness();
+    return res.json({ success: true, readiness: r });
+  } catch (err) {
+    next(err);
+  }
+};
 
 // ============================================================
 // @route   GET /api/billing/issuer — the header printed on customer bills
@@ -265,8 +318,10 @@ exports.getAdvances = async (req, res, next) => {
     const extra = extraIds.length
       ? await Trip.find({ _id: { $in: extraIds } }).select('tripNumber patientName status scheduleType scheduleDate estimatedFare grandTotal createdAt billId').lean()
       : [];
+    const linked = await payments.withReversalLinks(unbilled); // advances: not on a bill yet
     const trips = [...open, ...extra].map((t) => {
       const recs = unbilled.filter((p) => String(p.trip) === String(t._id));
+      const recsJson = linked.filter((p) => String(p.trip) === String(t._id));
       const advancePaise = recs.reduce((s, p) => s + p.amountPaise, 0);
       const estimatePaise = toPaise(t.grandTotal) || toPaise(t.estimatedFare) || null;
       const reconcile = [];
@@ -280,7 +335,7 @@ exports.getAdvances = async (req, res, next) => {
         coverRemainingPaise: estimatePaise ? Math.max(0, estimatePaise - advancePaise) : null,
         canTakeAdvance: ['booked', 'dispatched', 'en_route'].includes(t.status) && !!estimatePaise && advancePaise < estimatePaise,
         reconcile,
-        payments: recs.map((p) => p.toJSON()),
+        payments: recsJson,
       };
     });
     return res.json({

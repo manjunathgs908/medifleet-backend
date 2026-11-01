@@ -750,6 +750,13 @@ const tripSchema = new Schema(
     completedAt   : Date,
     cancelledAt   : Date,
     cancellationReason: String,
+    cancelledBy   : { type: Schema.Types.ObjectId, ref: 'User' }, // the operator who cancelled (CRM)
+    // Held for the few seconds an assign / cancel / complete is being
+    // applied, so two of them can never act on the trip at once (no double
+    // bill, no cancelled trip brought back). Claimed and released by
+    // conditional updates in tripController; a claim older than 2 minutes
+    // (interrupted request) no longer blocks.
+    transitionClaimedAt: { type: Date },
 
     // Driver's explicit accept of a 'dispatched' assignment. 'dispatched'
     // alone only means "assigned to a vehicle/driver" — this flag is what

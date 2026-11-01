@@ -30,6 +30,7 @@ const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
 const whatsappNotifications = require('../services/whatsappNotifications');
 const trackingNotifications = require('../services/trackingNotifications');
+const { dispatchStateOf, countDispatchStates, hasCrew, parseScheduleDate } = require('../utils/dispatchUrgency');
 
 const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
 
@@ -344,7 +345,8 @@ async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
     tripType      : tripType || 'one_way',
     returnAddress : tripType === 'round_trip' ? returnAddress : undefined,
     scheduleType  : scheduleType || 'now',
-    scheduleDate  : scheduleType === 'later' && scheduleDate ? new Date(scheduleDate) : undefined,
+    // India time when the form sends no timezone (see parseScheduleDate).
+    scheduleDate  : scheduleType === 'later' && scheduleDate ? parseScheduleDate(scheduleDate) : undefined,
     acEnabled     : !!acEnabled,
     helperEnabled : !!helperEnabled,
     baseFare      : fare.baseFare,
@@ -403,21 +405,21 @@ exports.createBookedTrip = createBookedTrip;
 //    'on_trip'. Called from both the legacy Vehicle-sourced assignment
 //    path and the Ambulance-sourced one below — Trip.driver is a plain
 //    User ref either way, so this needs no per-source branching at all. ──
-const dispatchTripToDriver = async (trip, driverId) => {
+const applyDispatch = async (trip, driverId, session) => {
   trip.status      = 'dispatched';
   trip.dispatchedAt = new Date();
   trip.driverConfirmed = false; // (re)assignment always re-prompts the driver
   trip.driver = driverId;
-  await trip.save();
+  await trip.save({ session });
 
   if (!driverId) return;
 
   await User.findByIdAndUpdate(driverId, {
     'availability.status'   : 'on_trip',
     'availability.updatedAt': new Date(),
-  });
+  }, { session });
 
-  await Notification.create({
+  await Notification.create([{
     type        : 'trip_assigned',
     title       : '🚑 New Trip Assigned',
     message     : `You have a new trip: ${trip.patientName} — ${trip.pickup.address}`,
@@ -425,8 +427,13 @@ const dispatchTripToDriver = async (trip, driverId) => {
     trip        : trip._id,
     targetUserId: driverId,
     targetRole  : 'driver',
-  });
+  }], { session });
+};
 
+// Only after the assignment has committed: pushes, the call intent and the
+// customer messages, so a rolled-back assignment never notifies anyone.
+const announceDispatch = async (trip, driverId) => {
+  if (!driverId) return;
   const driverUser = await User.findById(driverId).select('pushToken fcmToken');
   sendPush(driverUser?.pushToken, '🚑 New Trip Assigned', `${trip.patientName} — ${trip.pickup.address}`, { tripId: trip._id.toString() });
   // Phase 2 — additive, alongside the Expo push above, not instead of it.
@@ -464,16 +471,79 @@ const dispatchTripToDriver = async (trip, driverId) => {
     .catch((err) => console.error('[trackingNotifications] notifyTrackingLink failed:', err.message));
 };
 
+// ── One operator action at a time per trip ─────────────────────────────
+// Assign, cancel and complete each load the trip, decide, and save. Two of
+// them at once used to overwrite each other: two Completes made two bills,
+// a Complete could overwrite a Cancel, an Assign could bring a cancelled
+// trip back. Each now first CLAIMS the trip with one conditional update —
+// only if it is still in the expected state and nobody else holds it — and
+// releases it when done. A claim from a request that died is ignored after
+// CLAIM_STALE_MS.
+const CLAIM_STALE_MS = 2 * 60 * 1000;
+const ACTIVE_TRIP_STATES = ['booked', 'dispatched', 'en_route'];
+async function claimTrip(tripId, conditions) {
+  const at = new Date();
+  const claimed = await Trip.findOneAndUpdate(
+    { _id: tripId, ...conditions, $or: [{ transitionClaimedAt: null }, { transitionClaimedAt: { $lt: new Date(at - CLAIM_STALE_MS) } }] },
+    { $set: { transitionClaimedAt: at } },
+    { new: true, projection: { _id: 1 } },
+  );
+  return claimed ? at : null;
+}
+const releaseTrip = (tripId, at) => Trip.updateOne({ _id: tripId, transitionClaimedAt: at }, { $unset: { transitionClaimedAt: 1 } });
+const busy = (res) => res.status(409).json({
+  success: false, code: 'TRIP_CHANGED',
+  message: 'This trip was just changed by someone else (assigned, cancelled or completed). Reload the board and check it.',
+});
+exports._claimTrip = claimTrip;
+exports._releaseTrip = (...a) => releaseTrip(...a);
+
+// Every status change is COMMITTED here, in one MongoDB transaction that
+// first proves this request still owns its claim and the trip is still in
+// the expected state (`guard`), and only then writes — so a request whose
+// claim expired (it stalled > CLAIM_STALE_MS and someone else acted) can
+// never overwrite the newer action. `apply(trip, session)` makes all the
+// database writes of the change with `session`: either all of them commit
+// or none do. It may run more than once (MongoDB retries transient
+// conflicts), so it starts from a fresh read every time and has no side
+// effects outside the database — notifications go after the commit.
+class ClaimLost extends Error {}
+async function commitClaimed(tripId, claim, guard, apply) {
+  const session = await Trip.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      const owned = await Trip.updateOne(
+        { _id: tripId, transitionClaimedAt: claim, ...guard },
+        { $unset: { transitionClaimedAt: 1 } },
+        { session },
+      );
+      if (!owned?.matchedCount) throw new ClaimLost();
+      const trip = await Trip.findById(tripId).session(session);
+      result = await apply(trip, session);
+    });
+    return { ok: true, result };
+  } catch (err) {
+    if (err instanceof ClaimLost) return { ok: false };
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+}
+exports._commitClaimed = commitClaimed;
+
 // ── Helper: assign trip to an on-duty Ambulance operator (owner or
 //    driver — same "someone is on shift on this Ambulance" shape either
 //    way). No Ambulance.status change needed: 'assigned' already covers
 //    the whole duty shift regardless of individual trips, and the
 //    per-trip busy/available signal lives entirely on the driver's own
 //    User.availability.status, exactly like the Vehicle path. ──
-const assignTripToAmbulance = async (trip, ambulance) => {
+const assignTripToAmbulance = async (trip, ambulance, session) => {
   trip.ambulance = ambulance._id;
   trip.vehicle   = undefined;
-  await dispatchTripToDriver(trip, ambulance.assignedDriver?._id || ambulance.assignedDriver);
+  const driverId = ambulance.assignedDriver?._id || ambulance.assignedDriver;
+  await applyDispatch(trip, driverId, session);
+  return driverId;
 };
 
 
@@ -506,14 +576,30 @@ exports.assignVehicle = async (req, res, next) => {
     if (computeAmbulanceDisplayStatus(ambulance) !== 'available') {
       return res.status(400).json({ success: false, message: 'Selected ambulance is not available.' });
     }
-    await assignTripToAmbulance(trip, ambulance);
+
+    // Only if the trip is still as loaded (same status, same driver) and no
+    // cancel/complete is in progress.
+    const guard = { status: { $in: ACTIVE_TRIP_STATES }, driver: trip.driver ?? null };
+    const claim = await claimTrip(trip._id, guard);
+    if (!claim) return busy(res);
+    let committed;
+    try {
+      committed = await commitClaimed(trip._id, claim, guard, async (t, session) => ({
+        trip: t, driverId: await assignTripToAmbulance(t, ambulance, session),
+      }));
+    } finally {
+      await releaseTrip(trip._id, claim);
+    }
+    if (!committed.ok) return busy(res);
+    const { trip: fresh, driverId } = committed.result;
+    await announceDispatch(fresh, driverId);
 
     // 'vehicle' stays in the populate list so the response shape is
     // unchanged for the CRM; it resolves to null for anything but a
     // historical trip.
-    await trip.populate(['vehicle', 'ambulance', 'driver', 'dropHospital']);
+    await fresh.populate(['vehicle', 'ambulance', 'driver', 'dropHospital']);
 
-    return res.json({ success: true, trip });
+    return res.json({ success: true, trip: fresh });
   } catch (err) {
     next(err);
   }
@@ -548,14 +634,49 @@ exports.updateStatus = async (req, res, next) => {
         message : `Cannot transition trip from '${trip.status}' to '${status}'.`,
       });
     }
-
-    trip.status = status;
-    if (status === 'en_route')   trip.enRouteAt   = new Date();
-    if (status === 'cancelled') {
-      trip.cancelledAt = new Date();
-      trip.closeAllOpenWaitSegments(trip.cancelledAt);
+    // Completion records the fare, the bill and the income — only
+    // PUT /:id/complete does that (no app uses this route for it). Marking
+    // a trip completed here would leave it unbilled.
+    if (status === 'completed') {
+      return res.status(400).json({ success: false, code: 'USE_COMPLETE', message: 'Use "Complete trip" (PUT /api/trips/:id/complete) — it records the fare and the bill.' });
     }
-    await trip.save();
+    // Same rule as the CRM: a cancellation says why.
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (status === 'cancelled' && (reason.length < 3 || reason.length > 300)) {
+      return res.status(400).json({ success: false, message: 'Give a reason for cancelling (3–300 characters).' });
+    }
+    // Starting a trip needs the crew it was dispatched to.
+    if (status === 'en_route' && !hasCrew(trip)) {
+      return res.status(400).json({ success: false, message: 'This trip has no crew assigned.' });
+    }
+
+    // Only from exactly the state this request saw, by the same driver, and
+    // not while an assign / cancel / complete is being applied.
+    const guard = { status: trip.status, driver: trip.driver ?? null };
+    const claim = await claimTrip(trip._id, guard);
+    if (!claim) return busy(res);
+    let committed;
+    try {
+      committed = await commitClaimed(trip._id, claim, guard, async (t, session) => {
+        t.status = status;
+        if (status === 'en_route') t.enRouteAt = new Date();
+        if (status === 'cancelled') {
+          t.cancelledAt = new Date();
+          t.closeAllOpenWaitSegments(t.cancelledAt);
+          t.cancellationReason = reason;
+          t.cancelledBy = req.user._id;
+        }
+        await t.save({ session });
+        if (status === 'cancelled' && t.driver) {
+          await User.findByIdAndUpdate(t.driver, { 'availability.status': 'available' }, { session });
+        }
+        return t;
+      });
+    } finally {
+      await releaseTrip(trip._id, claim);
+    }
+    if (!committed.ok) return busy(res);
+    Object.assign(trip, { status, enRouteAt: committed.result.enRouteAt, cancelledAt: committed.result.cancelledAt });
 
     // Only reachable from 'dispatched' per validTransitions above — this
     // is the driver heading toward pickup, not toward the hospital (that
@@ -957,15 +1078,32 @@ exports.completeTrip = async (req, res, next) => {
   try {
     const { distanceKm, actualDistanceKm, additionalCharges } = req.body;
 
-    const trip = await Trip.findById(req.params.id).populate('dropHospital');
-    if (!trip)                    return res.status(404).json({ success: false, message: 'Trip not found.' });
-    if (trip.status === 'completed') return res.status(400).json({ success: false, message: 'Trip already completed.' });
-    if (trip.status === 'cancelled') return res.status(400).json({ success: false, message: 'Cannot complete a cancelled trip.' });
+    const loaded = await Trip.findById(req.params.id).populate('dropHospital');
+    if (!loaded)                    return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (loaded.status === 'completed') return res.status(400).json({ success: false, message: 'Trip already completed.' });
+    if (loaded.status === 'cancelled') return res.status(400).json({ success: false, message: 'Cannot complete a cancelled trip.' });
+    // Only a trip a crew has (dispatched or en route, with a driver AND
+    // their ambulance) can be completed and billed. A booking nobody took —
+    // or one "dispatched" to an ambulance with no driver — is assigned or
+    // cancelled with a reason instead.
+    if (!['dispatched', 'en_route'].includes(loaded.status) || !hasCrew(loaded)) {
+      return res.status(400).json({ success: false, message: 'This booking has no crew assigned — assign a vehicle/driver, or cancel it with a reason.' });
+    }
 
     // Driver guard
-    if (req.user.role === 'driver' && trip.driver?.toString() !== req.user._id.toString()) {
+    if (req.user.role === 'driver' && loaded.driver?.toString() !== req.user._id.toString()) {
       return res.status(403).json({ success: false, message: 'You can only complete your own trips.' });
     }
+
+    // Exactly one completion — and one bill — per trip: a second Complete,
+    // or a Cancel/Assign at the same moment, finds the trip claimed.
+    const claim = await claimTrip(loaded._id, { status: { $in: ['dispatched', 'en_route'] }, driver: loaded.driver });
+    if (!claim) return busy(res);
+    let committed;
+    try {
+    committed = await commitClaimed(loaded._id, claim, { status: { $in: ['dispatched', 'en_route'] }, driver: loaded.driver }, async (trip, session) => {
+    await trip.populate('dropHospital');
+    if (!hasCrew(trip)) throw new ClaimLost();
 
     // ── 1. Update distance — actualDistanceKm (driver app's client-side
     //      haversine accumulation over the en_route GPS pings) takes
@@ -995,7 +1133,7 @@ exports.completeTrip = async (req, res, next) => {
         gstRate          : GST_RATE,
       });
     } catch (fareErr) {
-      return res.status(400).json({ success: false, message: fareErr.message });
+      throw Object.assign(new Error(fareErr.message), { completionFareError: true });
     }
 
     // Bracketing timestamp for both wait calcs below and the trip's own
@@ -1087,16 +1225,15 @@ exports.completeTrip = async (req, res, next) => {
     trip.status       = 'completed';
     trip.completedAt  = completedAt;
     trip.closeAllOpenWaitSegments(trip.completedAt);
-    await trip.save();
-
-    // Fire-and-forget WhatsApp notification -- no-ops internally for any
-    // trip that isn't bookingSource:'whatsapp'. trip.grandTotal above is
-    // already the final billed amount (fare + wait charges) by this point.
-    whatsappNotifications.notifyTripCompleted(trip)
-      .catch((err) => console.error('[whatsappNotifications] notifyTripCompleted failed:', err.message));
+    await trip.save({ session });
 
     // ── 3. Auto-generate Bill ─────────────────────────────────
-    const bill = await Bill.create({
+    // Status, bill, income and the driver's release commit together (this
+    // whole block is one transaction), and a bill or income entry that
+    // already exists for this trip is reused, never repeated — so a crash
+    // or a retry at any point can't leave a half-billed trip or bill twice.
+    const existingBill = await Bill.findOne({ trip: trip._id }).session(session);
+    const bill = existingBill || (await Bill.create([{
       trip            : trip._id,
       patient         : trip.patientName,
       hospital        : trip.dropHospital?._id,
@@ -1108,22 +1245,25 @@ exports.completeTrip = async (req, res, next) => {
       gstAmount       : fare.gstAmount,
       waitCharge      : trip.waitCharge,
       grandTotal      : trip.grandTotal,
-    });
+    }], { session }))[0];
 
     // Link bill to trip
     trip.billId = bill._id;
-    await trip.save();
+    await trip.save({ session });
 
     // ── 4. Auto-create Income ledger entry ─────────────────────
-    await Income.create({
-      category   : 'trip_fare',
-      amount     : trip.grandTotal,
-      description: `Trip ${trip.tripNumber} — ${trip.patientName}`,
-      date       : new Date(),
-      trip       : trip._id,
-      vehicle    : trip.vehicle,
-      recordedBy : req.user._id,
-    });
+    const hasIncome = await Income.exists({ trip: trip._id, category: 'trip_fare' }).session(session);
+    if (!hasIncome) {
+      await Income.create([{
+        category   : 'trip_fare',
+        amount     : trip.grandTotal,
+        description: `Trip ${trip.tripNumber} — ${trip.patientName}`,
+        date       : new Date(),
+        trip       : trip._id,
+        vehicle    : trip.vehicle,
+        recordedBy : req.user._id,
+      }], { session });
+    }
 
     // ── 5. Release vehicle & driver ───────────────────────────
     if (trip.driver) {
@@ -1133,8 +1273,25 @@ exports.completeTrip = async (req, res, next) => {
           'availability.updatedAt': new Date(),
         },
         $inc: { completedTripsCount: 1 },
-      });
+      }, { session });
     }
+
+    return { trip, bill };
+    });
+    } catch (err) {
+      if (err.completionFareError) return res.status(400).json({ success: false, message: err.message });
+      throw err;
+    } finally {
+      await releaseTrip(loaded._id, claim);
+    }
+    if (!committed.ok) return busy(res);
+    const { trip, bill } = committed.result;
+
+    // After the commit only. Fire-and-forget WhatsApp notification -- no-ops
+    // internally for any trip that isn't bookingSource:'whatsapp'.
+    // trip.grandTotal is the final billed amount (fare + wait charges).
+    whatsappNotifications.notifyTripCompleted(trip)
+      .catch((err) => console.error('[whatsappNotifications] notifyTripCompleted failed:', err.message));
 
     await bill.populate(['trip', 'hospital']);
 
@@ -1218,26 +1375,41 @@ exports.declineTrip = async (req, res, next) => {
 
     const previousDriver  = trip.driver;
 
+    // Only while it is still dispatched to THIS driver and nothing else is
+    // being applied (a CRM reassign/cancel at the same moment wins or loses
+    // cleanly, never half each).
+    const guard = { status: 'dispatched', driver: req.user._id };
+    const claim = await claimTrip(trip._id, guard);
+    if (!claim) return busy(res);
+    let committed;
+    try {
+      committed = await commitClaimed(trip._id, claim, guard, async (t, session) => {
+        t.status       = 'booked';
+        t.vehicle       = undefined;
+        t.driver        = undefined;
+        t.dispatchedAt  = undefined;
+        t.driverConfirmed = false; // defensive — trip is unassigned again anyway
+        await t.save({ session });
+        if (previousDriver) {
+          await User.findByIdAndUpdate(previousDriver, {
+            'availability.status'   : 'available',
+            'availability.updatedAt': new Date(),
+          }, { session });
+        }
+        return t;
+      });
+    } finally {
+      await releaseTrip(trip._id, claim);
+    }
+    if (!committed.ok) return busy(res);
+    Object.assign(trip, { status: 'booked', driver: undefined, vehicle: undefined, dispatchedAt: undefined, driverConfirmed: false });
+
     TripCallEvent.create({
       tripId  : trip._id,
       driverId: req.user._id,
       type    : 'REJECTED',
       source  : 'backend',
     }).catch((err) => console.log('[TripCallEvent] Could not log REJECTED:', err.message));
-
-    trip.status       = 'booked';
-    trip.vehicle       = undefined;
-    trip.driver        = undefined;
-    trip.dispatchedAt  = undefined;
-    trip.driverConfirmed = false; // defensive — trip is unassigned again anyway
-    await trip.save();
-
-    if (previousDriver) {
-      await User.findByIdAndUpdate(previousDriver, {
-        'availability.status'   : 'available',
-        'availability.updatedAt': new Date(),
-      });
-    }
 
     return res.json({ success: true, message: 'Trip declined and returned to the assignment pool.', trip });
   } catch (err) {
@@ -1253,23 +1425,42 @@ exports.declineTrip = async (req, res, next) => {
 // ============================================================
 exports.cancelTrip = async (req, res, next) => {
   try {
-    const { reason } = req.body;
-    const trip = await Trip.findById(req.params.id);
-    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
-    if (trip.status === 'completed' || trip.status === 'cancelled') {
-      return res.status(400).json({ success: false, message: `Trip is already ${trip.status}.` });
+    // An operator cancels on purpose, saying why — stale bookings are never
+    // cancelled without one.
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length < 3 || reason.length > 300) {
+      return res.status(400).json({ success: false, message: 'Give a reason for cancelling (3–300 characters).' });
+    }
+    const loaded = await Trip.findById(req.params.id);
+    if (!loaded) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    if (loaded.status === 'completed' || loaded.status === 'cancelled') {
+      return res.status(400).json({ success: false, message: `Trip is already ${loaded.status}.` });
     }
 
-    trip.status             = 'cancelled';
-    trip.cancelledAt        = new Date();
-    trip.closeAllOpenWaitSegments(trip.cancelledAt);
-    trip.cancellationReason = reason;
-    await trip.save();
-
-    // Release vehicle
-    if (trip.driver) {
-      await User.findByIdAndUpdate(trip.driver, { 'availability.status': 'available' });
+    // Not while an assign or complete is being applied.
+    const guard = { status: { $in: ACTIVE_TRIP_STATES } };
+    const claim = await claimTrip(loaded._id, guard);
+    if (!claim) return busy(res);
+    let committed;
+    try {
+      committed = await commitClaimed(loaded._id, claim, guard, async (t, session) => {
+        t.status             = 'cancelled';
+        t.cancelledAt        = new Date();
+        t.closeAllOpenWaitSegments(t.cancelledAt);
+        t.cancellationReason = reason;
+        t.cancelledBy        = req.user?._id;
+        await t.save({ session });
+        // Release vehicle
+        if (t.driver) {
+          await User.findByIdAndUpdate(t.driver, { 'availability.status': 'available' }, { session });
+        }
+        return t;
+      });
+    } finally {
+      await releaseTrip(loaded._id, claim);
     }
+    if (!committed.ok) return busy(res);
+    const trip = committed.result;
 
     return res.json({ success: true, message: 'Trip cancelled.', trip });
   } catch (err) {
@@ -1307,15 +1498,29 @@ exports.customerCancelTrip = async (req, res, next) => {
       });
     }
 
-    trip.status             = 'cancelled';
-    trip.cancelledAt        = new Date();
-    trip.closeAllOpenWaitSegments(trip.cancelledAt);
-    trip.cancellationReason = reason || 'Cancelled by customer';
-    await trip.save();
-
-    if (trip.driver) {
-      await User.findByIdAndUpdate(trip.driver, { 'availability.status': 'available' });
+    // Same rules as every other cancel: only an active trip, still before
+    // pickup, and not while the crew or the CRM is changing it.
+    const guard = { status: { $in: ACTIVE_TRIP_STATES }, pickupVerified: { $ne: true } };
+    const claim = await claimTrip(trip._id, guard);
+    if (!claim) return res.status(409).json({ success: false, message: 'This trip is being updated right now. Please try again in a moment, or call the helpline.' });
+    let committed;
+    try {
+      committed = await commitClaimed(trip._id, claim, guard, async (t, session) => {
+        t.status             = 'cancelled';
+        t.cancelledAt        = new Date();
+        t.closeAllOpenWaitSegments(t.cancelledAt);
+        t.cancellationReason = (typeof reason === 'string' && reason.trim().slice(0, 300)) || 'Cancelled by customer';
+        await t.save({ session });
+        if (t.driver) {
+          await User.findByIdAndUpdate(t.driver, { 'availability.status': 'available' }, { session });
+        }
+        return t;
+      });
+    } finally {
+      await releaseTrip(trip._id, claim);
     }
+    if (!committed.ok) return res.status(409).json({ success: false, message: 'This trip was just updated. Please refresh, or call the helpline.' });
+    Object.assign(trip, { status: committed.result.status, cancelledAt: committed.result.cancelledAt });
 
     return res.json({
       success: true,
@@ -1606,14 +1811,18 @@ exports.getLiveBoard = async (req, res, next) => {
 
     const availableVehicles = ambulanceEntries;
 
-    // Trip documents: the toJSON rule replaces the customer's number with
-    // patientPhoneMasked for every caller.
+    // Each trip as its JSON form (the customer's number masked per viewer)
+    // plus how urgent it is — read-only: an overdue booking stays booked
+    // and counted until an operator assigns or cancels it.
+    const now = Date.now();
+    const liveTrips = activeTrips.map((t) => ({ ...t.toJSON(), dispatch: dispatchStateOf(t, now) }));
     return res.json({
       success: true,
-      liveTrips       : activeTrips,
+      liveTrips,
       availableVehicles,
       counts: {
-        active   : activeTrips.length,
+        // active: every booked/dispatched/en-route trip, overdue included.
+        ...countDispatchStates(liveTrips.map((t) => t.dispatch)),
         available: availableVehicles.length,
       },
     });

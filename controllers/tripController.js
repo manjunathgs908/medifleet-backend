@@ -276,6 +276,38 @@ exports.createTrip = async (req, res, next) => {
 // Throws an error flagged isFareError when the fare cannot be computed.
 // bookingSource is set only by callers that know it; createTrip leaves the
 // schema default alone, as it always has.
+// A booked trip makes its lead converted, always: the booking wins over
+// any lead change made at the same moment. Applied at the lead's current
+// rev, so the history entry records the status and follow-up it really
+// replaced (a change that lands in between is re-read, not overwritten
+// blindly); a dashboard change from before the booking then gets a 409.
+// The follow-up reminder ends; its time stays in the history entry.
+async function convertLead(leadId, trip, bookedBy) {
+  const booker = bookedBy ? await User.findById(bookedBy).select('name').lean() : null;
+  const entry = (before) => ({
+    type: 'status', at: new Date(), by: bookedBy || undefined, byName: booker?.name,
+    detail: {
+      from: before ? before.status || 'new' : null, to: 'converted', trip: trip.tripNumber,
+      ...(before?.nextFollowUpAt ? { followUpCleared: before.nextFollowUpAt } : {}),
+    },
+  });
+  const update = (before) => ({
+    $set  : { status: 'converted', convertedTrip: trip._id },
+    $unset: { nextFollowUpAt: 1, lostReason: 1 },
+    $inc  : { rev: 1 },
+    $push : { history: entry(before) },
+  });
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const before = await Lead.findById(leadId).select('status nextFollowUpAt rev').lean();
+    if (!before) return;
+    const rev = before.rev || 0;
+    const done = await Lead.findOneAndUpdate({ _id: leadId, ...(rev === 0 ? { rev: { $in: [0, null] } } : { rev }) }, update(before));
+    if (done) return;
+  }
+  // Still contended after five tries: convert anyway — the trip exists.
+  await Lead.findByIdAndUpdate(leadId, update(null));
+}
+
 async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
   const {
     // Internal (owner/CRM) fields
@@ -367,9 +399,7 @@ async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
   const trip = await Trip.create(tripData);
 
   // Mark lead as converted if applicable
-  if (leadId) {
-    await Lead.findByIdAndUpdate(leadId, { status: 'converted', convertedTrip: trip._id });
-  }
+  if (leadId) await convertLead(leadId, trip, bookedBy);
 
   // ── No auto-assign. Dispatch is a human decision. ─────────
   //

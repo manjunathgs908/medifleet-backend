@@ -11,7 +11,10 @@ jest.mock('../models', () => ({
     find: (...a) => mockFind(...a),
     schema: { path: () => ({ enumValues: ['new', 'contacted', 'converted', 'lost', 'spam'] }) },
   },
+  User: { find: () => ({ select: () => ({ lean: async () => [] }) }) },
 }));
+// The list also shows an open missed-call callback linked to a lead.
+jest.mock('../models/CallbackTask', () => ({ find: () => ({ select: () => ({ lean: async () => [] }) }) }));
 
 const router = require('../routes/leads');
 

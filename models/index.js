@@ -502,6 +502,33 @@ const leadSchema = new Schema(
     notes       : { type: String },
     convertedTrip: { type: Schema.Types.ObjectId, ref: 'Trip' }, // If lead became a trip
 
+    // ── Follow-up (controllers/leadController.js) ─────────────
+    // All optional: leads from before this existed are left as they are
+    // and read as unassigned / no follow-up / rev 0.
+    assignedToName: { type: String },
+    nextFollowUpAt: { type: Date },        // CRM reminder only — never a call or message
+    lostReason    : { type: String, trim: true },
+    followUpNotes : [{
+      text  : { type: String, trim: true },
+      at    : Date,
+      by    : { type: Schema.Types.ObjectId, ref: 'User' },
+      byName: String,
+      _id   : false,
+    }],
+    // Assignment, follow-up time and status changes: who, when, from/to.
+    history: [{
+      type  : { type: String },
+      at    : Date,
+      by    : { type: Schema.Types.ObjectId, ref: 'User' },
+      byName: String,
+      detail: Schema.Types.Mixed,
+      _id   : false,
+    }],
+    // Bumped by every assignment / follow-up / status change: an update
+    // made from an out-of-date view is refused (409), never applied over
+    // someone else's.
+    rev: { type: Number },
+
     // â”€â”€ Call popup data (populated from telephony webhook) â”€â”€â”€
     callHistory: [
       {
@@ -528,9 +555,14 @@ leadSchema.set('toJSON', {
       delete ret.phone;
       if (full) ret.phone = full;
     }
+    if (!('rev' in ret) || ret.rev == null) ret.rev = 0;
     return ret;
   },
 });
+
+// The dashboard's due-today / overdue / unassigned views.
+leadSchema.index({ status: 1, nextFollowUpAt: 1 });
+leadSchema.index({ status: 1, assignedTo: 1 });
 
 const Lead = mongoose.model('Lead', leadSchema);
 

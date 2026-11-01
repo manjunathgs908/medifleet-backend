@@ -104,7 +104,9 @@ const ALLOWED = {
                       ['POST', `/api/callbacks/not-routed/${ID}/queue`], ['POST', `/api/callbacks/not-routed/${ID}/dismiss`]],
   'WhatsApp Chats' : [['GET', '/api/whatsapp/conversations'], ['POST', '/api/whatsapp/call-outcome'], ['GET', '/api/whatsapp/customer/9000000001']],
   'WhatsApp Leads' : [['GET', '/api/whatsapp-leads'], ['PATCH', `/api/whatsapp-leads/${ID}/status`]],
-  Leads            : [['GET', '/api/leads'], ['PUT', `/api/leads/${ID}`]],
+  Leads            : [['GET', '/api/leads'], ['GET', '/api/leads?view=overdue'], ['GET', '/api/leads/summary'], ['GET', '/api/leads/assignees'],
+                      ['PATCH', `/api/leads/${ID}/assign`], ['PATCH', `/api/leads/${ID}/follow-up`], ['PATCH', `/api/leads/${ID}/status`],
+                      ['POST', `/api/leads/${ID}/notes`], ['PUT', `/api/leads/${ID}`]],
   Hospitals        : [['GET', '/api/hospitals'], ['POST', '/api/hospitals']],
 };
 
@@ -147,7 +149,9 @@ describe('telecaller (operations) access', () => {
   });
 
   it('a driver gets none of the operations pages', async () => {
-    for (const [method, path] of [['GET', '/api/sos'], ['GET', '/api/leads'], ['GET', '/api/whatsapp-leads'], ['GET', '/api/auth/users']]) {
+    for (const [method, path] of [['GET', '/api/sos'], ['GET', '/api/leads'], ['GET', '/api/whatsapp-leads'], ['GET', '/api/auth/users'],
+      ['GET', '/api/leads/summary'], ['PATCH', `/api/leads/${ID}/assign`], ['PATCH', `/api/leads/${ID}/follow-up`],
+      ['PATCH', `/api/leads/${ID}/status`], ['POST', `/api/leads/${ID}/notes`]]) {
       expect([method, path, await call('driver', method, path)]).toEqual([method, path, 403]);
     }
   });

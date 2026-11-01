@@ -477,9 +477,12 @@ exports.generateHospitalInvoice = async (req, res, next) => {
 
     const discountPercent = hospital.tieUp?.discountPercent || 0;
 
-    // ── 2. Date range (unchanged) ─────────────────────────────
-    const periodStart = new Date(y, m - 1, 1);
-    const periodEnd   = new Date(y, m, 0, 23, 59, 59);
+    // ── 2. Date range: the India calendar month (Asia/Kolkata, UTC+05:30,
+    //    no daylight saving), whatever the server's own clock — a trip
+    //    completed at 00:30 IST on the 1st belongs to that month. [start, end).
+    const IST_MS = 330 * 60 * 1000;
+    const periodStart = new Date(Date.UTC(y, m - 1, 1) - IST_MS);
+    const periodEnd   = new Date(Date.UTC(y, m, 1) - IST_MS);
     const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     const invoiceNumber = `INV-${y}-${String(m).padStart(2, '0')}-${String(hospital._id).slice(-6).toUpperCase()}`;
 
@@ -498,7 +501,7 @@ exports.generateHospitalInvoice = async (req, res, next) => {
           const candidates = await Trip.find({
             dropHospital    : hospitalId,
             status          : 'completed',
-            completedAt     : { $gte: periodStart, $lte: periodEnd },
+            completedAt     : { $gte: periodStart, $lt: periodEnd },
             isHospitalBilled: false,
             _id             : { $nin: keptTrips },
           }).select('_id tripNumber billId').session(session);

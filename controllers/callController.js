@@ -39,6 +39,8 @@ const Ambulance    = require('../models/Ambulance');
 const Quote        = require('../models/Quote');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
+const CallbackTask = require('../models/CallbackTask');
+const callbackQueue = require('../services/callbackQueue');
 const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
 const WebrtcEndpoint   = require('../models/WebrtcEndpoint');
 const plivo        = require('../services/plivoService');
@@ -390,7 +392,7 @@ class CallError extends Error {
 // a driver only the customer of a live trip assigned to them, a fleet owner
 // only on their own ambulances, CRM staff anyone the CRM shows them.
 async function resolveCustomer(req, agent) {
-  const { tripId, leadId, quoteId, whatsappLeadId, customerRef, callLogId } = req.body || {};
+  const { tripId, leadId, quoteId, whatsappLeadId, customerRef, callLogId, callbackTaskId } = req.body || {};
 
   if (tripId) {
     const query = isObjectId(String(tripId)) ? { _id: tripId } : { tripNumber: String(tripId) };
@@ -429,12 +431,24 @@ async function resolveCustomer(req, agent) {
     if (!wl) throw new CallError(404, 'Lead not found.');
     return { phone: wl.phone, context: 'whatsapp_lead', refs: { whatsappLead: wl._id } };
   }
+  if (callbackTaskId) {
+    // "Call back" from the callback queue. Only places the call: the task
+    // stays open until a person resolves it; this call is listed on it as
+    // an attempt (callbackTask).
+    if (!isObjectId(String(callbackTaskId))) throw new CallError(404, 'Callback not found.');
+    const task = await CallbackTask.findById(callbackTaskId).select('+customerPhone trip lead');
+    if (!task?.customerPhone) throw new CallError(404, 'Callback not found.');
+    return { phone: task.customerPhone, context: 'call_back', refs: { trip: task.trip, lead: task.lead, callbackTask: task._id } };
+  }
   if (callLogId) {
     // "Call back" from the call history -- typically a missed incoming call.
     if (!isObjectId(String(callLogId))) throw new CallError(404, 'Call not found.');
-    const prior = await CallLog.findById(callLogId).select('+customerPhone trip lead');
+    const prior = await CallLog.findById(callLogId).select('+customerPhone trip lead callbackTask');
     if (!prior?.customerPhone) throw new CallError(404, 'Call not found.');
-    return { phone: prior.customerPhone, context: 'call_back', refs: { trip: prior.trip, lead: prior.lead } };
+    // A missed call still waiting in the callback queue: this call counts
+    // as an attempt on that task (it does not resolve it).
+    const openTask = prior.callbackTask && await CallbackTask.exists({ _id: prior.callbackTask, state: 'open' });
+    return { phone: prior.customerPhone, context: 'call_back', refs: { trip: prior.trip, lead: prior.lead, ...(openTask ? { callbackTask: prior.callbackTask } : {}) } };
   }
   if (customerRef) {
     const phone = phoneFromRef(customerRef);
@@ -669,6 +683,9 @@ exports.incoming = async (req, res, next) => {
       endedAt      : ringing ? undefined : new Date(),
       // Phones go straight into this call's Dial only when no app rings first.
       dialledPhones: ringing && !sipUsers.length ? agentPhones.map(normalisePhone) : undefined,
+      // A customer's call, so a miss goes to the callback queue — not a
+      // staff member testing from their own ring phone.
+      callbackEligible: isMobile(from) && !callerWasRingPhone ? true : undefined,
     });
     plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
     serverTrail('server:incoming_routed', {
@@ -821,7 +838,12 @@ exports.events = async (req, res, next) => {
         // A connected call is never turned back into a failure by a late,
         // repeated or concurrent report; "completed" may replace a missed
         // set by a hang-up that arrived first.
-        if (nextStatus) await setStatusIf(log, nextStatus, { $ne: 'completed' });
+        const applied = nextStatus ? await setStatusIf(log, nextStatus, { $ne: 'completed' }) : false;
+        // Already in the callback queue as missed, but answered after all:
+        // take it off at once (the queue's sweep also catches it if this fails).
+        if (applied && nextStatus === 'completed' && log.direction === 'inbound' && log.callbackTask) {
+          callbackQueue.retractAnswered(log._id).catch((err) => console.error(`[calls] callback retract failed log=${log._id}:`, err?.message || err));
+        }
       }
       // A customer whose call nobody picked up hears why before hanging up.
       if (log?.direction === 'inbound' && dialStatus && dialStatus !== 'completed') {
@@ -885,6 +907,9 @@ exports.events = async (req, res, next) => {
         totalSec      : Number.isFinite(total) ? total : undefined,
         startedAt     : b.StartTime ? new Date(b.StartTime) : new Date(),
         endedAt       : new Date(),
+        // Not queued automatically — nothing here rang staff. Listed under
+        // "Not routed by CRM" for a person to add or dismiss.
+        callbackReview: isMobile(from) ? { state: 'pending' } : undefined,
       });
       console.warn(`[calls] inbound call ${b.CallUUID} reached hangup with no /incoming log — logged as not_routed (log=${created._id}). Check the Plivo number is linked to the "SaveLife CRM" application.`);
     } else {

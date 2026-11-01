@@ -50,6 +50,7 @@ const MOUNTS = {
   '/api/seo'             : '../routes/seo',
   '/api/quotes'          : '../routes/quotes',
   '/api/calls'           : '../routes/calls',
+  '/api/callbacks'       : '../routes/callbacks',
 };
 
 // Every route's own handler -> 200, keeping all the guards in front of it.
@@ -98,6 +99,9 @@ const ALLOWED = {
   'Trip Alerts'    : [['GET', '/api/trip-call-events?type=NO_RESPONSE']],
   'Posting Alerts' : [['GET', '/api/geofence-events']],
   'SOS Alerts'     : [['GET', '/api/sos'], ['PATCH', `/api/sos/${ID}/resolve`]],
+  Callbacks        : [['GET', '/api/callbacks'], ['GET', '/api/callbacks/summary'], ['GET', '/api/callbacks/assignees'], ['GET', '/api/callbacks/not-routed'],
+                      ['PATCH', `/api/callbacks/${ID}/assign`], ['PATCH', `/api/callbacks/${ID}/schedule`], ['POST', `/api/callbacks/${ID}/resolve`],
+                      ['POST', `/api/callbacks/not-routed/${ID}/queue`], ['POST', `/api/callbacks/not-routed/${ID}/dismiss`]],
   'WhatsApp Chats' : [['GET', '/api/whatsapp/conversations'], ['POST', '/api/whatsapp/call-outcome'], ['GET', '/api/whatsapp/customer/9000000001']],
   'WhatsApp Leads' : [['GET', '/api/whatsapp-leads'], ['PATCH', `/api/whatsapp-leads/${ID}/status`]],
   Leads            : [['GET', '/api/leads'], ['PUT', `/api/leads/${ID}`]],

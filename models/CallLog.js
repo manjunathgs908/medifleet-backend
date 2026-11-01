@@ -90,11 +90,27 @@ const CallLogSchema = new mongoose.Schema(
     recordingUrl: { type: String },
     recordingId : { type: String },
     recordingSec: { type: Number },
+
+    // Missed-call callback queue (services/callbackQueue.js).
+    //   callbackEligible: set by /incoming on a real customer's call (a
+    //     mobile number that is not one of our ring phones). Only calls
+    //     carrying it can be queued — none from before the queue existed.
+    //   callbackReview: a 'not_routed' call (created at hang-up) waiting for
+    //     a person to add it to the queue or dismiss it — {state, by, byName, at}.
+    //   callbackTask: inbound — the task this missed call belongs to;
+    //     outbound — the task this call was a callback attempt for.
+    callbackEligible: { type: Boolean },
+    callbackReview  : { type: mongoose.Schema.Types.Mixed },
+    callbackTask    : { type: mongoose.Schema.Types.ObjectId, ref: 'CallbackTask', index: true },
+    // A queued missed call later reported answered: taken off its task's
+    // missed count at this time.
+    callbackRetractedAt: { type: Date },
   },
   { timestamps: true },
 );
 
 CallLogSchema.index({ createdAt: -1 });
+CallLogSchema.index({ callbackEligible: 1, status: 1, startedAt: 1 }, { partialFilterExpression: { callbackEligible: true } });
 
 // Whether an "active" stored status can still be true (display only).
 const { liveStateOf } = require('../utils/callLiveness');

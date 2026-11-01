@@ -33,15 +33,23 @@ const paymentSchema = new Schema(
     // original is never changed — with the negative of the original amount,
     // so every balance and total that adds receipts up nets it out, on the
     // date it was made (receivedAt = when the reversal was recorded).
-    kind  : { type: String, enum: ['advance', 'payment', 'reversal'], required: true },
+    // 'refund': money the owner paid BACK to the customer outside the system
+    // (cash / UPI / bank) — RFD/<FY>/NNNNNN, negative amount, dated when it
+    // was paid out. It reduces what was received on the bill / trip and is
+    // reported as money paid out, never as a reversal. Record only: nothing
+    // here sends money.
+    kind  : { type: String, enum: ['advance', 'payment', 'reversal', 'refund'], required: true },
 
     amountPaise: {
       type: Number, required: true,
       validate: {
-        validator(v) { return Number.isInteger(v) && (this.kind === 'reversal' ? v < 0 : v > 0); },
-        message: 'amountPaise must be a whole number of paise: positive, or negative for a reversal.',
+        validator(v) { return Number.isInteger(v) && (['reversal', 'refund'].includes(this.kind) ? v < 0 : v > 0); },
+        message: 'amountPaise must be a whole number of paise: positive, or negative for a reversal or refund.',
       },
     },
+    // Refund only: the outgoing UPI / bank reference. Kept apart from
+    // `reference` (incoming money, which has its own uniqueness rule).
+    payoutReference: { type: String, trim: true },
     method     : { type: String, enum: Object.keys(METHODS), required: true },
     reference  : { type: String, trim: true },  // UPI ref / bank UTR / gateway payment id
     receivedAt : { type: Date, required: true }, // when the money was received (may be before recordedAt)
@@ -121,7 +129,17 @@ const issueSchema = new Schema(
     bill     : { type: Schema.Types.ObjectId, ref: 'Bill' },
     payment  : { type: Schema.Types.ObjectId, ref: 'Payment' },
     detail   : Schema.Types.Mixed,
+    // Resolved by the owner (billingController.resolveProviderIssue): an
+    // outcome and a note, who and when. Records a decision only — it never
+    // creates a receipt or changes any money record.
     resolvedAt: Date,
+    resolution: {
+      outcome: { type: String, enum: ['matched_to_bill', 'refunded_at_razorpay', 'not_ours', 'duplicate_notice', 'other'] },
+      note   : String,
+      by     : { type: Schema.Types.ObjectId, ref: 'User' },
+      byName : String,
+    },
+    rev: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

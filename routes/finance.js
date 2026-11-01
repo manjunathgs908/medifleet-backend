@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { Expense, Income, Loan } = require('../models');
 const { protect, authorize } = require('../middleware/auth');
+const { parseAmount } = require('../utils/money');
 
 router.get('/expenses', protect, authorize('owner'), async (req, res, next) => {
   try { const expenses = await Expense.find().sort({ date: -1 }); res.json({ success: true, expenses }); } catch(err) { next(err); }
@@ -15,8 +16,30 @@ router.get('/income', protect, authorize('owner'), async (req, res, next) => {
   try { const income = await Income.find().sort({ date: -1 }); res.json({ success: true, income }); } catch(err) { next(err); }
 });
 
+// Manual income: donation / grant / misc only. trip_fare is written when a
+// trip completes and hospital_credit by the system — entering either by hand
+// would count the same revenue twice. Only these fields are accepted.
+const MANUAL_INCOME = ['donation', 'grant', 'misc'];
 router.post('/income', protect, authorize('owner'), async (req, res, next) => {
-  try { const income = await Income.create({ ...req.body, recordedBy: req.user._id }); res.status(201).json({ success: true, income }); } catch(err) { next(err); }
+  try {
+    const b = req.body || {};
+    if (!MANUAL_INCOME.includes(b.category)) {
+      return res.status(400).json({ success: false, message: 'Income can be entered for donation, grant or misc only — trip fares and hospital credit are recorded automatically.' });
+    }
+    const paise = parseAmount(b.amount);
+    if (!paise) return res.status(400).json({ success: false, message: 'Enter an amount in rupees (up to 2 decimals, above ₹0).' });
+    const description = typeof b.description === 'string' ? b.description.trim() : '';
+    if (description.length > 200) return res.status(400).json({ success: false, message: 'Keep the description under 200 characters.' });
+    let date = new Date();
+    if (b.date !== undefined && b.date !== '') {
+      // A plain date ("2026-11-01") is that day in India.
+      date = typeof b.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(b.date) ? new Date(`${b.date}T00:00:00+05:30`) : new Date(NaN);
+      if (Number.isNaN(date.getTime())) return res.status(400).json({ success: false, message: 'Give the date as YYYY-MM-DD.' });
+      if (date.getTime() > Date.now() + 864e5) return res.status(400).json({ success: false, message: 'The date is in the future.' });
+    }
+    const income = await Income.create({ category: b.category, amount: paise / 100, description: description || undefined, date, recordedBy: req.user._id });
+    res.status(201).json({ success: true, income });
+  } catch(err) { next(err); }
 });
 
 router.get('/loans', protect, authorize('owner'), async (req, res, next) => {

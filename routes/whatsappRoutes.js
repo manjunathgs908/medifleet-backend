@@ -29,6 +29,7 @@ const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { Trip, Lead } = require('../models');
+const LeadClaim = require('../models/LeadClaim');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { maskPhone, customerRef, phoneFromRef, isCustomerRef } = require('../utils/customerPhone');
 const { fullPhone } = require('../utils/phoneViewer');
@@ -124,10 +125,10 @@ async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId
     },
   });
 
-  if (existingLead) {
-    // Applied only at the rev just read, so a dashboard change or a booking
-    // made in between is never overwritten: this re-reads and re-decides.
-    let lead = existingLead;
+  // Applied only at the rev just read, so a dashboard change or a booking
+  // made in between is never overwritten: this re-reads and re-decides.
+  const updateExisting = async (found) => {
+    let lead = found;
     for (let attempt = 0; attempt < 5 && lead; attempt += 1) {
       const rev = lead.rev || 0;
       const e = effectFor(lead);
@@ -154,22 +155,48 @@ async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId
       lead = await Lead.findById(lead._id);
     }
     throw new Error('Lead changed repeatedly while recording this call outcome.');
-  }
+  };
+  if (existingLead) return updateExisting(existingLead);
 
-  const e = effectFor(null);
-  return Lead.create({
-    source: 'whatsapp',
-    phone: normalisedPhone,
-    status: e.status,
-    message: serviceLabel || undefined,
-    notes: noteEntry || undefined,
-    convertedTrip: trip?._id,
-    lostReason: e.lostReason,
-    nextFollowUpAt: e.nextFollowUpAt,
-    callHistory: [callHistoryEntry],
-    history: [historyEntry(null, e)],
-    receivedAt: calledAt,
-  });
+  // A new number: create the lead in one transaction with its claim
+  // (models/LeadClaim.js). Two outcomes at the same instant both write the
+  // claim, so only one commits; the other is retried, finds that lead and
+  // updates it — one lead, not two. Existing leads are not touched.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let created = null;
+    let found = null;
+    const session = await Lead.startSession();
+    try {
+      await session.withTransaction(async () => {
+        created = null; found = null;
+        await LeadClaim.updateOne({ _id: `whatsapp:${normalisedPhone}` }, { $inc: { hits: 1 } }, { upsert: true, session });
+        found = await Lead.findOne({ source: 'whatsapp', phone: normalisedPhone }).session(session);
+        if (found) return;
+        const e = effectFor(null);
+        [created] = await Lead.create([{
+          source: 'whatsapp',
+          phone: normalisedPhone,
+          status: e.status,
+          message: serviceLabel || undefined,
+          notes: noteEntry || undefined,
+          convertedTrip: trip?._id,
+          lostReason: e.lostReason,
+          nextFollowUpAt: e.nextFollowUpAt,
+          callHistory: [callHistoryEntry],
+          history: [historyEntry(null, e)],
+          receivedAt: calledAt,
+        }], { session });
+      });
+    } catch (err) {
+      if (err?.code !== 11000) throw err; // the claim's first insert raced: try again
+      continue;
+    } finally {
+      await session.endSession();
+    }
+    if (found) return updateExisting(found);
+    return created;
+  }
+  throw new Error('Could not record this call outcome on a lead — please try again.');
 }
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message

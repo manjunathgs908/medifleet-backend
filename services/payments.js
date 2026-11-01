@@ -285,6 +285,7 @@ const REASON_MAX = 300;
 // (when it is on a bill); `reversedBy` its existing reversal, if any.
 function reversalBlock(p, { bal = null, reversedBy = null } = {}) {
   if (p.kind === 'reversal') return 'A reversal can\'t itself be reversed.';
+  if (p.kind === 'refund') return 'A refund can\'t be reversed here.';
   if (p.verification !== 'staff_recorded' || !REVERSIBLE_METHODS.includes(p.method)) {
     return 'Only staff-recorded cash, UPI or bank receipts can be reversed here — a Razorpay-verified payment needs the Razorpay dashboard.';
   }
@@ -298,6 +299,85 @@ function reversalBlock(p, { bal = null, reversedBy = null } = {}) {
     if (bal.paidPaise < p.amountPaise) return 'This bill shows less received than the receipt — it needs reconciling first.';
   }
   return null;
+}
+
+// ── Refund paid out to the customer (record only) ────────────────
+// Owner-only (routes). Records money the owner already paid back outside
+// the system (cash / UPI / bank) — this sends nothing and calls no gateway.
+// RFD/<FY>/NNNNNN, negative amount dated when it was paid out, linked to
+// the bill (or, before billing, the trip's advances). Up to what was
+// received there; the bill's paid amount and status drop in the same
+// transaction. Reported as money paid out, apart from collections.
+const REFUND_METHODS = ['cash', 'upi', 'bank_transfer'];
+async function recordRefund({ tripId, amountPaise, method, payoutReference, paidOutAt, reason, requestId, user, now = new Date() }) {
+  await requireIndexes();
+  const text = typeof reason === 'string' ? reason.trim().replace(/\s+/g, ' ') : '';
+  if (text.length < REASON_MIN) throw new PaymentRefused(400, `Give a reason of at least ${REASON_MIN} characters.`);
+  if (text.length > REASON_MAX) throw new PaymentRefused(400, `Keep the reason under ${REASON_MAX} characters.`);
+  if (!REFUND_METHODS.includes(method)) throw new PaymentRefused(400, 'Pick cash, UPI or bank transfer.');
+
+  const replay = async () => {
+    const prior = await Payment.findOne({ requestId });
+    if (!prior) return null;
+    if (prior.kind !== 'refund' || String(prior.trip) !== String(tripId) || prior.amountPaise !== -amountPaise) {
+      throw new PaymentRefused(409, 'This form was already used for something else. Reload and try again.');
+    }
+    return { refund: prior, created: false };
+  };
+  const earlier = await replay();
+  if (earlier) return earlier;
+
+  const fy = financialYear(now);
+  await Payment.Counter.updateOne({ _id: `refund:${fy}` }, { $setOnInsert: { seq: 0 } }, { upsert: true }).catch((e) => { if (e?.code !== 11000) throw e; });
+  const session = await Payment.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const trip = await Trip.findOneAndUpdate({ _id: tripId }, { $inc: { paymentRev: 1 } }, { new: true, session }).select('billId createdAt');
+      if (!trip) throw new PaymentRefused(404, 'Trip not found.');
+      if (await Payment.exists({ requestId }).session(session)) throw new PaymentRefused(0, 'replay', { replay: true });
+      if (paidOutAt < new Date(new Date(trip.createdAt).getTime() - 24 * 3600 * 1000)) {
+        throw new PaymentRefused(400, 'The refund date is before this trip was booked.');
+      }
+      let bill = null;
+      let receivedPaise;
+      if (trip.billId) {
+        bill = await Bill.findById(trip.billId).session(session);
+        if (!bill) throw new PaymentRefused(409, 'This trip\'s bill could not be found — it needs reconciling first.');
+        receivedPaise = toPaise(bill.paidAmount) || 0;
+      } else {
+        receivedPaise = await receiptsTotal({ trip: trip._id, bill: null }, session);
+      }
+      if (receivedPaise <= 0) throw new PaymentRefused(409, 'Nothing has been received on this trip, so there is nothing to refund.');
+      if (amountPaise > receivedPaise) {
+        throw new PaymentRefused(409, `That is more than was received (${formatRupees(receivedPaise)}).`, { limitPaise: receivedPaise });
+      }
+      const c = await Payment.Counter.findOneAndUpdate({ _id: `refund:${fy}` }, { $inc: { seq: 1 } }, { new: true, session });
+      const [refund] = await Payment.create([{
+        receiptNumber: `RFD/${fy}/${String(c.seq).padStart(6, '0')}`, trip: trip._id, bill: bill?._id, kind: 'refund',
+        amountPaise: -amountPaise, method, payoutReference: payoutReference || undefined, receivedAt: paidOutAt,
+        verification: 'staff_recorded', recordedBy: user._id, recordedByName: user.name, requestId, reason: text,
+      }], { session });
+      if (bill) {
+        const paidPaise = receivedPaise - amountPaise;
+        const status = statusFor(paidPaise, toPaise(bill.grandTotal));
+        await Bill.updateOne({ _id: bill._id }, {
+          $set: { paidAmount: toRupees(paidPaise), paymentStatus: status },
+          ...(status === 'paid' ? {} : { $unset: { paidAt: 1 } }),
+        }, { session });
+      }
+      result = { refund, created: true };
+    });
+  } catch (err) {
+    if (err?.replay || (err?.code === 11000 && /requestId/.test(err.message || ''))) {
+      const again = await replay();
+      if (again) return again;
+    }
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+  return result;
 }
 
 async function nextReversalNumber(session, fy) {
@@ -427,7 +507,7 @@ async function applyAdvancesToNewBill(trip, bill, session) {
   if (!advances.length) return bill;
   const paidPaise = advances.reduce((s, p) => s + p.amountPaise, 0);
   const totalPaise = toPaise(bill.grandTotal);
-  const lastReceived = advances.filter((p) => p.kind !== 'reversal').at(-1);
+  const lastReceived = advances.filter((p) => !['reversal', 'refund'].includes(p.kind)).at(-1);
   bill.paidAmount = toRupees(paidPaise);
   bill.paymentStatus = statusFor(paidPaise, totalPaise);
   if (paidPaise > 0) bill.paymentMode = lastReceived.method;
@@ -540,8 +620,9 @@ async function collectionTotals({ from, to }) {
   }
   const openInvoices = invoices.filter((i) => i.status !== 'paid');
   const hospitalReceivablePaise = openInvoices.reduce((s, i) => s + (toPaise(i.netPayable) || 0), 0);
+  // Money in: receipts net of reversals. Refunds are money OUT, reported apart.
   const byVerification = await Payment.aggregate([
-    { $match: { receivedAt: { $gte: from, $lt: to } } },
+    { $match: { receivedAt: { $gte: from, $lt: to }, kind: { $ne: 'refund' } } },
     { $group: { _id: '$verification', paise: { $sum: '$amountPaise' }, n: { $sum: 1 } } },
   ]);
   const v = Object.fromEntries(byVerification.map((r) => [r._id, r.paise]));
@@ -549,6 +630,10 @@ async function collectionTotals({ from, to }) {
   // because their amounts are negative and dated when they were made).
   const [rev] = await Payment.aggregate([
     { $match: { kind: 'reversal', receivedAt: { $gte: from, $lt: to } } },
+    { $group: { _id: null, paise: { $sum: '$amountPaise' }, n: { $sum: 1 } } },
+  ]);
+  const [ref] = await Payment.aggregate([
+    { $match: { kind: 'refund', receivedAt: { $gte: from, $lt: to } } },
     { $group: { _id: null, paise: { $sum: '$amountPaise' }, n: { $sum: 1 } } },
   ]);
   const [held] = await Payment.aggregate([{ $match: { bill: null } }, { $group: { _id: null, paise: { $sum: '$amountPaise' } } }]);
@@ -559,6 +644,11 @@ async function collectionTotals({ from, to }) {
     collectedPaise: (v.staff_recorded || 0) + (v.provider_verified || 0), // net of reversals
     reversedPaise: -(rev?.paise || 0),
     reversalsCount: rev?.n || 0,
+    // Refunds paid out to customers in the period (positive figure), and
+    // what that leaves: collected − refunded.
+    refundedPaise: -(ref?.paise || 0),
+    refundsCount: ref?.n || 0,
+    netCollectedPaise: (v.staff_recorded || 0) + (v.provider_verified || 0) + (ref?.paise || 0),
     collectedStaffRecordedPaise: v.staff_recorded || 0,
     collectedProviderVerifiedPaise: v.provider_verified || 0,
     // All-time, not in any month: recorded as received, timing unverified.
@@ -582,6 +672,6 @@ async function collectionTotals({ from, to }) {
 module.exports = {
   istMonth, collectionTotals, balanceOf, invoicedBills, recordPayment, applyAdvancesToNewBill, applyProviderPayment,
   noteProviderIssue, receiptsTotal, financialYear, indexesReady, requireIndexes, PaymentRefused,
-  reversePayment, reversalBlock, withReversalLinks, REASON_MIN,
+  reversePayment, reversalBlock, withReversalLinks, REASON_MIN, recordRefund,
   _resetIndexCheck: () => { indexState = { ok: false, checkedAt: 0, error: null }; },
 };

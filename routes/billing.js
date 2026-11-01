@@ -17,6 +17,9 @@ router.get('/advances', protect, authorize('owner'), billingCtrl.getAdvances);
 router.get('/issuer', protect, authorize(...OPERATIONS), billingCtrl.getIssuer);
 router.get('/payment-readiness', protect, authorize('owner'), billingCtrl.getPaymentReadiness);
 router.get('/provider-issues', protect, authorize('owner'), billingCtrl.getProviderIssues);
+router.patch('/provider-issues/:id/resolve', protect, authorize('owner'), billingCtrl.resolveProviderIssue);
+// Owner only: record a refund already paid out (record only — sends nothing).
+router.post('/refunds', protect, authorize('owner'), billingCtrl.recordRefund);
 router.post('/hospital-invoice/generate', protect, authorize('owner'), billingCtrl.generateHospitalInvoice);
 router.get('/hospital-invoices', protect, authorize('owner'), billingCtrl.getHospitalInvoices);
 router.put('/hospital-invoices/:id/status', protect, authorize('owner'), billingCtrl.updateInvoiceStatus);

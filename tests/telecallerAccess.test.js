@@ -122,7 +122,8 @@ const BLOCKED = {
   Billing   : [['GET', '/api/billing/bills'], ['GET', '/api/billing/hospital-invoices'], ['GET', `/api/billing/bills/${ID}`],
                ['POST', '/api/billing/payments'], ['GET', `/api/billing/payments/${ID}`], ['GET', '/api/billing/advances'],
                ['PUT', `/api/billing/bills/${ID}/payment`], ['GET', '/api/finance/summary'], ['GET', '/api/billing/provider-issues'],
-               ['POST', `/api/billing/payments/${ID}/reverse`], ['GET', '/api/billing/payment-readiness']],
+               ['POST', `/api/billing/payments/${ID}/reverse`], ['GET', '/api/billing/payment-readiness'],
+               ['POST', '/api/billing/refunds'], ['PATCH', `/api/billing/provider-issues/${ID}/resolve`], ['POST', '/api/finance/income']],
   SEO       : [['GET', '/api/seo/articles']],
   'Plivo live calls': [['GET', '/api/calls/plivo/live']],
 };

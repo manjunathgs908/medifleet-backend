@@ -163,6 +163,10 @@ const billingSettingsSchema = new Schema({
   // Where each series starts in a financial year: { 'tax_invoice:2026-27': 59 }.
   // Applied only before that series' first number is used.
   seriesStart: { type: Map, of: Number, default: undefined },
+  // Each time the tax-invoice series was moved on to continue from a number
+  // (invoicingController.restartTaxSeries): who, when, which unpaid CRM
+  // numbers were deleted, and the number the series continues from.
+  seriesRestarts: { type: [{ _id: false, at: Date, by: { type: Schema.Types.ObjectId, ref: 'User' }, byName: String, fy: String, next: Number, deleted: [String], counterBefore: Number }], default: undefined },
   updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
 }, { timestamps: true });
 

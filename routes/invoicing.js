@@ -12,6 +12,11 @@ router.put ('/settings',        ...owner, ctrl.updateSettings);
 // Where a series starts this year (e.g. after Vyapar's last number) —
 // only before it has used a number.
 router.put ('/settings/series', ...owner, ctrl.setSeriesStart);
+// Continue the tax-invoice series from a number: deletes the CRM's unpaid
+// numbers below it (duplicates of Vyapar's). Refused if any tax invoice has
+// a payment; needs the typed word DELETE. Preview first (GET changes nothing).
+router.get ('/settings/series/restart',  ...owner, ctrl.previewRestartTaxSeries);
+router.post('/settings/series/restart',  ...owner, ctrl.restartTaxSeries);
 
 router.get ('/parties',         ...owner, ctrl.listParties);
 router.post('/parties',         ...owner, ctrl.createParty);

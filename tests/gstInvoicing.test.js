@@ -210,6 +210,39 @@ describe('editing an issued invoice: what counts as a change to amounts/GST/part
   });
 });
 
+describe('continue the tax-invoice series from a number', () => {
+  const { restartPlan } = require('../controllers/invoicingController')._internals;
+  const inv = (seq, over = {}) => ({ _id: `id${seq}`, number: `2026-27/${seq}`, seq, fy: '2026-27', status: 'issued', receivedPaise: 0, payments: [], ...over });
+  const plan = (numbered, { allTax = numbered, counterSeq = numbered.length ? Math.max(...numbered.map((i) => i.seq)) : null, next = 58 } = {}) =>
+    restartPlan({ allTax, numbered, counterSeq, next, fy: '2026-27' });
+
+  it('the case at hand: unpaid 2026-27/1 is deleted, series continues at 58', () => {
+    const p = plan([inv(1)]);
+    expect(p.problems).toEqual([]);
+    expect(p.toDelete.map((i) => i.number)).toEqual(['2026-27/1']);
+  });
+  it('refused if ANY tax invoice has money received — any year, even a draft', () => {
+    expect(plan([inv(1, { receivedPaise: 100 })]).problems[0]).toMatch(/Money has been received against 2026-27\/1/);
+    expect(plan([inv(1)], { allTax: [inv(1), inv(9, { fy: '2025-26', number: '2025-26/9', payments: [{}] })] }).problems[0]).toMatch(/2025-26\/9/);
+  });
+  it('refused if a number at or above the one entered is already used', () => {
+    expect(plan([inv(1), inv(58)]).problems.join(' ')).toMatch(/2026-27\/58 already uses/);
+  });
+  it('refused if the counter has already given out that number', () => {
+    expect(plan([], { counterSeq: 60 }).problems[0]).toMatch(/would reuse one/);
+  });
+  it('nothing to do when it already continues from there', () => {
+    expect(plan([], { counterSeq: 57 }).problems[0]).toMatch(/already continues from 2026-27\/58/);
+  });
+  it('a fresh series with no counter yet can be set', () => {
+    expect(plan([], { counterSeq: null }).problems).toEqual([]);
+  });
+  it('the number must be a whole number from 1', () => {
+    expect(plan([inv(1)], { next: 0 }).problems[0]).toMatch(/whole number/);
+    expect(plan([inv(1)], { next: 5.5 }).problems[0]).toMatch(/whole number/);
+  });
+});
+
 describe('default terms', () => {
   it('the standard five, for agreement and quotation clients alike', () => {
     const { DEFAULT_TERMS } = require('../controllers/invoicingController');
@@ -227,7 +260,7 @@ describe('routes: owner only', () => {
   it('every invoicing route is behind login and the owner role', async () => {
     const router = require('../routes/invoicing');
     const routes = router.stack.filter((l) => l.route);
-    expect(routes.length).toBe(18);
+    expect(routes.length).toBe(20);
     for (const l of routes) {
       expect(l.route.stack.length).toBe(3);
       const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json() { return this; } };

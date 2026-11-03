@@ -690,4 +690,108 @@ exports.setSeriesStart = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange };
+// ════════════════════════════════════════════════════════════
+// Continue the tax-invoice series from a number (Settings, owner only)
+// ════════════════════════════════════════════════════════════
+// For when the CRM started numbering at 1 but Vyapar had already used the
+// first numbers of the year: the CRM's own numbers below the one entered
+// duplicate Vyapar's, so those test invoices are deleted (never sent or
+// filed) and the series continues from the number entered.
+//
+// Safety (as in the one-off fix script): refused if ANY tax invoice in the
+// CRM has money received — so nothing with a payment is ever touched and
+// it cannot run once real invoices are being paid; refused if any number at
+// or above the one entered has been used (it would be reused or out of
+// order); the owner types DELETE; the checks run again inside the one
+// transaction that deletes and moves the counter. Bills of supply and
+// drafts are never touched.
+const RESTART_WORD = 'DELETE';
+const isPaid = (i) => (i.receivedPaise || 0) > 0 || (i.payments || []).length > 0;
+
+// allTax: every tax invoice in the CRM (any year, any status);
+// numbered: this year's numbered ones; counterSeq: the last number used.
+function restartPlan({ allTax, numbered, counterSeq, next, fy }) {
+  const problems = [];
+  if (!Number.isInteger(next) || next < 1 || next > 99999) problems.push('The next number must be a whole number from 1.');
+  const paid = allTax.filter(isPaid);
+  if (paid.length) problems.push(`Money has been received against ${paid.map((i) => i.number || 'a draft').join(', ')}. Nothing is changed while any tax invoice has a payment.`);
+  const atOrAbove = numbered.filter((i) => i.seq >= next);
+  if (atOrAbove.length) problems.push(`${atOrAbove.map((i) => i.number).join(', ')} already use${atOrAbove.length === 1 ? 's' : ''} a number at or above ${next}.`);
+  if (counterSeq != null && counterSeq >= next && !atOrAbove.length) problems.push(`Numbers up to ${gst.formatNumber('tax_invoice', fy, counterSeq)} have already been given out; continuing from ${next} would reuse one.`);
+  const toDelete = numbered.filter((i) => i.seq < next);
+  if (!problems.length && !toDelete.length && counterSeq === next - 1) problems.push(`The series already continues from ${gst.formatNumber('tax_invoice', fy, next)}.`);
+  return { problems, toDelete };
+}
+
+async function loadRestartState(fy, session = null) {
+  const opts = session ? { session } : {};
+  const [allTax, counter] = await Promise.all([
+    SalesInvoice.find({ docType: 'tax_invoice' }, 'number status seq fy receivedPaise payments partySnapshot totals date', opts).lean(),
+    DocumentCounter.findById(`tax_invoice:${fy}`, null, opts).lean(),
+  ]);
+  const numbered = allTax.filter((i) => i.fy === fy && i.number).sort((a, b) => a.seq - b.seq);
+  return { allTax, numbered, counterSeq: counter ? counter.seq : null };
+}
+
+const restartView = (i) => ({
+  number: i.number, status: i.status, date: i.date, party: i.partySnapshot?.name,
+  totalPaise: i.totals?.grandTotalPaise || 0, receivedPaise: i.receivedPaise || 0,
+});
+
+// GET /settings/series/restart?next=58 — what it would do; changes nothing.
+exports.previewRestartTaxSeries = async (req, res, next) => {
+  try {
+    const fy = gst.financialYear(new Date());
+    const state = await loadRestartState(fy);
+    const n = req.query.next != null && req.query.next !== '' ? Number(req.query.next) : null;
+    const plan = n == null ? null : restartPlan({ ...state, next: n, fy });
+    return res.json({
+      success: true, fy, confirmWord: RESTART_WORD,
+      counterSeq: state.counterSeq,
+      nextNumber: gst.formatNumber('tax_invoice', fy, (state.counterSeq ?? 0) + 1),
+      invoices: state.numbered.map(restartView),
+      paid: state.allTax.filter(isPaid).map((i) => i.number || 'draft'),
+      ...(plan ? { plan: { next: n, nextNumber: gst.formatNumber('tax_invoice', fy, n), willDelete: plan.toDelete.map(restartView), problems: plan.problems } } : {}),
+    });
+  } catch (err) { next(err); }
+};
+
+// POST /settings/series/restart { next, confirm: 'DELETE' }
+exports.restartTaxSeries = async (req, res, next) => {
+  try {
+    const fy = gst.financialYear(new Date());
+    const n = Number(req.body?.next);
+    if (String(req.body?.confirm || '').trim() !== RESTART_WORD) return bad(res, `Type ${RESTART_WORD} to confirm.`, { reason: 'not_confirmed' });
+    const key = `tax_invoice:${fy}`;
+    let result;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const state = await loadRestartState(fy, session);
+        const plan = restartPlan({ ...state, next: n, fy });
+        if (plan.problems.length) throw Object.assign(new Error(plan.problems[0]), { refused: plan.problems });
+        const ids = plan.toDelete.map((i) => i._id);
+        if (ids.length) {
+          const del = await SalesInvoice.deleteMany({ _id: { $in: ids }, docType: 'tax_invoice', fy, receivedPaise: { $not: { $gt: 0 } }, 'payments.0': { $exists: false } }, { session });
+          if (del.deletedCount !== ids.length) throw Object.assign(new Error('An invoice changed meanwhile. Nothing was changed; try again.'), { refused: ['changed'] });
+        }
+        await DocumentCounter.updateOne({ _id: key }, { $set: { seq: n - 1 } }, { upsert: true, session });
+        const deleted = plan.toDelete.map((i) => i.number);
+        await BillingSettings.updateOne({ _id: 'default' }, {
+          $push: { seriesRestarts: { at: new Date(), by: req.user._id, byName: req.user.name, fy, next: n, deleted, counterBefore: state.counterSeq } },
+        }, { upsert: true, session });
+        result = { deleted, counterBefore: state.counterSeq };
+      });
+    } catch (err) {
+      if (err?.refused) return res.status(409).json({ success: false, reason: 'refused', message: err.message, problems: err.refused });
+      throw err;
+    } finally {
+      await session.endSession();
+    }
+    const nextNumber = gst.formatNumber('tax_invoice', fy, n);
+    console.warn(`[invoicing] tax-invoice series ${fy} continued from ${nextNumber} by=${req.user._id}; deleted unpaid CRM invoices: ${result.deleted.join(', ') || 'none'}; counter ${result.counterBefore ?? '-'}→${n - 1}`);
+    return res.json({ success: true, deleted: result.deleted, nextNumber, message: `Done. ${result.deleted.length ? `Deleted ${result.deleted.join(', ')}. ` : ''}The next tax invoice will be ${nextNumber}.` });
+  } catch (err) { next(err); }
+};
+
+exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange, restartPlan };

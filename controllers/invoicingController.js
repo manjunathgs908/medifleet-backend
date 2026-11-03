@@ -34,6 +34,18 @@ const istToday = (now = new Date()) => {
 };
 const fmtDay = (d) => new Date(new Date(d).getTime() + IST_MS).toISOString().slice(0, 10);
 
+// Printed on every tax invoice and bill of supply unless the owner saves
+// their own in Settings, or the invoice carries its own. Worded for clients
+// who signed an agreement and for those who accepted a quotation.
+const DEFAULT_TERMS = [
+  '1. This invoice is raised based on the rates accepted in the agreement or quotation.',
+  '2. The above invoice details are true and correct, and the service has been duly provided.',
+  '3. Signature & seal are not required on this computer-generated invoice.',
+  '4. Payment is due within the agreed credit period from the invoice date.',
+  '5. E. & O.E. (Errors and Omissions Excepted).',
+].join('\n');
+exports.DEFAULT_TERMS = DEFAULT_TERMS;
+
 const paymentState = (inv) => {
   const total = inv.totals?.grandTotalPaise || 0;
   const got = inv.receivedPaise || 0;
@@ -285,12 +297,19 @@ async function draftFromBody(body, { party: knownParty } = {}) {
   const { problems: cp, invoice } = gst.computeInvoice({ lines, placeOfSupply, roundOff });
   problems.push(...cp);
   const paymentMode = body.paymentMode === 'cash' ? 'cash' : 'credit';
+  // The site this invoice is for — optional; a site name is needed if any
+  // of it is given.
+  const sl = body.serviceLocation || {};
+  const serviceLocation = { siteName: text(sl.siteName, 150), address: text(sl.address, 400), attention: text(sl.attention, 120) };
+  const hasSite = Object.values(serviceLocation).some(Boolean);
+  if (hasSite && !serviceLocation.siteName) problems.push('Service location: give the site name.');
   return {
     party, problems,
     doc: {
       party: party._id, date, placeOfSupply, roundOff, paymentMode,
       docType: invoice.docType, supplyType: invoice.supplyType, reverseCharge: invoice.reverseCharge,
       lines: invoice.lines, totals: invoice.totals, taxSummary: invoice.taxSummary,
+      serviceLocation: hasSite ? serviceLocation : undefined,
       description: text(body.description, 300), terms: text(body.terms, 2000), notes: text(body.notes, 1000),
       transport: body.transport ? {
         driverName: text(body.transport.driverName, 100), vehicleNumber: text(body.transport.vehicleNumber, 20),
@@ -497,7 +516,7 @@ exports.listInvoices = async (req, res, next) => {
     const from = istDay(req.query.from); const to = istDay(req.query.to);
     if (from || to) filter.date = { ...(from ? { $gte: from } : {}), ...(to ? { $lte: to } : {}) };
     let list = await SalesInvoice.find(filter).sort({ date: -1, seq: -1, createdAt: -1 }).limit(500)
-      .select('status docType number date party partySnapshot totals receivedPaise paymentMode description createdAt')
+      .select('status docType number date party partySnapshot serviceLocation totals receivedPaise paymentMode description createdAt')
       .populate('party', 'name').lean();
     list = list.map((i) => ({ ...i, partyName: i.partySnapshot?.name || i.party?.name, paymentState: i.status === 'issued' ? paymentState(i) : null, balancePaise: i.status === 'issued' ? i.totals.grandTotalPaise - (i.receivedPaise || 0) : null }));
     if (['unpaid', 'partial', 'paid'].includes(req.query.payment)) list = list.filter((i) => i.paymentState === req.query.payment);
@@ -529,7 +548,8 @@ exports.getInvoice = async (req, res, next) => {
         placeOfSupplyName: gst.stateName(inv.placeOfSupply),
         amountInWords: gst.amountInWords(Math.max(0, inv.totals.grandTotalPaise)),
         bank: settings?.bank, upiId: settings?.upiId, signatory: settings?.signatory || CUSTOMER_ISSUER.name,
-        terms: inv.terms || settings?.terms || '',
+        // This invoice's own terms, else the owner's (Settings), else the standard ones.
+        terms: inv.terms || settings?.terms || DEFAULT_TERMS,
       },
     });
   } catch (err) { next(err); }
@@ -549,7 +569,8 @@ exports.getSettings = async (req, res, next) => {
       const next = c ? c.seq + 1 : Number(start || 1);
       return { docType, fy, key, started: !!c, next, nextNumber: gst.formatNumber(docType, fy, next) };
     }));
-    return res.json({ success: true, settings, series, states: Object.entries(gst.STATES).map(([code, name]) => ({ code: String(code).padStart(2, '0'), name })), supplierState: gst.SUPPLIER_STATE, issuer: CUSTOMER_ISSUER });
+    // Terms as printed: the owner's when saved, else the standard ones.
+    return res.json({ success: true, settings: { ...settings, terms: settings.terms || DEFAULT_TERMS }, defaultTerms: DEFAULT_TERMS, series, states: Object.entries(gst.STATES).map(([code, name]) => ({ code: String(code).padStart(2, '0'), name })), supplierState: gst.SUPPLIER_STATE, issuer: CUSTOMER_ISSUER });
   } catch (err) { next(err); }
 };
 
@@ -567,9 +588,11 @@ exports.updateSettings = async (req, res, next) => {
       if (u && !/^[\w.-]{2,}@[a-zA-Z]{2,}$/.test(u)) return bad(res, 'A UPI ID looks like name@bank.');
       set.upiId = u;
     }
-    if ('terms' in b) set.terms = text(b.terms, 2000);
+    // Blank terms = back to the standard terms (DEFAULT_TERMS).
+    const unset = {};
+    if ('terms' in b) { const tm = text(b.terms, 2000); if (tm) set.terms = tm; else unset.terms = ''; }
     if ('signatory' in b) set.signatory = text(b.signatory, 100);
-    await BillingSettings.updateOne({ _id: 'default' }, { $set: set }, { upsert: true });
+    await BillingSettings.updateOne({ _id: 'default' }, { $set: set, ...(Object.keys(unset).length ? { $unset: unset } : {}) }, { upsert: true });
     return res.json({ success: true });
   } catch (err) { next(err); }
 };

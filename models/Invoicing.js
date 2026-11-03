@@ -127,6 +127,9 @@ const salesInvoiceSchema = new Schema({
   payments    : { type: [paymentSchema], default: [] },
   receivedPaise: { type: Number, default: 0 },
 
+  // The site this invoice is for (a company taking ambulances at several
+  // sites gets one invoice per site). Printed beside "Bill To".
+  serviceLocation: { siteName: String, address: String, attention: String },
   description : String,           // e.g. "MONTH OF JULY"
   terms       : String,
   transport   : { driverName: String, vehicleNumber: String, pickup: String, drop: String },

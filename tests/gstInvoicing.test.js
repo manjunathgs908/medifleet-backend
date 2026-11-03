@@ -180,6 +180,19 @@ describe('numbering and words', () => {
   });
 });
 
+describe('default terms', () => {
+  it('the standard five, for agreement and quotation clients alike', () => {
+    const { DEFAULT_TERMS } = require('../controllers/invoicingController');
+    expect(DEFAULT_TERMS.split('\n')).toEqual([
+      '1. This invoice is raised based on the rates accepted in the agreement or quotation.',
+      '2. The above invoice details are true and correct, and the service has been duly provided.',
+      '3. Signature & seal are not required on this computer-generated invoice.',
+      '4. Payment is due within the agreed credit period from the invoice date.',
+      '5. E. & O.E. (Errors and Omissions Excepted).',
+    ]);
+  });
+});
+
 describe('routes: owner only', () => {
   it('every invoicing route is behind login and the owner role', async () => {
     const router = require('../routes/invoicing');

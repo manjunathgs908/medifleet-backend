@@ -20,6 +20,10 @@ router.get('/provider-issues', protect, authorize('owner'), billingCtrl.getProvi
 router.patch('/provider-issues/:id/resolve', protect, authorize('owner'), billingCtrl.resolveProviderIssue);
 // Owner only: record a refund already paid out (record only — sends nothing).
 router.post('/refunds', protect, authorize('owner'), billingCtrl.recordRefund);
+// Customer bills on WhatsApp: review, Send (once), Don't send (owner only).
+router.get('/customer-bills', protect, authorize('owner'), billingCtrl.getCustomerBills);
+router.post('/customer-bills/:id/send', protect, authorize('owner'), billingCtrl.sendCustomerBill);
+router.post('/customer-bills/:id/dismiss', protect, authorize('owner'), billingCtrl.dismissCustomerBill);
 router.post('/hospital-invoice/generate', protect, authorize('owner'), billingCtrl.generateHospitalInvoice);
 router.get('/hospital-invoices', protect, authorize('owner'), billingCtrl.getHospitalInvoices);
 router.put('/hospital-invoices/:id/status', protect, authorize('owner'), billingCtrl.updateInvoiceStatus);

@@ -1030,6 +1030,35 @@ const billSchema = new Schema(
     invoiceId   : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },
 
     notes       : String,
+
+    // The customer's copy of this bill on WhatsApp (services/customerBill.js).
+    // Set when the trip completes. state:
+    //   pending_review — waiting for the owner to tap Send (always, while
+    //                    BILL_AUTO_SEND is off; with warnings, always)
+    //   sending        — claimed by one send (only one can be in flight)
+    //   sent           — delivered to WhatsApp (sentAt, messageId); final
+    //   failed         — WhatsApp refused (error); can be retried
+    //   no_phone       — no valid customer mobile on the trip
+    //   dismissed      — the owner chose not to send it
+    // warnings: why it needs a person's look (drop_wait_review, no_distance,
+    // far_from_estimate, no_total, billed_elsewhere).
+    customerBill: {
+      type: new Schema({
+        state     : { type: String, enum: ['pending_review', 'sending', 'sent', 'failed', 'no_phone', 'dismissed'], required: true },
+        warnings  : { type: [String], default: undefined },
+        queuedAt  : Date,
+        sendingAt : Date,
+        sentAt    : Date,
+        auto      : Boolean,                                // sent by BILL_AUTO_SEND, not a person
+        by        : { type: Schema.Types.ObjectId, ref: 'User' }, // who sent or dismissed it
+        byName    : String,
+        messageId : String,                                 // WhatsApp's id for the sent message
+        error     : String,
+        attempts  : Number,
+        dismissedAt: Date,
+      }, { _id: false }),
+      default: undefined,
+    },
   },
   { timestamps: true }
 );

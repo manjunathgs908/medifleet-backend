@@ -706,3 +706,71 @@ exports.getFinancialDashboard = async (req, res, next) => {
     next(err);
   }
 };
+
+
+// ── Customer bills on WhatsApp (services/customerBill.js) ─────────────────
+// Every completed trip's bill waits here for the owner to tap Send (unless
+// BILL_AUTO_SEND is on and it has no warnings). Numbers are masked.
+const customerBill = require('../services/customerBill');
+
+const SEND_RESULT = {
+  already_sent: [409, 'This bill was already sent to the customer.'],
+  dismissed   : [409, 'This bill was marked "Don\'t send".'],
+  warnings    : [409, 'This bill has warnings. Check them, then confirm to send.'],
+  in_progress : [409, 'This bill is being sent right now.'],
+  no_phone    : [422, 'This trip has no valid customer mobile, so the bill cannot be sent on WhatsApp.'],
+  failed      : [502, 'WhatsApp did not accept the bill.'],
+  not_found   : [404, 'Bill not found.'],
+  not_queued  : [404, 'This bill is not in the customer-bill list (it predates this feature).'],
+};
+
+// ============================================================
+// @route   GET /api/billing/customer-bills?view=to_send|sent|dismissed
+// @access  Private [owner]
+// ============================================================
+exports.getCustomerBills = async (req, res, next) => {
+  try {
+    const view = req.query.view || 'to_send';
+    const bills = await customerBill.listBills(view);
+    if (!bills) return res.status(400).json({ success: false, message: 'Unknown view.' });
+    return res.json({ success: true, view, autoSend: customerBill.autoSendOn(), bills });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/customer-bills/:id/send   { acknowledgeWarnings }
+// @desc    Sends the bill to the customer on WhatsApp — once. A bill with
+//          warnings needs acknowledgeWarnings: true. A failed send can be
+//          sent again; a sent one cannot.
+// @access  Private [owner]
+// ============================================================
+exports.sendCustomerBill = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Bill not found.' });
+    const r = await customerBill.sendBill(req.params.id, { user: req.user, acknowledgeWarnings: req.body?.acknowledgeWarnings === true });
+    if (r.ok) return res.json({ success: true, state: 'sent', message: 'Bill sent to the customer on WhatsApp.' });
+    const [status, message] = SEND_RESULT[r.code] || [500, 'The bill could not be sent.'];
+    return res.status(status).json({ success: false, reason: r.code, message: r.error ? `${message} ${r.error}` : message, warnings: r.warnings });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/customer-bills/:id/dismiss
+// @desc    "Don't send": the bill stays as it is; the customer is not
+//          messaged.
+// @access  Private [owner]
+// ============================================================
+exports.dismissCustomerBill = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Bill not found.' });
+    const r = await customerBill.dismissBill(req.params.id, req.user);
+    if (!r.ok) return res.status(409).json({ success: false, message: 'This bill was already sent, dismissed, or is being sent.' });
+    return res.json({ success: true, state: 'dismissed' });
+  } catch (err) {
+    next(err);
+  }
+};

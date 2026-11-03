@@ -30,6 +30,7 @@ const smsService = require('../utils/smsService');
 const { haversineKm } = require('../utils/haversine');
 const axios = require('axios');
 const whatsappNotifications = require('../services/whatsappNotifications');
+const customerBill = require('../services/customerBill');
 const trackingNotifications = require('../services/trackingNotifications');
 const { dispatchStateOf, countDispatchStates, hasCrew, parseScheduleDate } = require('../utils/dispatchUrgency');
 
@@ -1322,11 +1323,13 @@ exports.completeTrip = async (req, res, next) => {
     if (!committed.ok) return busy(res);
     const { trip, bill } = committed.result;
 
-    // After the commit only. Fire-and-forget WhatsApp notification -- no-ops
-    // internally for any trip that isn't bookingSource:'whatsapp'.
-    // trip.grandTotal is the final billed amount (fare + wait charges).
-    whatsappNotifications.notifyTripCompleted(trip)
-      .catch((err) => console.error('[whatsappNotifications] notifyTripCompleted failed:', err.message));
+    // After the commit only. The customer's bill on WhatsApp (trip_bill) is
+    // the one completion message — trip_complete is no longer sent, so the
+    // customer never gets two. Queued for the owner to review and send;
+    // sent at once only with BILL_AUTO_SEND=true and no warnings
+    // (services/customerBill.js). Never delays or fails the completion.
+    customerBill.queueBill(trip, bill)
+      .catch((err) => console.error('[customerBill] queue failed:', err.message));
 
     await bill.populate(['trip', 'hospital']);
 

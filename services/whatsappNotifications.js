@@ -38,6 +38,7 @@ const { User, Vehicle, Trip } = require('../models');
 const Ambulance = require('../models/Ambulance');
 const whatsapp = require('./whatsappService');
 const { haversineKm } = require('../utils/haversine');
+const { normalisePhone } = require('../utils/phone');
 
 // Every template is approved in English only -- see the language note
 // above. Deliberately a constant, not trip.whatsappLanguage: sending a
@@ -322,4 +323,44 @@ async function notifyQuoteLink(phone, url) {
   return res;
 }
 
-module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted, notifyTrackingLink, notifyQuoteLink };
+// A customer's number as WhatsApp needs it: 91 + the 10-digit mobile.
+// Trips store whatever the booking channel sent (10 digits, 91..., +91...,
+// or 'N/A'), so anything that is not an Indian mobile is null — never sent.
+function waPhone(raw) {
+  const ten = normalisePhone(raw);
+  return /^[6-9]\d{9}$/.test(ten) ? `91${ten}` : null;
+}
+
+// ============================================================
+// @desc  The customer's bill for a completed trip (services/customerBill.js
+//        decides when). Replaces trip_complete as the one completion
+//        message.
+//
+//        Template trip_bill (Utility, English, body-only, 7 variables) —
+//        submit in Meta Business Manager under exactly this name:
+//          🚑 SaveLife Ambulance — Bill {{1}} for trip {{2}}
+//          {{3}}
+//          Total: {{4}} · Paid: {{5}} · Balance due: {{6}}
+//          View your bill and pay online: {{7}}
+//        {{3}} is one line ("Fare ₹2,400 · Waiting ₹150 · Extras ₹0 ·
+//        GST ₹120"): Meta refuses a variable containing a newline.
+//        Amounts arrive formatted, ₹ included.
+//
+// @param phone  Already waPhone()'d by the caller.
+// @returns      Meta's reply, or { skipped, reason } — never throws.
+// ============================================================
+async function notifyBill(phone, { billNumber, tripNumber, breakdown, total, paid, balance, trip }) {
+  if (!phone) return { skipped: true, reason: 'no valid customer mobile' };
+  const url = await trackUrl(trip);
+  if (!url) return { skipped: true, reason: 'no tracking link for this trip' };
+  const res = await whatsapp.sendTemplate(
+    phone,
+    'trip_bill',
+    TEMPLATE_LANG,
+    bodyComponents(billNumber, tripNumber, breakdown, total, paid, balance, url),
+  );
+  if (!res) return { skipped: true, reason: 'WhatsApp did not accept the message — is the trip_bill template approved?' };
+  return res;
+}
+
+module.exports = { notifyDriverAssigned, notifyTripStarted, notifyTripCompleted, notifyTrackingLink, notifyQuoteLink, notifyBill, waPhone };

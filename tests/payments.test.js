@@ -137,7 +137,8 @@ describe('customer-facing issuer (bills and receipts)', () => {
   it('business name, GSTIN, registered address and configured contacts', () => {
     expect(CUSTOMER_ISSUER).toEqual({
       name: 'SaveLife Health Services', gstin: '29CIQPM9958R1ZK', address: BUSINESS.address,
-      phone: BUSINESS.callNumber, email: BUSINESS.email, website: BUSINESS.website,
+      phone: BUSINESS.callNumber, whatsapp: BUSINESS.whatsappNumber, email: BUSINESS.email, website: BUSINESS.website,
+      udyam: 'UDYAM-KR-03-0024329',
     });
   });
 

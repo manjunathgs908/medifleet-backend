@@ -20,8 +20,11 @@ const CUSTOMER_ISSUER = Object.freeze({
   gstin  : '29CIQPM9958R1ZK',
   address: BUSINESS.address,
   phone  : BUSINESS.callNumber,
+  whatsapp: BUSINESS.whatsappNumber,
   email  : BUSINESS.email,
   website: BUSINESS.website,
+  // MSME (Udyam) registration, printed on GST invoices.
+  udyam  : 'UDYAM-KR-03-0024329',
 });
 
 // GSTIN check digit (the standard mod-36 scheme), for the test above.

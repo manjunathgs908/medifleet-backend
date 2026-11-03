@@ -320,7 +320,9 @@ async function draftFromBody(body, { party: knownParty } = {}) {
 }
 
 // What stops an invoice being issued, beyond the maths.
-async function issueProblems(inv, party, now = new Date()) {
+// `numbered`: the issued invoice being edited — its number is kept, so its
+// date must stay in its financial year and between its neighbours'.
+async function issueProblems(inv, party, now = new Date(), { numbered = null } = {}) {
   const problems = [];
   if (!party) return ['The party no longer exists.'];
   if (party.kind === 'registered') {
@@ -332,12 +334,36 @@ async function issueProblems(inv, party, now = new Date()) {
     if (p) problems.push(`Line ${i + 1}: ${p}`);
   });
   if (inv.date > now) problems.push('The invoice date cannot be in the future.');
+  const fy = gst.financialYear(inv.date);
+  const numberedSeries = { docType: inv.docType, fy, status: { $in: ['issued', 'cancelled'] } };
+  if (numbered) {
+    if (fy !== numbered.fy) problems.push(`${numbered.number} belongs to ${numbered.fy}; its date must stay in that financial year.`);
+    const prev = await SalesInvoice.findOne({ ...numberedSeries, seq: { $lt: numbered.seq } }).sort({ seq: -1 }).select('number date').lean();
+    const next = await SalesInvoice.findOne({ ...numberedSeries, seq: { $gt: numbered.seq } }).sort({ seq: 1 }).select('number date').lean();
+    if (prev && inv.date < prev.date) problems.push(`The date is before ${prev.number} (${fmtDay(prev.date)}). Invoices must be dated in number order.`);
+    if (next && inv.date > next.date) problems.push(`The date is after ${next.number} (${fmtDay(next.date)}). Invoices must be dated in number order.`);
+    return problems;
+  }
   // Numbers run in date order: no invoice dated before the last one issued
   // in its series this year.
-  const fy = gst.financialYear(inv.date);
-  const last = await SalesInvoice.findOne({ docType: inv.docType, fy, status: { $in: ['issued', 'cancelled'] } }).sort({ seq: -1 }).select('number date').lean();
+  const last = await SalesInvoice.findOne(numberedSeries).sort({ seq: -1 }).select('number date').lean();
   if (last && inv.date < last.date) problems.push(`The date is before ${last.number} (${fmtDay(last.date)}). Invoices must be dated in number order.`);
   return problems;
+}
+
+// Whether an edit changes what is owed or the GST: the party, place of
+// supply, round-off or any line figure. Text-only fields (description,
+// driver, vehicle, site, terms, notes) and the date do not count.
+const FINANCIAL_LINE_KEYS = ['item', 'name', 'code', 'kind', 'unit', 'qtyMilli', 'ratePaise', 'discountPercent', 'discountPaise', 'taxType', 'gstRate', 'reverseCharge', 'taxablePaise', 'taxPaise', 'totalPaise'];
+function financialChange(before, after) {
+  const lineSig = (lines) => JSON.stringify((lines || []).map((l) => FINANCIAL_LINE_KEYS.map((k) => (l[k] == null ? null : String(l[k])))));
+  const changed = [];
+  if (String(before.party) !== String(after.party)) changed.push('party');
+  if (String(before.placeOfSupply) !== String(after.placeOfSupply)) changed.push('place of supply');
+  if ((before.roundOff !== false) !== (after.roundOff !== false)) changed.push('round-off');
+  if (lineSig(before.lines) !== lineSig(after.lines)) changed.push('line items');
+  if ((before.totals?.grandTotalPaise ?? null) !== (after.totals?.grandTotalPaise ?? null) && !changed.length) changed.push('total');
+  return changed;
 }
 
 exports.calculate = async (req, res, next) => {
@@ -362,14 +388,63 @@ exports.updateInvoice = async (req, res, next) => {
     if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Invoice not found.' });
     const cur = await SalesInvoice.findById(req.params.id).lean();
     if (!cur) return res.status(404).json({ success: false, message: 'Invoice not found.' });
-    if (cur.status !== 'draft') return res.status(409).json({ success: false, message: 'An issued invoice cannot be edited. Cancel it and issue a new one.' });
+    if (cur.status === 'cancelled') return res.status(409).json({ success: false, message: 'A cancelled invoice cannot be edited.' });
     const d = await draftFromBody({ party: cur.party, ...req.body });
     if (d.fatal) return bad(res, d.fatal);
     const rev = Number(req.body?.rev);
-    const r = await SalesInvoice.updateOne({ _id: cur._id, status: 'draft', rev }, { $set: d.doc, $inc: { rev: 1 } });
-    if (!r.modifiedCount) return res.status(409).json({ success: false, reason: 'stale', message: 'This draft was changed or issued elsewhere. Reload it.' });
+
+    if (cur.status === 'draft') {
+      const r = await SalesInvoice.updateOne({ _id: cur._id, status: 'draft', rev }, { $set: d.doc, $inc: { rev: 1 } });
+      if (!r.modifiedCount) return res.status(409).json({ success: false, reason: 'stale', message: 'This draft was changed or issued elsewhere. Reload it.' });
+      const invoice = await SalesInvoice.findById(cur._id).lean();
+      return res.json({ success: true, invoice, problems: d.problems });
+    }
+
+    // An issued invoice: everything is recomputed, its number never changes,
+    // and it must still be a valid invoice of the same kind.
+    if (rev !== cur.rev) return res.status(409).json({ success: false, reason: 'stale', message: 'This invoice changed since you opened it. Reload it, then edit.' });
+    if (d.doc.docType !== cur.docType) {
+      return bad(res, `This edit would turn ${cur.docType === 'tax_invoice' ? 'the tax invoice into a bill of supply' : 'the bill of supply into a tax invoice'}, which has its own number series. Cancel ${cur.number} and issue a new one instead.`, { reason: 'doc_type_change' });
+    }
+    const problems = [...d.problems, ...(await issueProblems(d.doc, d.party, new Date(), { numbered: cur }))];
+    if (problems.length) return bad(res, problems[0], { reason: 'not_valid', problems });
+
+    const changed = financialChange(cur, d.doc);
+    const received = cur.receivedPaise || 0;
+    if (received > 0 && changed.length) {
+      if (d.doc.totals.grandTotalPaise < received) {
+        return bad(res, `₹${(received / 100).toLocaleString('en-IN')} has been received against ${cur.number}; the new total cannot be less than that.`, { reason: 'below_received' });
+      }
+      if (req.body?.confirmFinancialChange !== true) {
+        return res.status(409).json({
+          success: false, reason: 'financial_change_needs_confirm', changed,
+          message: `Money has been received against ${cur.number}. This edit changes its ${changed.join(', ')}. Save anyway?`,
+        });
+      }
+    }
+
+    // Money already received is never changed by an edit (a cash sale keeps
+    // what was recorded at issue); Record money received adds to it.
+    const { doc } = d;
+    const now = new Date();
+    const r = await SalesInvoice.updateOne(
+      { _id: cur._id, status: 'issued', rev: cur.rev, number: cur.number },
+      {
+        $set: {
+          ...doc,
+          partySnapshot: {
+            name: d.party.name, kind: d.party.kind, gstin: d.party.gstin, stateCode: d.party.stateCode,
+            stateName: gst.stateName(d.party.stateCode), address: d.party.address, phone: d.party.phone,
+          },
+        },
+        $inc: { rev: 1 },
+        $push: { edits: { at: now, by: req.user._id, byName: req.user.name, financial: changed.length > 0, changed, totalBeforePaise: cur.totals?.grandTotalPaise, totalAfterPaise: doc.totals.grandTotalPaise } },
+      },
+    );
+    if (!r.modifiedCount) return res.status(409).json({ success: false, reason: 'stale', message: 'This invoice was changed elsewhere. Reload it.' });
+    console.info(`[invoicing] edited ${cur.number} by=${req.user._id} changed=${changed.join('|') || 'text only'} total=${cur.totals?.grandTotalPaise}→${doc.totals.grandTotalPaise}p`);
     const invoice = await SalesInvoice.findById(cur._id).lean();
-    return res.json({ success: true, invoice, problems: d.problems });
+    return res.json({ success: true, invoice, message: `Saved ${cur.number}.` });
   } catch (err) { next(err); }
 };
 
@@ -615,4 +690,4 @@ exports.setSeriesStart = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems };
+exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange };

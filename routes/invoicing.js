@@ -26,7 +26,7 @@ router.post('/invoices/calculate', ...owner, ctrl.calculate);
 router.get ('/invoices',        ...owner, ctrl.listInvoices);
 router.post('/invoices',        ...owner, ctrl.createInvoice);
 router.get ('/invoices/:id',    ...owner, ctrl.getInvoice);
-router.put ('/invoices/:id',    ...owner, ctrl.updateInvoice);      // drafts only
+router.put ('/invoices/:id',    ...owner, ctrl.updateInvoice);      // drafts; issued keep their number
 router.delete('/invoices/:id',  ...owner, ctrl.deleteDraft);        // drafts only
 router.post('/invoices/:id/issue',    ...owner, ctrl.issueInvoice);
 router.post('/invoices/:id/cancel',   ...owner, ctrl.cancelInvoice);

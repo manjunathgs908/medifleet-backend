@@ -180,6 +180,36 @@ describe('numbering and words', () => {
   });
 });
 
+describe('editing an issued invoice: what counts as a change to amounts/GST/party', () => {
+  const { financialChange } = require('../controllers/invoicingController')._internals;
+  const base = () => ({
+    party: 'p1', placeOfSupply: '29', roundOff: true,
+    lines: [{ item: 'i1', name: 'Hiring', code: '999315', kind: 'service', unit: 'Month', qtyMilli: 1000, ratePaise: 6400000, discountPaise: 0, taxType: 'taxable', gstRate: 18, reverseCharge: false, taxablePaise: 6400000, taxPaise: 1152000, totalPaise: 7552000 }],
+    totals: { grandTotalPaise: 7552000 },
+    description: 'MONTH OF JULY', transport: { driverName: 'A', vehicleNumber: 'KA01' }, serviceLocation: { siteName: 'Site 1' }, terms: 'x',
+  });
+  it('text-only edits (driver, vehicle, description, site, terms) are not financial', () => {
+    const after = { ...base(), description: 'MONTH OF AUGUST', transport: { driverName: 'B', vehicleNumber: 'KA02' }, serviceLocation: { siteName: 'Site 2' }, terms: 'y' };
+    expect(financialChange(base(), after)).toEqual([]);
+  });
+  it('the same line re-sent (ids as strings, empty discount %) is not a change', () => {
+    const after = base();
+    after.lines[0] = { ...after.lines[0], item: { toString: () => 'i1' }, discountPercent: undefined };
+    expect(financialChange(base(), after)).toEqual([]);
+  });
+  it.each([
+    ['party', (a) => { a.party = 'p2'; }],
+    ['place of supply', (a) => { a.placeOfSupply = '24'; }],
+    ['round-off', (a) => { a.roundOff = false; }],
+    ['line items', (a) => { a.lines[0].ratePaise = 6500000; }],
+    ['line items', (a) => { a.lines[0].gstRate = 5; }],
+    ['line items', (a) => { a.lines.push({ ...a.lines[0] }); }],
+  ])('%s', (what, mutate) => {
+    const after = base(); mutate(after);
+    expect(financialChange(base(), after)).toContain(what);
+  });
+});
+
 describe('default terms', () => {
   it('the standard five, for agreement and quotation clients alike', () => {
     const { DEFAULT_TERMS } = require('../controllers/invoicingController');

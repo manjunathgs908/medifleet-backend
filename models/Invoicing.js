@@ -141,6 +141,9 @@ const salesInvoiceSchema = new Schema({
   cancelledBy: { type: Schema.Types.ObjectId, ref: 'User' },
   cancelledAt: Date,
   cancelReason: String,
+  // Edits made after issue (the number never changes): who, when, whether
+  // amounts/GST/party changed and the total before and after.
+  edits: { type: [{ _id: false, at: Date, by: { type: Schema.Types.ObjectId, ref: 'User' }, byName: String, financial: Boolean, changed: [String], totalBeforePaise: Number, totalAfterPaise: Number }], default: undefined },
   rev        : { type: Number, default: 0 },   // drafts: an edit from a stale screen is refused
 }, { timestamps: true });
 // A number is used once in its financial year.

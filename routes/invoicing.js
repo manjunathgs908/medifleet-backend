@@ -36,5 +36,9 @@ router.delete('/invoices/:id',  ...owner, ctrl.deleteDraft);        // drafts on
 router.post('/invoices/:id/issue',    ...owner, ctrl.issueInvoice);
 router.post('/invoices/:id/cancel',   ...owner, ctrl.cancelInvoice);
 router.post('/invoices/:id/payments', ...owner, ctrl.recordPayment);
+// Permanently delete a CANCELLED tax invoice with no money received
+// (preview first; the run needs DELETE). Frees its number if it was the last.
+router.get ('/invoices/:id/delete-cancelled', ...owner, ctrl.previewDeleteCancelled);
+router.post('/invoices/:id/delete-cancelled', ...owner, ctrl.deleteCancelledInvoice);
 
 module.exports = router;

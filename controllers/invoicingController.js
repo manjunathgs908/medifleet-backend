@@ -794,4 +794,102 @@ exports.restartTaxSeries = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange, restartPlan };
+// ════════════════════════════════════════════════════════════
+// Delete a cancelled tax invoice permanently (owner only)
+// ════════════════════════════════════════════════════════════
+// For a bill issued in error, never sent, then cancelled. Only a CANCELLED
+// TAX INVOICE with no money received can go; bills of supply and live
+// invoices never. If it holds the last number used in its series this year,
+// the counter steps back so the next invoice reuses that number (no gap);
+// otherwise the counter stays and a gap remains (the view says so). Typed
+// DELETE; checked again inside the one transaction; logged.
+const DELETE_WORD = 'DELETE';
+
+// inv: the invoice; counterSeq: its series' last number used; higherSeqs:
+// how many numbers above it exist in the series (any status).
+function deleteCancelledPlan(inv, { counterSeq, higherCount }) {
+  const problems = [];
+  if (!inv) return { problems: ['Invoice not found.'], reuse: false };
+  if (inv.docType !== 'tax_invoice') problems.push('Only a tax invoice can be deleted here.');
+  if (inv.status !== 'cancelled') problems.push(`Only a cancelled invoice can be deleted (this one is ${inv.status}). Cancel it first.`);
+  if (isPaid(inv)) problems.push('Money has been recorded against this invoice, so it cannot be deleted.');
+  if (!inv.number || !inv.seq) problems.push('This invoice has no number.');
+  const reuse = !problems.length && higherCount === 0 && counterSeq === inv.seq;
+  return { problems, reuse };
+}
+
+async function loadDeleteState(id, session = null) {
+  const opts = session ? { session } : {};
+  const inv = await SalesInvoice.findById(id, 'docType status number fy seq receivedPaise payments partySnapshot totals cancelReason date', opts).lean();
+  if (!inv?.fy || !inv?.seq) return { inv, counterSeq: null, higherCount: 0 };
+  const [counter, higherCount] = await Promise.all([
+    DocumentCounter.findById(`${inv.docType}:${inv.fy}`, null, opts).lean(),
+    SalesInvoice.countDocuments({ docType: inv.docType, fy: inv.fy, seq: { $gt: inv.seq } }, opts),
+  ]);
+  return { inv, counterSeq: counter ? counter.seq : null, higherCount };
+}
+
+// GET /invoices/:id/delete-cancelled — what deleting it would do.
+exports.previewDeleteCancelled = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    const st = await loadDeleteState(req.params.id);
+    if (!st.inv) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    const plan = deleteCancelledPlan(st.inv, st);
+    const nextAfter = plan.reuse ? st.inv.number : (st.counterSeq != null ? gst.formatNumber(st.inv.docType, st.inv.fy, st.counterSeq + 1) : null);
+    return res.json({
+      success: true, confirmWord: DELETE_WORD, number: st.inv.number,
+      canDelete: !plan.problems.length, problems: plan.problems,
+      numberReused: plan.reuse, nextNumberAfter: nextAfter,
+      message: plan.problems.length ? plan.problems[0]
+        : plan.reuse ? `${st.inv.number} is the last number used, so the next tax invoice will reuse ${st.inv.number} — no gap.`
+          : `${st.inv.number} is not the last number used (${st.higherCount} later number${st.higherCount === 1 ? '' : 's'} exist), so a gap will remain at ${st.inv.number}; the next tax invoice stays ${nextAfter}.`,
+    });
+  } catch (err) { next(err); }
+};
+
+// POST /invoices/:id/delete-cancelled { confirm: 'DELETE' }
+exports.deleteCancelledInvoice = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    if (String(req.body?.confirm || '').trim() !== DELETE_WORD) return bad(res, `Type ${DELETE_WORD} to confirm.`, { reason: 'not_confirmed' });
+    let result;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const st = await loadDeleteState(req.params.id, session);
+        if (!st.inv) throw Object.assign(new Error('Invoice not found.'), { status: 404 });
+        const plan = deleteCancelledPlan(st.inv, st);
+        if (plan.problems.length) throw Object.assign(new Error(plan.problems[0]), { status: 409, problems: plan.problems });
+        const inv = st.inv;
+        const del = await SalesInvoice.deleteOne({
+          _id: inv._id, docType: 'tax_invoice', status: 'cancelled', receivedPaise: { $not: { $gt: 0 } }, 'payments.0': { $exists: false },
+        }, { session });
+        if (del.deletedCount !== 1) throw Object.assign(new Error('The invoice changed meanwhile. Nothing was deleted.'), { status: 409 });
+        if (plan.reuse) {
+          const c = await DocumentCounter.updateOne({ _id: `${inv.docType}:${inv.fy}`, seq: inv.seq }, { $set: { seq: inv.seq - 1 } }, { session });
+          if (c.modifiedCount !== 1) throw Object.assign(new Error('The series moved on meanwhile. Nothing was deleted.'), { status: 409 });
+        }
+        await BillingSettings.updateOne({ _id: 'default' }, {
+          $push: { deletedInvoices: {
+            at: new Date(), by: req.user._id, byName: req.user.name, number: inv.number, fy: inv.fy, seq: inv.seq,
+            party: inv.partySnapshot?.name, totalPaise: inv.totals?.grandTotalPaise, cancelReason: inv.cancelReason, numberReused: plan.reuse,
+          } },
+        }, { upsert: true, session });
+        result = { number: inv.number, reuse: plan.reuse };
+      });
+    } catch (err) {
+      if (err?.status) return res.status(err.status).json({ success: false, reason: 'refused', message: err.message, problems: err.problems });
+      throw err;
+    } finally {
+      await session.endSession();
+    }
+    console.warn(`[invoicing] deleted cancelled ${result.number} by=${req.user._id}; number ${result.reuse ? 'freed for reuse' : 'left as a gap'}`);
+    return res.json({
+      success: true, numberReused: result.reuse,
+      message: result.reuse ? `Deleted ${result.number}. The next tax invoice will reuse ${result.number}.` : `Deleted ${result.number}. Its number stays unused (a gap in the series).`,
+    });
+  } catch (err) { next(err); }
+};
+
+exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange, restartPlan, deleteCancelledPlan };

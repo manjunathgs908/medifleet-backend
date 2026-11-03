@@ -167,6 +167,10 @@ const billingSettingsSchema = new Schema({
   // (invoicingController.restartTaxSeries): who, when, which unpaid CRM
   // numbers were deleted, and the number the series continues from.
   seriesRestarts: { type: [{ _id: false, at: Date, by: { type: Schema.Types.ObjectId, ref: 'User' }, byName: String, fy: String, next: Number, deleted: [String], counterBefore: Number }], default: undefined },
+  // Cancelled tax invoices deleted permanently (invoicingController
+  // .deleteCancelledInvoice): what was deleted, by whom, and whether its
+  // number was freed for reuse (it was the last one in the series).
+  deletedInvoices: { type: [{ _id: false, at: Date, by: { type: Schema.Types.ObjectId, ref: 'User' }, byName: String, number: String, fy: String, seq: Number, party: String, totalPaise: Number, cancelReason: String, numberReused: Boolean }], default: undefined },
   updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
 }, { timestamps: true });
 

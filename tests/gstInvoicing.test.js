@@ -243,6 +243,29 @@ describe('continue the tax-invoice series from a number', () => {
   });
 });
 
+describe('deleting a cancelled tax invoice', () => {
+  const { deleteCancelledPlan } = require('../controllers/invoicingController')._internals;
+  const inv = (over = {}) => ({ docType: 'tax_invoice', status: 'cancelled', number: '2026-27/59', fy: '2026-27', seq: 59, receivedPaise: 0, payments: [], ...over });
+
+  it('the last number used: deleted and its number reused', () => {
+    expect(deleteCancelledPlan(inv(), { counterSeq: 59, higherCount: 0 })).toEqual({ problems: [], reuse: true });
+  });
+  it('not the last number: deleted, the counter stays (a gap remains)', () => {
+    expect(deleteCancelledPlan(inv(), { counterSeq: 61, higherCount: 2 })).toEqual({ problems: [], reuse: false });
+  });
+  it.each([
+    ['an issued invoice', { status: 'issued' }, /Only a cancelled invoice/],
+    ['a draft', { status: 'draft' }, /Only a cancelled invoice/],
+    ['a bill of supply', { docType: 'bill_of_supply' }, /Only a tax invoice/],
+    ['money received', { receivedPaise: 100 }, /Money has been recorded/],
+    ['a payment line', { payments: [{}] }, /Money has been recorded/],
+  ])('refused: %s', (_, over, re) => {
+    const p = deleteCancelledPlan(inv(over), { counterSeq: 59, higherCount: 0 });
+    expect(p.problems.join(' ')).toMatch(re);
+    expect(p.reuse).toBe(false);
+  });
+});
+
 describe('default terms', () => {
   it('the standard five, for agreement and quotation clients alike', () => {
     const { DEFAULT_TERMS } = require('../controllers/invoicingController');
@@ -260,7 +283,7 @@ describe('routes: owner only', () => {
   it('every invoicing route is behind login and the owner role', async () => {
     const router = require('../routes/invoicing');
     const routes = router.stack.filter((l) => l.route);
-    expect(routes.length).toBe(20);
+    expect(routes.length).toBe(22);
     for (const l of routes) {
       expect(l.route.stack.length).toBe(3);
       const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json() { return this; } };

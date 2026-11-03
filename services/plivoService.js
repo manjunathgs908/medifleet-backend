@@ -341,15 +341,23 @@ async function issueToken(username) {
 const APP_RING_SECONDS = 15;
 const PHONE_RING_SECONDS = 40;
 
+// The phone stage of an incoming call also reports live, through the
+// Dial's callbackUrl: when a phone picks up (DialAction=answer) and when it
+// hangs up (DialAction=hangup). The action URL only fires when the Dial
+// ends, which is too late for the CRM to offer Transfer on a call answered
+// on a phone.
 function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
   const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
   const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
     + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
   const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}"` : '';
+  const live = stage === 'phone'
+    ? ` callbackUrl="${esc(apiUrl(`/api/calls/dial-event?log=${logId}&stage=phone`))}" callbackMethod="POST"`
+    : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
-    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
+    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${live}${sipHeaders}>${legs}</Dial>`,
   );
 }
 

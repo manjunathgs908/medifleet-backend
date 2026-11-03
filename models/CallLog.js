@@ -91,6 +91,16 @@ const CallLogSchema = new mongoose.Schema(
     recordingId : { type: String },
     recordingSec: { type: Number },
 
+    // An incoming call answered on a ring PHONE, as Plivo reported it live
+    // (the phone Dial's callbackUrl, callController.js dialEvent), so the
+    // CRM can show it and offer Transfer while it lasts. answeredIn:
+    // 'phone' only (an in-app answer is claimed by the CRM itself).
+    // answeredLegId: Plivo's UUID of that phone leg; answeredLegEndedAt:
+    // when that phone hung up (the call itself may go on — a transfer).
+    answeredIn        : { type: String, enum: ['phone'] },
+    answeredLegId     : { type: String },
+    answeredLegEndedAt: { type: Date },
+
     // Live transfers of an incoming call from the CRM (callController.js
     // transferCall), oldest first. Each: {by, byName, at, targets (user ids
     // rung), steps (e.g. ["english","all","back_app"]), outcome, answeredBy,

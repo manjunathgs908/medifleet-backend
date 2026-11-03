@@ -47,7 +47,7 @@ const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
-const { ACTIVE_STATUSES, callHasEnded, liveStateOf, PLIVO_CHECK_AFTER_MS } = require('../utils/callLiveness');
+const { ACTIVE_STATUSES, MAX_LIVE_MS, callHasEnded, liveStateOf, PLIVO_CHECK_AFTER_MS } = require('../utils/callLiveness');
 
 // Statuses during which a driver or partner may still reach the customer.
 const ACTIVE_TRIP_STATUSES = ['booked', 'dispatched', 'en_route'];
@@ -520,7 +520,7 @@ exports.clickToCall = async (req, res, next) => {
 // apart — from the Render log, or from the CRM via GET /api/calls/config.
 // In memory: it covers this server process since its last deploy, which is
 // the window anyone checking "did the call just now reach us?" needs.
-const WEBHOOKS = ['answer', 'incoming', 'events', 'recording', 'transfer-answer'];
+const WEBHOOKS = ['answer', 'incoming', 'events', 'recording', 'transfer-answer', 'dial-event'];
 const SERVER_STARTED_AT = new Date();
 const webhookStats = Object.fromEntries(WEBHOOKS.map((w) => [w, {
   hits: 0, accepted: 0, rejected: 0, lastHitAt: null, lastAcceptedAt: null, lastRejectedAt: null, lastRejectReason: null,
@@ -1138,6 +1138,11 @@ exports.transferCall = async (req, res, next) => {
     if (!holder || String(holder) !== String(req.user._id)) {
       return res.status(403).json({ success: false, reason: 'not_on_call', message: 'Only the person on this call can transfer it.' });
     }
+    // Answered on their phone: that phone must still be on the call.
+    const onPhone = heldOnPhone(log);
+    if (onPhone && log.answeredLegEndedAt) {
+      return res.status(409).json({ success: false, reason: 'ended', message: 'Your phone has already hung up on this call.' });
+    }
 
     const onDuty = await loadOnDuty();
     const devices = await loadOnlineDevices(onDuty);
@@ -1177,11 +1182,26 @@ exports.transferCall = async (req, res, next) => {
         { $set: { [`transfers.${t}.outcome`]: 'failed', [`transfers.${t}.error`]: `Plivo transfer failed (status ${status ?? '-'})`, [`transfers.${t}.endedAt`]: new Date() }, $push: { flow: `transfer${t}:failed(${status ?? '-'})` } },
       );
       if (failed?.modifiedCount > 0) {
+        // Answered on a phone: the call (or that phone) may have just hung
+        // up while the CRM still showed Transfer. Say so rather than "you
+        // are still connected".
+        if (onPhone) {
+          const now = await CallLog.findById(log._id).select('endedAt answeredLegEndedAt').lean();
+          if (status === 404 || now?.endedAt || now?.answeredLegEndedAt) {
+            console.info(`[calls] transfer of log=${log._id} too late: the call or the phone had already hung up (status ${status ?? '-'})`);
+            return res.status(409).json({ success: false, reason: 'ended', message: 'This call ended before it could be transferred.' });
+          }
+        }
         console.error(`[calls] transfer of log=${log._id} failed at Plivo (status ${status ?? '-'}) — caller left with ${req.user.name}`);
         return res.status(502).json({ success: false, reason: 'plivo_failed', message: 'The transfer did not go through. You are still connected to the caller.' });
       }
     }
-    plivo.logCall(`transfer ${t} by=${req.user._id} english=${plan.english.users.length} all=${plan.all.users.length}`, log);
+    // Plivo drops the phone that had the call when it moves the customer;
+    // if that phone is somehow still on a few seconds later, hang it up.
+    if (onPhone && log.answeredLegId) {
+      setTimeout(() => { dropAnsweredPhoneLeg(log._id).catch(() => {}); }, PHONE_LEG_DROP_MS).unref?.();
+    }
+    plivo.logCall(`transfer ${t} by=${req.user._id} english=${plan.english.users.length} all=${plan.all.users.length}${onPhone ? ' from=phone' : ''}`, log);
     return res.json({
       success: true,
       transfer: t,
@@ -1276,6 +1296,145 @@ exports.transferAnswer = async (req, res, next) => {
     console.error(`[calls] transfer-answer failed log=${logId || '-'}:`, err?.message || err);
     if (logId) CallLog.updateOne({ _id: logId }, { $push: { flow: 'transfer:error→sorry_message' } }).catch(() => {});
     return sendXml(res, plivo.speakXml(SORRY_MESSAGE));
+  }
+};
+
+
+// ── Transfer of a call answered on a phone ─────────────────────────────────
+// Ring mode "My phone": the call is answered on the native dialer, not in
+// the CRM. The phone Dial's callbackUrl tells us live who picked up (and
+// when that phone hangs up); the CRM polls GET /my-live and shows the call
+// with Transfer, which is the same transfer as in the app.
+
+// The person who has the call now answered it on their own phone (nobody
+// has taken it as a transfer since).
+function heldOnPhone(log) {
+  if (log?.answeredIn !== 'phone' || !log.agentUser) return false;
+  return String(transferHolder(log)) === String(log.agentUser)
+    && !(log.transfers || []).some((t) => t?.answeredBy && TRANSFER_ANSWERED.includes(t.outcome));
+}
+
+// Plivo drops the phone leg itself when it moves the customer; this is the
+// backstop if it is still on after this long (as the app hangs up its own
+// leg after 5s).
+const PHONE_LEG_DROP_MS = 5 * 1000;
+exports.PHONE_LEG_DROP_MS = PHONE_LEG_DROP_MS;
+
+async function dropAnsweredPhoneLeg(logId) {
+  const log = await CallLog.findById(logId).select('answeredLegId answeredLegEndedAt').lean();
+  if (!log?.answeredLegId || log.answeredLegEndedAt) return false;
+  // Only that one phone leg — never the customer's, never a transfer leg.
+  // Already gone (404) is fine: hangupLegs says nothing about it.
+  const done = await hangupLegs([log.answeredLegId], `phone still on after transfer log=${logId}`);
+  if (done.length) {
+    await CallLog.updateOne({ _id: logId, answeredLegEndedAt: null }, { $set: { answeredLegEndedAt: new Date() }, $push: { flow: 'phone:dropped_after_transfer' } });
+  }
+  return done.length > 0;
+}
+exports.dropAnsweredPhoneLeg = dropAnsweredPhoneLeg;
+
+// ============================================================
+// @route   POST /api/calls/dial-event?log=<id>&stage=phone
+// @desc    The phone Dial's callbackUrl: a phone picked up
+//          (DialAction=answer) or hung up (DialAction=hangup). On answer,
+//          the on-duty person whose ring phone it is has the call — as the
+//          Dial's end report would say, but now, while it lasts. First
+//          answer wins; an answer already recorded is never replaced.
+//          Nothing here changes what the caller hears.
+// @access  Plivo (signature)
+// ============================================================
+exports.dialEvent = async (req, res, next) => {
+  try {
+    const b = plivoParams(req);
+    const logId = logIdOf(req);
+    const action = String(b.DialAction || '').toLowerCase();
+    const legId = b.DialBLegUUID ? String(b.DialBLegUUID) : null;
+    if (!logId || req.query.stage !== 'phone') return sendXml(res, plivo.emptyXml());
+
+    if (action === 'answer' || action === 'connected') {
+      const log = await CallLog.findById(logId).select('direction context agentUser answeredAt answeredLegId endedAt');
+      if (!log || log.direction !== 'inbound' || log.endedAt) return sendXml(res, plivo.emptyXml());
+      // 'connected' follows 'answer' for the same leg: recorded once.
+      if (log.answeredLegId) return sendXml(res, plivo.emptyXml());
+      const who = b.DialBLegTo ? await whoseRingPhone(b.DialBLegTo) : null;
+      const now = new Date();
+      const set = { answeredIn: 'phone', ...(legId ? { answeredLegId: legId } : {}) };
+      let r;
+      if (who) {
+        r = await CallLog.updateOne(
+          { _id: log._id, agentUser: { $exists: false }, answeredLegId: { $exists: false } },
+          { $set: { ...set, agentUser: who._id, agentName: who.name, agentType: 'staff', answeredAt: now }, $push: { flow: 'phone:answered(live)' } },
+        );
+      } else {
+        // A phone that is nobody's on-duty ring phone (PLIVO_FALLBACK_AGENTS):
+        // the call is shown to nobody, but its answer time is still right.
+        r = await CallLog.updateOne(
+          { _id: log._id, agentUser: { $exists: false }, answeredLegId: { $exists: false } },
+          { $set: { ...set, ...(log.answeredAt ? {} : { answeredAt: now }) }, $push: { flow: 'phone:answered(live, not a ring phone)' } },
+        );
+      }
+      serverTrail('server:phone_answered', { logId: String(log._id), user: who ? String(who._id) : null, recorded: r?.modifiedCount > 0 });
+      return sendXml(res, plivo.emptyXml());
+    }
+
+    if (action === 'hangup' && legId) {
+      // Only the phone that had the call; another phone's leg ending (it
+      // rang and stopped) is not recorded.
+      const r = await CallLog.updateOne(
+        { _id: logId, answeredLegId: legId, answeredLegEndedAt: null },
+        { $set: { answeredLegEndedAt: new Date() }, $push: { flow: 'phone:hung_up(live)' } },
+      );
+      if (r?.modifiedCount > 0) serverTrail('server:phone_hung_up', { logId });
+    }
+    return sendXml(res, plivo.emptyXml());
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   GET /api/calls/my-live
+// @desc    The incoming call the signed-in user answered on their own
+//          phone and is still on, if any — masked, as GET /:id — with
+//          whether they can transfer it now. call: null when there is none.
+//          Polled by the CRM every few seconds.
+// @access  Private [owner, telecaller]
+// ============================================================
+exports.myLiveCall = async (req, res, next) => {
+  try {
+    const log = await CallLog.findOne({
+      // createdAt is indexed: only calls young enough to still be live.
+      createdAt         : { $gte: new Date(Date.now() - MAX_LIVE_MS) },
+      direction         : 'inbound',
+      context           : 'incoming',
+      agentUser         : req.user._id,
+      answeredIn        : 'phone',
+      endedAt           : null,
+      answeredLegEndedAt: null,
+    })
+      .sort({ createdAt: -1 })
+      .select('+customerPhone') // for toJSON: masked, or in full for a CRM owner
+      .populate('trip', 'tripNumber patientName status')
+      .populate('lead', 'patientName');
+    // Taken by a colleague as a transfer: no longer this user's call.
+    if (!log || !heldOnPhone(log)) return res.json({ success: true, call: null });
+    const transfers = log.transfers || [];
+    const ringing = transfers.some((t) => t?.outcome === 'ringing');
+    const last = transfers[transfers.length - 1];
+    return res.json({
+      success: true,
+      call: {
+        id          : log._id,
+        answeredAt  : log.answeredAt,
+        transferring: ringing,
+        canTransfer : !ringing,
+        // The last attempt that left the caller with this user, if any.
+        lastTransferFailed: last?.outcome === 'failed' ? true : undefined,
+        log,
+      },
+    });
+  } catch (err) {
+    next(err);
   }
 };
 

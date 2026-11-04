@@ -7,10 +7,9 @@ const { protect, authorize } = require('../middleware/auth');
 // AI telecaller PILOT. Plivo webhooks first (Plivo-signed, no login) —
 // declared before the owner guard below.
 router.post('/plivo/answer',       ctrl.answer);
+router.post('/plivo/next',         ctrl.next);   // after the stream ends (the XML <Redirect>)
 router.post('/plivo/hangup',       ctrl.hangup);
-router.post('/plivo/handoff',      ctrl.handoff);
 router.post('/plivo/handoff-done', ctrl.handoffDone);
-router.post('/plivo/goodbye',      ctrl.goodbye);
 router.post('/plivo/recording',    ctrl.recording);
 
 // The CRM pilot page — owner only.

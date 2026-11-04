@@ -98,9 +98,12 @@ async function checkCanCall(raw, { atAnswer = false } = {}) {
 
 // ── Call limits and models (env, with pilot defaults) ───────
 const maxCallSeconds = () => Math.min(Math.max(Number(process.env.AI_CALL_MAX_SECONDS) || 300, 60), 600);
-const realtimeModel = () => process.env.AI_REALTIME_MODEL || 'gpt-realtime';
+// GPT-Live: a voice model (session.model) plus a Responses model it
+// delegates tool work to (session.delegation.responses.model).
+const realtimeModel = () => process.env.AI_REALTIME_MODEL || 'gpt-live-1';
+const delegateModel = () => process.env.AI_DELEGATE_MODEL || 'gpt-6-luna';
 const realtimeVoice = () => process.env.AI_REALTIME_VOICE || 'marin';
-const transcribeModel = () => process.env.AI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe';
+const liveUrl = () => process.env.AI_LIVE_WS_URL || 'wss://api.openai.com/v1/live/sessions';
 
 // ── Rough cost — rates from env only, never hardcoded ───────
 // AI_COST_*_USD_PER_1M: OpenAI Realtime price per 1M tokens of each kind.
@@ -137,6 +140,6 @@ function estimateCostPaise(usage = {}, durationSec = 0) {
 
 module.exports = {
   envEnabled, allowlist, isAllowlisted, toggleEnabled, missingConfig, contactedUsVia,
-  activeCall, checkCanCall, maxCallSeconds, realtimeModel, realtimeVoice, transcribeModel,
+  activeCall, checkCanCall, maxCallSeconds, realtimeModel, delegateModel, realtimeVoice, liveUrl,
   costRates, estimateCostPaise, ACTIVE_STATES,
 };

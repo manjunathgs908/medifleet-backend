@@ -413,12 +413,17 @@ async function callAiLeg({ phone, callId, timeLimit }) {
 
 // The answered AI call: record the whole session in the background, then a
 // two-way audio stream (8 kHz mu-law, Plivo's phone format — passed to
-// OpenAI Realtime as-is, no transcoding) to our websocket. keepCallAlive:
-// the call lives as long as the stream does.
-function aiStreamXml({ streamUrl, recordUrl, maxSeconds }) {
+// GPT-Live as-is, no transcoding) to our websocket. keepCallAlive: the
+// XML after <Stream> runs only once the stream disconnects — so the
+// <Redirect> is what happens next, ALWAYS: Plivo itself asks nextUrl for
+// the handoff <Dial>, a goodbye or a hangup, whether the stream ended on
+// purpose, on the time limit or because something broke. No REST transfer
+// racing a call that has already moved on.
+function aiStreamXml({ streamUrl, recordUrl, nextUrl, maxSeconds }) {
   return xml(
     `<Record recordSession="true" redirect="false" maxLength="${maxSeconds}" fileFormat="mp3" playBeep="false" callbackUrl="${esc(recordUrl)}" callbackMethod="POST"/>`
-    + `<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" streamTimeout="${maxSeconds}">${esc(streamUrl)}</Stream>`,
+    + `<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" streamTimeout="${maxSeconds}">${esc(streamUrl)}</Stream>`
+    + `<Redirect method="POST">${esc(nextUrl)}</Redirect>`,
   );
 }
 

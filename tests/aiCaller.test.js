@@ -34,6 +34,7 @@ function mockMemoryModel() {
     if (v === null) return val == null;
     if (v && typeof v === 'object' && !(v instanceof Date) && !Array.isArray(v)) {
       if ('$in' in v) return v.$in.map(String).includes(String(val));
+      if ('$ne' in v) return String(val) !== String(v.$ne);
       if ('$gte' in v) return val != null && val >= v.$gte;
       if ('$regex' in v) return new RegExp(v.$regex).test(String(val ?? ''));
     }
@@ -325,6 +326,8 @@ describe('STEP 2B. Plivo answer webhook', () => {
     expect(res.status).toBe(200);
     expect(res.text).toContain('<Record recordSession="true"');
     expect(res.text).toMatch(/<Stream bidirectional="true" keepCallAlive="true" contentType="audio\/x-mulaw;rate=8000" streamTimeout="300">wss:\/\/api\.savelife\.health\/api\/ai-caller\/stream\?call=/);
+    // After the stream, ALWAYS: Plivo itself asks /next what to do (no REST transfer to race the call).
+    expect(res.text).toContain(`</Stream><Redirect method="POST">https://api.savelife.health/api/ai-caller/plivo/next?call=${id}</Redirect>`);
     const url = res.text.match(/>(wss:[^<]+)</)[1].replace(/&amp;/g, '&');
     expect(streamServer.verify(url)).toBe(id);
     expect(AiCall.store[0]).toMatchObject({ status: 'in_progress', plivoCallUuid: 'uuid-1' });
@@ -362,19 +365,24 @@ describe('STEP 2B. Plivo answer webhook', () => {
 });
 
 // ============================================================
-// The live conversation, with fake Plivo and OpenAI sockets.
+// The live conversation, with fake Plivo and OpenAI (GPT-Live) sockets.
 class FakeSocket extends EventEmitter {
   constructor(state = 1) { super(); this.readyState = state; this.sent = []; }
   send(s) { this.sent.push(JSON.parse(s)); }
-  close() { if (this.readyState === 3) return; this.readyState = 3; this.emit('close'); }
+  close(code) { if (this.readyState === 3) return; this.readyState = 3; this.emit('close', code || 1000, Buffer.from('')); }
   open() { this.readyState = 1; this.emit('open'); }
   push(ev) { this.emit('message', Buffer.from(JSON.stringify(ev))); }
   of(type) { return this.sent.filter((m) => (m.type || m.event) === type); }
 }
+// A delegated function call, as GPT-Live wraps it.
+const fnCall = (name, args, id = 'c1') => ({
+  type: 'response.event', delegation_id: 'item_d1',
+  event: { type: 'response.output_item.done', item: { type: 'function_call', call_id: id, name, arguments: JSON.stringify(args) } },
+});
 
-describe('STEP 2C. the conversation', () => {
+describe('STEP 2C. the conversation (GPT-Live)', () => {
   let callId; let plivoWs; let ai;
-  const begin = async () => {
+  const begin = async ({ started = true } = {}) => {
     const created = await AiCall.create({ phone: TEST_NO, status: 'in_progress', plivoCallUuid: 'uuid-1' });
     callId = String(created._id);
     plivoWs = new FakeSocket(1);
@@ -382,95 +390,136 @@ describe('STEP 2C. the conversation', () => {
     await session.createSession({ callId, plivoWs, connectOpenAI: () => ai });
     plivoWs.push({ event: 'start', start: { streamId: 'st-1' } });
     ai.open();
+    if (started) ai.push({ type: 'session.started', session: { id: 'sess_1' } });
     await flush();
   };
   const call = () => AiCall.store.find((d) => String(d._id) === callId);
-  afterEach(() => { plivoWs?.close(); });
-
-  test('the FIRST thing said is the disclosure, verbatim, Kannada then English; no-medical-advice rule is set', async () => {
-    await begin();
-    const [update] = ai.of('session.update');
-    expect(update.session).toMatchObject({ type: 'realtime', instructions: session.INSTRUCTIONS });
-    expect(update.session.audio.input.format.type).toBe('audio/pcmu');
-    expect(update.session.audio.output.format.type).toBe('audio/pcmu');
-    expect(update.session.tools.map((t) => t.name)).toEqual(['get_quote', 'create_booking', 'handoff_to_human', 'end_call']);
-    const [first] = ai.of('response.create');
-    expect(first.response.instructions).toContain(session.DISCLOSURE_KN);
-    expect(first.response.instructions).toContain(session.DISCLOSURE_EN);
-    expect(first.response.instructions.indexOf(session.DISCLOSURE_KN)).toBeLessThan(first.response.instructions.indexOf(session.DISCLOSURE_EN));
-    expect(session.DISCLOSURE_EN).toMatch(/automated assistant.*recorded/);
-    expect(session.INSTRUCTIONS).toMatch(/NEVER give medical advice/);
+  const next = () => http('POST', `/api/ai-caller/plivo/next?call=${callId}`, { form: {} });
+  afterEach(() => {
+    plivoWs?.close();
+    // The AI path never uses Plivo's REST transfer/hangup (that was the 404).
+    expect(plivo.transferCall).not.toHaveBeenCalled();
+    expect(plivo.hangupCall).not.toHaveBeenCalled();
   });
 
-  test('audio is bridged both ways; the caller talking over clears playback', async () => {
+  test('session.start: GPT-Live model, mu-law 8 kHz, voice, tools delegated to the Responses model', async () => {
+    await begin({ started: false });
+    const [start] = ai.of('session.start');
+    expect(Object.keys(start.session).sort()).toEqual(['audio', 'delegation', 'instructions', 'model']); // strict config: nothing else
+    expect(start.session).toMatchObject({
+      model: 'gpt-live-1',
+      instructions: session.INSTRUCTIONS,
+      audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
+      delegation: { type: 'responses', responses: { model: 'gpt-6-luna', instructions: session.DELEGATE_INSTRUCTIONS, tool_choice: 'auto' } },
+    });
+    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'create_booking', 'handoff_to_human', 'end_call']);
+    // Nothing is sent before session.started — not even audio.
+    plivoWs.push({ event: 'media', media: { payload: 'AAAA' } });
+    expect(ai.of('session.input_audio.append')).toHaveLength(0);
+    expect(ai.of('session.commentary.append')).toHaveLength(0);
+  });
+
+  test('model names come from env (AI_REALTIME_MODEL / AI_DELEGATE_MODEL / AI_REALTIME_VOICE)', async () => {
+    Object.assign(process.env, { AI_REALTIME_MODEL: 'gpt-live-1-mini', AI_DELEGATE_MODEL: 'gpt-5.6-luna', AI_REALTIME_VOICE: 'cedar' });
+    try {
+      await begin({ started: false });
+      const [start] = ai.of('session.start');
+      expect(start.session.model).toBe('gpt-live-1-mini');
+      expect(start.session.delegation.responses.model).toBe('gpt-5.6-luna');
+      expect(start.session.audio.output.voice).toBe('cedar');
+    } finally {
+      ['AI_REALTIME_MODEL', 'AI_DELEGATE_MODEL', 'AI_REALTIME_VOICE'].forEach((k) => delete process.env[k]);
+    }
+  });
+
+  test('on session.started the FIRST thing said is the disclosure, Kannada then English; no-medical-advice rule set', async () => {
+    await begin();
+    const [disclosure] = ai.of('session.commentary.append');
+    expect(disclosure).toMatchObject({ delegation_id: null, content: `${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN}` });
+    expect(session.DISCLOSURE_EN).toMatch(/automated assistant.*recorded/);
+    expect(session.INSTRUCTIONS).toMatch(/FIRST WORDS/);
+    expect(session.INSTRUCTIONS).toMatch(/NEVER give medical advice/);
+    expect(session.DELEGATE_INSTRUCTIONS).toMatch(/never answer medical questions/);
+  });
+
+  test('audio is bridged both ways in GPT-Live events, no transcoding', async () => {
     await begin();
     plivoWs.push({ event: 'media', media: { payload: 'AAAA' } });
-    expect(ai.of('input_audio_buffer.append')).toEqual([{ type: 'input_audio_buffer.append', audio: 'AAAA' }]);
-    ai.push({ type: 'response.output_audio.delta', delta: 'BBBB' });
+    expect(ai.of('session.input_audio.append')).toEqual([{ type: 'session.input_audio.append', audio: 'AAAA' }]);
+    ai.push({ type: 'session.output_audio.delta', delta: 'BBBB', start_ms: 0, end_ms: 20 });
     expect(plivoWs.of('playAudio')[0]).toEqual({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: 'BBBB' } });
-    ai.push({ type: 'input_audio_buffer.speech_started' });
-    expect(plivoWs.of('clearAudio')[0]).toEqual({ event: 'clearAudio', streamId: 'st-1' });
   });
 
-  test('booking path: quote from the real fare path, then a booking with bookingSource ai_telecaller', async () => {
+  test('transcript fragments are joined into turns per speaker', async () => {
+    await begin();
+    ai.push({ type: 'session.output_transcript.delta', delta: 'Namaskara, ' });
+    ai.push({ type: 'session.output_transcript.delta', delta: 'which service?' });
+    ai.push({ type: 'session.input_transcript.delta', delta: 'I need an ' });
+    ai.push({ type: 'session.input_transcript.delta', delta: 'ambulance' });
+    plivoWs.close(); // the end flushes the open turn
+    await flush();
+    const turns = call().transcript.filter((t) => t.role !== 'system').map((t) => `${t.role}: ${t.text}`);
+    expect(turns).toEqual(['assistant: Namaskara, which service?', 'caller: I need an ambulance']);
+  });
+
+  test('booking path: delegated function calls -> real fare path -> booking with bookingSource ai_telecaller', async () => {
     await begin();
     resolvePlaceFromText.mockImplementation(async (q) => ({ status: 'single', place: { name: q, address: 'Bengaluru', lat: q === 'Jayanagar' ? 12.93 : 12.96, lng: 77.58 } }));
     quoteTrip.mockResolvedValue({ oneWayKm: 6.2, distanceKm: 6.2, fare: { grandTotal: 1450 } });
     createBookedTrip.mockResolvedValue({ _id: 'trip1', tripNumber: 'TRP-1', estimatedFare: 1450 });
 
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'get_quote', arguments: JSON.stringify({ service_code: 'bls', pickup: 'Jayanagar', drop: 'Victoria Hospital' }) });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Victoria Hospital' }, 'call_q'));
     await flush();
-    const quoteOut = JSON.parse(ai.of('conversation.item.create')[0].item.output);
-    expect(quoteOut).toMatchObject({ ok: true, estimated_fare_rupees: 1450, pickup: 'Jayanagar, Bengaluru' });
+    const [out1] = ai.of('response.item.create');
+    expect(out1.item).toMatchObject({ type: 'function_call_output', call_id: 'call_q' });
+    expect(JSON.parse(out1.item.output)).toMatchObject({ ok: true, estimated_fare_rupees: 1450, pickup: 'Jayanagar, Bengaluru' });
+    expect(ai.of('response.create')).toHaveLength(1); // the backend response is continued explicitly
     expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ selectedType: 'bls', tripType: 'one_way', pickupLat: 12.93 }));
 
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c2', name: 'create_booking', arguments: JSON.stringify({ patient_name: 'Lakshmi', when: 'now', customer_confirmed: true }) });
+    ai.push(fnCall('create_booking', { patient_name: 'Lakshmi', when: 'now', customer_confirmed: true }, 'call_b'));
     await flush();
-    expect(createBookedTrip).toHaveBeenCalledTimes(1);
     const [body, opts] = createBookedTrip.mock.calls[0];
     expect(opts).toEqual({ bookingSource: 'ai_telecaller' }); // no bookedBy: it rings the CRM
     expect(body).toMatchObject({ patientName: 'Lakshmi', patientPhone: TEST_NO, selectedType: 'bls', pickupLat: 12.93, scheduleType: 'now', effectiveDist: 6.2 });
     expect(bookingPush.notifyIncomingBooking).toHaveBeenCalledWith('trip1');
     expect(call()).toMatchObject({ trip: 'trip1', outcome: 'booked' });
-    expect(JSON.parse(ai.of('conversation.item.create')[1].item.output)).toMatchObject({ ok: true, trip_number: 'TRP-1' });
+    expect(JSON.parse(ai.of('response.item.create')[1].item.output)).toMatchObject({ ok: true, trip_number: 'TRP-1' });
   });
 
-  test('no booking without a quote, without a clear yes, or twice', async () => {
+  test('no booking without a quote or without a clear yes', async () => {
     await begin();
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'create_booking', arguments: JSON.stringify({ when: 'now', customer_confirmed: true }) });
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }));
     await flush();
-    expect(JSON.parse(ai.of('conversation.item.create')[0].item.output)).toMatchObject({ ok: false, reason: 'no_quote' });
-
+    expect(JSON.parse(ai.of('response.item.create')[0].item.output)).toMatchObject({ ok: false, reason: 'no_quote' });
     resolvePlaceFromText.mockResolvedValue({ status: 'single', place: { name: 'X', address: 'Y', lat: 1, lng: 1 } });
     quoteTrip.mockResolvedValue({ oneWayKm: 1, distanceKm: 1, fare: { grandTotal: 900 } });
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c2', name: 'get_quote', arguments: JSON.stringify({ service_code: 'bls', pickup: 'a', drop: 'b' }) });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'a', drop: 'b' }, 'c2'));
     await flush();
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c3', name: 'create_booking', arguments: JSON.stringify({ when: 'now', customer_confirmed: false }) });
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: false }, 'c3'));
     await flush();
-    expect(JSON.parse(ai.of('conversation.item.create')[2].item.output)).toMatchObject({ ok: false, reason: 'not_confirmed' });
+    expect(JSON.parse(ai.of('response.item.create')[2].item.output)).toMatchObject({ ok: false, reason: 'not_confirmed' });
     expect(createBookedTrip).not.toHaveBeenCalled();
   });
 
   test('several matching places: the caller is asked, nothing is guessed', async () => {
     await begin();
     resolvePlaceFromText.mockResolvedValue({ status: 'multiple', places: [{ name: 'Manipal Hospital', address: 'Old Airport Rd', lat: 1, lng: 1 }, { name: 'Manipal Hospital', address: 'Hebbal', lat: 2, lng: 2 }] });
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'get_quote', arguments: JSON.stringify({ service_code: 'bls', pickup: 'Manipal', drop: 'Manipal' }) });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'Manipal', drop: 'Manipal' }));
     await flush();
-    const out = JSON.parse(ai.of('conversation.item.create')[0].item.output);
-    expect(out).toMatchObject({ ok: false, reason: 'clarify_places', pickup: { status: 'several' } });
+    expect(JSON.parse(ai.of('response.item.create')[0].item.output)).toMatchObject({ ok: false, reason: 'clarify_places', pickup: { status: 'several' } });
     expect(quoteTrip).not.toHaveBeenCalled();
   });
 
-  test('handoff path: the model asks → live transfer to the handoff XML, which rings on-duty phones', async () => {
+  test('handoff path: decided on the AiCall, stream closed, then /plivo/next rings on-duty phones', async () => {
     await begin();
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'handoff_to_human', arguments: JSON.stringify({ reason: 'caller_asked' }) });
+    ai.push(fnCall('handoff_to_human', { reason: 'caller_asked' }));
     await flush();
-    expect(plivo.transferCall).toHaveBeenCalledWith('uuid-1', `https://api.savelife.health/api/ai-caller/plivo/handoff?call=${callId}`);
     expect(call()).toMatchObject({ status: 'handing_off', handoff: true, handoffReason: 'caller_asked' });
-    expect(ai.readyState).toBe(3); // AI disconnected
+    expect(plivoWs.readyState).toBe(3); // Plivo now runs the <Redirect>
+    expect(ai.of('session.close')).toHaveLength(1); // OpenAI closed gracefully
 
     callController.fallbackPhones.mockReturnValueOnce(['9000011111']);
-    const xml = await http('POST', `/api/ai-caller/plivo/handoff?call=${callId}`, { form: {} });
+    const xml = await next();
     expect(xml.text).toContain('Connecting you to a SaveLife team member');
     expect(xml.text).toMatch(/<Dial callerId="\d*" action="https:\/\/api\.savelife\.health\/api\/ai-caller\/plivo\/handoff-done\?call=/);
     expect(xml.text).toContain('<Number>919000011111</Number>');
@@ -480,77 +529,134 @@ describe('STEP 2C. the conversation', () => {
     expect(call().outcome).toBe('handed_off');
   });
 
-  test('handoff nobody answers (or nobody on duty) → apology + callback queued', async () => {
+  test('handoff with nobody on duty, or nobody answering → apology + callback queued', async () => {
     await begin();
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'handoff_to_human', arguments: JSON.stringify({ reason: 'confused' }) });
+    ai.push(fnCall('handoff_to_human', { reason: 'confused' }));
     await flush();
-    const nobody = await http('POST', `/api/ai-caller/plivo/handoff?call=${callId}`, { form: {} });
+    const nobody = await next();
     expect(nobody.text).toContain('nobody from our team is free');
     expect(CallbackTask.store).toHaveLength(1);
     expect(CallbackTask.store[0]).toMatchObject({ customerPhone: TEST_NO, source: 'ai_call', state: 'open' });
     expect(call()).toMatchObject({ outcome: 'follow_up', callbackTask: CallbackTask.store[0]._id });
   });
 
-  test('distress words from the caller hand off at once — whatever the model does', async () => {
+  test('distress words in the caller transcript hand off at once — whatever the model does', async () => {
     await begin();
-    ai.push({ type: 'conversation.item.input_audio_transcription.completed', transcript: 'my father is not breathing' });
+    ai.push({ type: 'session.input_transcript.delta', delta: 'my father is not ' });
     await flush();
-    expect(plivo.transferCall).toHaveBeenCalledWith('uuid-1', expect.stringContaining('/plivo/handoff?call='));
-    expect(call()).toMatchObject({ handoff: true, handoffReason: 'distress' });
-    expect(call().transcript.map((t) => t.role)).toEqual(['caller', 'system']);
+    expect(call().handoff).toBeFalsy();
+    ai.push({ type: 'session.input_transcript.delta', delta: 'breathing' });
+    await flush();
+    expect(call()).toMatchObject({ status: 'handing_off', handoff: true, handoffReason: 'distress' });
+    expect(plivoWs.readyState).toBe(3);
   });
 
-  test.each([
-    'ಅವರಿಗೆ ಪ್ರಜ್ಞೆ ಇಲ್ಲ',
-    'वो बेहोश हैं',
-    'heavy bleeding from the head',
-  ])('distress (multi-language): "%s"', (text) => {
+  test.each(['ಅವರಿಗೆ ಪ್ರಜ್ಞೆ ಇಲ್ಲ', 'वो बेहोश हैं', 'heavy bleeding from the head'])('distress (multi-language): "%s"', (text) => {
     expect(session.isDistress(text)).toBe(true);
   });
   test('ordinary booking words are not distress', () => {
     expect(session.isDistress('I need an emergency ambulance to Victoria hospital')).toBe(false);
   });
 
-  test('fallback: the AI socket errors → handed to a person', async () => {
+  test('OpenAI closes the socket: code + reason logged and stored, handed to a person', async () => {
     await begin();
-    ai.emit('error', new Error('boom'));
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    ai.readyState = 3;
+    ai.emit('close', 1008, Buffer.from('Unknown model gpt-6-luna'));
     await flush();
-    expect(plivo.transferCall).toHaveBeenCalledWith('uuid-1', expect.stringContaining('/plivo/handoff?call='));
-    expect(call().handoffReason).toMatch(/AI connection error/);
+    expect(info).toHaveBeenCalledWith(expect.stringContaining('code=1008 reason=Unknown model gpt-6-luna'));
+    info.mockRestore();
+    expect(call()).toMatchObject({
+      status: 'handing_off',
+      openaiClose: { code: 1008, reason: 'Unknown model gpt-6-luna' },
+      error: 'AI connection closed (code 1008: Unknown model gpt-6-luna)',
+    });
+    expect((await next()).text).toMatch(/nobody from our team is free|<Dial/);
+  });
+
+  test('OpenAI rejects the handshake (HTTP 404 / 401): status and body logged and stored', async () => {
+    const errors = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await begin({ started: false });
+    const res = new EventEmitter();
+    res.statusCode = 404;
+    ai.emit('unexpected-response', {}, res);
+    res.emit('data', '{"error":{"message":"Not found"}}');
+    res.emit('end');
+    await flush();
+    expect(errors).toHaveBeenCalledWith(expect.stringContaining('HTTP 404 {"error":{"message":"Not found"}}'));
+    errors.mockRestore();
+    expect(call()).toMatchObject({ status: 'handing_off', openaiClose: { code: 404 } });
+    expect(call().error).toMatch(/AI handshake rejected: HTTP 404/);
+  });
+
+  test('an error event before session.started (e.g. a rejected session.start) is stored and hands off', async () => {
+    const errors = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await begin({ started: false });
+    ai.push({ type: 'error', error: { code: 'invalid_request_error', message: 'session.delegation.responses.model: unknown model' }, client_event_id: 'event_start' });
+    await flush();
+    errors.mockRestore();
+    expect(call().openaiErrors[0]).toMatchObject({ code: 'invalid_request_error', message: 'session.delegation.responses.model: unknown model' });
+    expect(call()).toMatchObject({ status: 'handing_off' });
+    expect(call().error).toMatch(/AI refused the session: invalid_request_error/);
+  });
+
+  test('an error event after start is logged but does not end a working call', async () => {
+    const errors = jest.spyOn(console, 'error').mockImplementation(() => {});
+    await begin();
+    ai.push({ type: 'error', error: { code: 'rate_limited', message: 'slow down' } });
+    await flush();
+    errors.mockRestore();
+    expect(call().status).toBe('in_progress');
+    expect(call().handoff).toBeFalsy();
+    expect(call().openaiErrors).toHaveLength(1);
   });
 
   test('fallback: a tool throws → handed to a person', async () => {
     await begin();
     resolvePlaceFromText.mockRejectedValue(new Error('google down'));
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'get_quote', arguments: JSON.stringify({ service_code: 'bls', pickup: 'a', drop: 'b' }) });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'a', drop: 'b' }));
     await flush();
-    expect(plivo.transferCall).toHaveBeenCalledTimes(1);
+    expect(call()).toMatchObject({ status: 'handing_off' });
     expect(call().handoffReason).toMatch(/google down/);
   });
 
-  test('fallback of the fallback: the handoff transfer fails → goodbye/hang-up + callback queued', async () => {
+  test('the stream ends unexpectedly (server restart, Plivo timeout) → /next hands off by itself', async () => {
     await begin();
-    plivo.transferCall.mockRejectedValueOnce(new Error('call gone')).mockRejectedValueOnce(new Error('still gone'));
-    ai.emit('close');
-    await flush(10);
-    expect(plivo.transferCall).toHaveBeenNthCalledWith(2, 'uuid-1', expect.stringContaining('/plivo/goodbye?call='));
-    expect(plivo.hangupCall).toHaveBeenCalledWith('uuid-1');
-    expect(call()).toMatchObject({ status: 'failed', outcome: 'follow_up' });
+    // No decision recorded — e.g. our process died. Plivo still runs the Redirect.
+    const xml = await next();
+    expect(xml.text).toMatch(/nobody from our team is free|<Dial/);
+    expect(call()).toMatchObject({ status: 'handing_off', handoffReason: 'stream ended unexpectedly' });
+  });
+
+  test('the call drops during a handoff → the hangup report still queues a callback', async () => {
+    await begin();
+    ai.push(fnCall('handoff_to_human', { reason: 'distress' }));
+    await flush();
+    call().answeredAt = new Date();
+    await http('POST', `/api/ai-caller/plivo/hangup?call=${callId}`, { form: { Duration: '40', BillDuration: '40', HangupCause: 'NORMAL_CLEARING' } });
+    expect(call()).toMatchObject({ status: 'completed', outcome: 'follow_up' });
     expect(CallbackTask.store).toHaveLength(1);
   });
 
-  test('fallback: OpenAI never connects → handed to a person after the connect timeout', async () => {
+  test('/next fails → goodbye + callback, never silence', async () => {
+    await begin();
+    const errors = jest.spyOn(console, 'error').mockImplementation(() => {});
+    callController.loadOnDuty.mockRejectedValueOnce(new Error('db down'));
+    ai.push(fnCall('handoff_to_human', { reason: 'confused' }));
+    await flush();
+    const xml = await next();
+    errors.mockRestore();
+    expect(xml.text).toContain('we could not continue this call');
+    expect(CallbackTask.store).toHaveLength(1);
+  });
+
+  test('OpenAI never starts the session → handed to a person after the connect timeout', async () => {
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     try {
-      const created = await AiCall.create({ phone: TEST_NO, status: 'in_progress', plivoCallUuid: 'uuid-9' });
-      callId = String(created._id);
-      plivoWs = new FakeSocket(1);
-      ai = new FakeSocket(0); // never opens
-      await session.createSession({ callId, plivoWs, connectOpenAI: () => ai });
-      await jest.advanceTimersByTimeAsync(8100);
+      await begin({ started: false });
+      await jest.advanceTimersByTimeAsync(10100);
       await flush();
-      expect(plivo.transferCall).toHaveBeenCalledWith('uuid-9', expect.stringContaining('/plivo/handoff?call='));
-      expect(call().handoffReason).toBe('AI did not connect in time');
+      expect(call()).toMatchObject({ status: 'handing_off', handoffReason: 'AI session did not start in time' });
     } finally {
       jest.useRealTimers();
     }
@@ -568,25 +674,37 @@ describe('STEP 2C. the conversation', () => {
     }
   });
 
-  test('end_call (follow_up): callback queued, hang up once the goodbye has played', async () => {
+  test('end_call (follow_up): callback queued; after the goodbye plays the stream closes and /next hangs up', async () => {
     await begin();
-    ai.push({ type: 'response.function_call_arguments.done', call_id: 'c1', name: 'end_call', arguments: JSON.stringify({ outcome: 'follow_up', summary: 'Wants a freezer box, call back' }) });
+    ai.push(fnCall('end_call', { outcome: 'follow_up', summary: 'Wants a freezer box, call back' }));
     await flush();
     expect(plivoWs.of('checkpoint')[0]).toEqual({ event: 'checkpoint', streamId: 'st-1', name: 'goodbye' });
-    expect(plivo.hangupCall).not.toHaveBeenCalled();
+    expect(plivoWs.readyState).toBe(1); // still playing the goodbye
     plivoWs.push({ event: 'playedStream', name: 'goodbye' });
     await flush();
-    expect(plivo.hangupCall).toHaveBeenCalledWith('uuid-1');
-    expect(call()).toMatchObject({ outcome: 'follow_up', summary: 'Wants a freezer box, call back' });
+    expect(plivoWs.readyState).toBe(3);
+    expect(call()).toMatchObject({ endRequested: true, outcome: 'follow_up', summary: 'Wants a freezer box, call back' });
     expect(CallbackTask.store).toHaveLength(1);
+    expect((await next()).text).toContain('<Hangup/>');
   });
 
-  test('the caller hanging up just ends the session — no handoff, no error', async () => {
+  test('session.closed: final usage stored (raw + mapped)', async () => {
+    await begin();
+    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
+    ai.push({ type: 'session.closed', reason: 'client_requested', usage: { input_token_details: { audio_tokens: 900, text_tokens: 50 }, output_token_details: { audio_tokens: 1500 } } });
+    await flush();
+    info.mockRestore();
+    expect(call().usage).toMatchObject({ audioIn: 900, textIn: 50, audioOut: 1500 });
+    expect(call().usageRaw).toBeTruthy();
+    expect(call().openaiClose.reason).toBe('client_requested');
+  });
+
+  test('the caller hanging up just ends the session — no handoff', async () => {
     await begin();
     plivoWs.close();
     await flush();
-    expect(plivo.transferCall).not.toHaveBeenCalled();
-    expect(ai.readyState).toBe(3);
+    expect(call().status).toBe('in_progress');
+    expect(call().handoff).toBeFalsy();
   });
 
   test('a second stream for the same call is refused', async () => {

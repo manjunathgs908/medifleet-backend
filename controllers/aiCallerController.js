@@ -10,8 +10,8 @@
  *   GET  /calls, /calls/:id sessions; one with its transcript
  *     — CRM owner only.
  *
- *   POST /plivo/answer, /hangup, /handoff, /handoff-done, /goodbye,
- *        /recording        Plivo webhooks, Plivo signature checked.
+ *   POST /plivo/answer, /next, /hangup, /handoff-done, /recording
+ *                           Plivo webhooks, Plivo signature checked.
  * ============================================================
  */
 const mongoose = require('mongoose');
@@ -43,7 +43,7 @@ exports.status = async (req, res, next) => {
       allowlist   : numbers,
       activeCallId: activeCall ? String(activeCall._id) : null,
       limits      : { maxCallSeconds: config.maxCallSeconds() },
-      models      : { realtime: config.realtimeModel(), voice: config.realtimeVoice(), transcribe: config.transcribeModel() },
+      models      : { realtime: config.realtimeModel(), delegate: config.delegateModel(), voice: config.realtimeVoice() },
       costRatesSet: !!config.costRates(),
     });
   } catch (err) { next(err); }
@@ -119,6 +119,7 @@ exports.answer = async (req, res, next) => {
     return sendXml(res, plivo.aiStreamXml({
       streamUrl : streamServer.streamUrl(id),
       recordUrl : plivo.apiUrl(`/api/ai-caller/plivo/recording?call=${id}`),
+      nextUrl   : plivo.apiUrl(`/api/ai-caller/plivo/next?call=${id}`),
       maxSeconds: config.maxCallSeconds(),
     }));
   } catch (err) {
@@ -142,15 +143,17 @@ exports.hangup = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-exports.handoff = async (req, res) => {
+// The stream ended (Plivo runs the <Redirect> after <Stream>): hand off,
+// hang up, or apologise — calls.nextXml decides from the AiCall.
+exports.next = async (req, res) => {
   const id = plivoGuard(req, res);
   if (!id) return undefined;
   try {
-    return sendXml(res, await calls.handoffXml(id));
+    return sendXml(res, await calls.nextXml(id));
   } catch (err) {
-    console.error('[aiCaller] handoff XML failed:', err.message);
-    await calls.queueFollowUp(id, 'Handoff failed').catch(() => {});
-    return sendXml(res, plivo.speakXml(calls.NOBODY_SAY));
+    console.error('[aiCaller] next-step XML failed:', err.message);
+    await calls.failSafe(id, `next step failed: ${err.message}`).catch(() => {});
+    return sendXml(res, plivo.speakXml(calls.GOODBYE_SAY));
   }
 };
 
@@ -163,12 +166,6 @@ exports.handoffDone = async (req, res) => {
     console.error('[aiCaller] handoff-done failed:', err.message);
     return sendXml(res, plivo.hangupXml());
   }
-};
-
-exports.goodbye = (req, res) => {
-  const id = plivoGuard(req, res);
-  if (!id) return undefined;
-  return sendXml(res, plivo.speakXml(calls.GOODBYE_SAY));
 };
 
 exports.recording = async (req, res) => {

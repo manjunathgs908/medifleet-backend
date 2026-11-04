@@ -62,8 +62,20 @@ const AiCallSchema = new mongoose.Schema(
       cachedIn: { type: Number, default: 0 },
     },
     estCostPaise: { type: Number, default: null },
+    // GPT-Live's own final usage report (session.closed), kept verbatim —
+    // its shape is newer than the fields above, which are filled from it
+    // where they match.
+    usageRaw: { type: mongoose.Schema.Types.Mixed },
+
+    // The assistant ended the call (end_call): when the stream closes,
+    // /plivo/next hangs up instead of handing off.
+    endRequested: { type: Boolean, default: false },
 
     error: { type: String, maxlength: 500 },
+    // Why the OpenAI side ended, as OpenAI said it — handshake HTTP status,
+    // websocket close code/reason, error events. For diagnosing a pilot call.
+    openaiClose : { code: Number, reason: String, at: Date },
+    openaiErrors: [{ _id: false, at: Date, code: String, message: String }],
   },
   { timestamps: true },
 );

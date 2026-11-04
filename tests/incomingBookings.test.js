@@ -52,6 +52,10 @@ jest.mock('../models/TripCallEvent', () => ({
 }));
 jest.mock('../models/GeofenceEvent', () => modelStub());
 jest.mock('../models/Quote',         () => modelStub());
+// /incoming also lists WhatsApp alerts (tests/whatsappAlerts.test.js);
+// none here, so these bookings-only tests see exactly what they did.
+jest.mock('../models/WhatsAppLead',    () => ({ ...modelStub(), find: jest.fn(() => ({ sort: () => ({ limit: () => Promise.resolve([]) }) })) }));
+jest.mock('../models/WhatsAppSession', () => ({ ...modelStub(), find: jest.fn(() => ({ sort: () => ({ limit: () => Promise.resolve([]) }) })) }));
 jest.mock('../utils/cloudinary', () => ({ uploadToCloudinary: jest.fn() }));
 jest.mock('../utils/platformOwner', () => ({
   isPlatformDriver: jest.fn(), platformDriverIds: jest.fn(), platformOwnerIds: jest.fn(),

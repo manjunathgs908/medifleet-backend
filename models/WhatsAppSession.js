@@ -66,6 +66,20 @@ const WhatsAppSessionSchema = new mongoose.Schema({
 
   tripId: { type: String, default: null },
 
+  // CRM incoming alert for this conversation — services/incomingAlerts.js.
+  // meaningfulAt: the FIRST time the step moved past language into a
+  // service or booking details (MEANINGFUL_STEPS there), claimed with a
+  // conditional update so it is set exactly once per conversation and only
+  // that transition alerts. alertPushAt: the once-only push lock.
+  // crmAckAt/By/Action: first operator's Open/Dismiss on the ring. None of
+  // these touch updatedAt, so the 30-minute TTL still measures customer
+  // activity only. Declared because this schema is strict (see above).
+  meaningfulAt: { type: Date },
+  alertPushAt : { type: Date },
+  crmAckAt    : { type: Date },
+  crmAckBy    : { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  crmAckAction: { type: String, enum: ['accepted', 'dismissed'] },
+
   updatedAt: { type: Date, default: Date.now },
 });
 

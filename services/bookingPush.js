@@ -3,14 +3,16 @@
  * services/bookingPush.js
  * ============================================================
  * Background Web Push to CRM operators (owners, telecallers) for a new
- * incoming booking, so it reaches them with the CRM in the background or
- * closed. Complements the foreground ring (components/IncomingBookingAlert
- * in the CRM polling GET /api/trips/incoming) — same definition of
- * "incoming" (services/incomingBookings.js), so a booking pushes exactly
- * when it would ring.
+ * incoming booking, new WhatsApp lead or meaningful WhatsApp conversation,
+ * so it reaches them with the CRM in the background or closed.
+ * Complements the foreground ring (components/IncomingBookingAlert in the
+ * CRM polling GET /api/trips/incoming) — same definitions
+ * (services/incomingBookings.js, services/incomingAlerts.js), so each
+ * pushes exactly when it would ring.
  *
- *   - once per booking: Trip.incomingPushAt is claimed with a conditional
- *     update before anything is sent, so a retry or a second caller sends
+ *   - once each: Trip.incomingPushAt / WhatsAppLead.alertPushAt /
+ *     WhatsAppSession.alertPushAt is claimed with a conditional update
+ *     before anything is sent, so a retry or a second caller sends
  *     nothing.
  *   - subscriptions the push service reports gone (404/410) are deleted.
  *   - fire-and-forget: notifyIncomingBooking never throws. A push failure
@@ -22,8 +24,11 @@
 const webpush = require('web-push');
 const { Trip } = require('../models');
 const PushSubscription = require('../models/PushSubscription');
+const WhatsAppLead = require('../models/WhatsAppLead');
+const WhatsAppSession = require('../models/WhatsAppSession');
 const { OPERATIONS } = require('../middleware/auth');
 const { INCOMING_WINDOW_MS, incomingTrip } = require('./incomingBookings');
+const incomingAlerts = require('./incomingAlerts');
 
 let warnedOff = false;
 function configured() {
@@ -78,8 +83,39 @@ async function sendIncomingBooking(tripId) {
   );
   if (!claimed) return { sent: 0, skipped: 'already_pushed' };
 
+  return sendToStaff(payloadFor(hit.trip, hit.via));
+}
+
+// WhatsApp lead / meaningful conversation — same checks, own lock
+// (alertPushAt on the lead / session). The notification's text and link
+// come from the alert item (services/incomingAlerts.js); still no phone.
+const WA_BODY = {
+  wa_lead: () => 'Asked on WhatsApp for a service with no automated booking — call back',
+  wa_chat: (a) => `${a.stage} · WhatsApp`,
+};
+async function sendWhatsAppAlert(Model, find, id) {
+  if (!configured()) return { sent: 0, skipped: 'not_configured' };
+  const alert = await find(id);
+  if (!alert) return { sent: 0, skipped: 'not_incoming' };
+  const claimed = await Model.findOneAndUpdate(
+    { _id: alert.id, alertPushAt: null },
+    { $set: { alertPushAt: new Date() } },
+    { new: true, projection: { _id: 1 } },
+  );
+  if (!claimed) return { sent: 0, skipped: 'already_pushed' };
+  return sendToStaff(JSON.stringify({
+    title: alert.title,
+    body : WA_BODY[alert.type](alert),
+    type : alert.type,
+    url  : alert.link,
+    tag  : alert.key,
+  }));
+}
+const sendWhatsAppLead = (leadId) => sendWhatsAppAlert(WhatsAppLead, incomingAlerts.incomingLead, leadId);
+const sendWhatsAppChat = (sessionId) => sendWhatsAppAlert(WhatsAppSession, incomingAlerts.incomingChat, sessionId);
+
+async function sendToStaff(payload) {
   const subs = await staffSubscriptions();
-  const payload = payloadFor(hit.trip, hit.via);
   // Undelivered past the ring window, it's stale — the push service drops it.
   const options = { TTL: Math.round(INCOMING_WINDOW_MS / 1000), urgency: 'high' };
 
@@ -99,12 +135,18 @@ async function sendIncomingBooking(tripId) {
   return { sent, failed: results.length - sent, removed: gone.length };
 }
 
-// Fire-and-forget entry point for the booking paths.
-function notifyIncomingBooking(tripId) {
-  return sendIncomingBooking(tripId).catch((err) => {
-    console.error('[bookingPush] notifyIncomingBooking failed:', err.message);
-    return { sent: 0, error: err.message };
-  });
-}
+// Fire-and-forget entry points — never reject.
+const fireAndForget = (name, send) => (id) => send(id).catch((err) => {
+  console.error(`[bookingPush] ${name} failed:`, err.message);
+  return { sent: 0, error: err.message };
+});
+const notifyIncomingBooking = fireAndForget('notifyIncomingBooking', sendIncomingBooking);
+const notifyWhatsAppLead    = fireAndForget('notifyWhatsAppLead', sendWhatsAppLead);
+const notifyWhatsAppChat    = fireAndForget('notifyWhatsAppChat', sendWhatsAppChat);
 
-module.exports = { notifyIncomingBooking, sendIncomingBooking, configured };
+module.exports = {
+  notifyIncomingBooking, sendIncomingBooking,
+  notifyWhatsAppLead, sendWhatsAppLead,
+  notifyWhatsAppChat, sendWhatsAppChat,
+  configured,
+};

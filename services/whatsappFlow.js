@@ -47,6 +47,7 @@ const fareCalculator = require('../utils/fareCalculator');
 const { verifyRoadDistanceKm } = require('../controllers/tripController');
 const whatsapp = require('./whatsappService');
 const bookingPush = require('./bookingPush');
+const { isMeaningfulStep, claimMeaningful } = require('./incomingAlerts');
 
 // Mirrors tripController.js's own GST_RATE (module-private there, not
 // exported -- this is the one other place a fare gets computed, so it
@@ -182,9 +183,21 @@ async function saveSession(session, patch) {
   // (e.g. completeLanguageSelection's { language, step } in one call).
   if (stepChanged) {
     logFunnelEvent(session.phone, session._id, session.step, session.language, session.serviceLabel);
+    // First step past language into a service / booking details: alert the
+    // CRM once for this conversation (services/incomingAlerts.js). Never
+    // awaited — must not delay or break the customer's reply.
+    if (!session.meaningfulAt && isMeaningfulStep(session.step)) alertIfFirstMeaningful(session._id);
   }
 
   return session;
+}
+
+// claimMeaningful sets session.meaningfulAt only if it is still unset, so
+// exactly one transition per conversation ever alerts.
+function alertIfFirstMeaningful(sessionId) {
+  claimMeaningful(sessionId)
+    .then((first) => { if (first) bookingPush.notifyWhatsAppChat(sessionId); })
+    .catch((err) => console.error('[whatsappFlow] meaningful-conversation alert failed:', err.message));
 }
 
 async function startFreshSession(phone) {
@@ -406,7 +419,10 @@ async function resolveAddressForLocation(lat, lng, metaAddress) {
 async function logLead(phone, service) {
   console.log(`[whatsappLead] phone=${phone} service=${service}`);
   try {
-    await WhatsAppLead.create({ phone, service });
+    const lead = await WhatsAppLead.create({ phone, service });
+    // Rings in the CRM via GET /incoming; this is the background push
+    // (once — alertPushAt). Fire-and-forget.
+    bookingPush.notifyWhatsAppLead(lead._id);
   } catch (err) {
     // A failed lead write must never break the customer-facing flow --
     // the console.log above is the fallback record if this ever throws.

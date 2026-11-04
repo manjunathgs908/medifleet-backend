@@ -29,6 +29,15 @@ const WhatsAppLeadSchema = new mongoose.Schema(
 
     status: { type: String, enum: ['new', 'contacted', 'closed'], default: 'new', index: true },
     notes : { type: String, trim: true },
+
+    // CRM incoming alert (full-screen ring + background push) — see
+    // services/incomingAlerts.js. alertPushAt is the once-only lock on the
+    // push; crmAckAt/By/Action is set ONCE by the first operator to Open or
+    // Dismiss it on the ring, which stops it ringing for everyone.
+    alertPushAt : { type: Date },
+    crmAckAt    : { type: Date },
+    crmAckBy    : { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    crmAckAction: { type: String, enum: ['accepted', 'dismissed'] },
   },
   { timestamps: true }
 );

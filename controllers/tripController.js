@@ -25,6 +25,7 @@ const { sendFullScreenTrip } = require('../utils/fcmService');
 const TripCallEvent = require('../models/TripCallEvent');
 const BookingOtp = require('../models/BookingOtp');
 const incomingBookings = require('../services/incomingBookings');
+const incomingAlerts = require('../services/incomingAlerts');
 const bookingPush = require('../services/bookingPush');
 const fareCalculator = require('../utils/fareCalculator');
 const { applyAdvancesToNewBill } = require('../services/payments');
@@ -1882,16 +1883,20 @@ exports.getLiveBoard = async (req, res, next) => {
 //          incoming (customer bookings and customer-confirmed quote links,
 //          never one an operator typed) is defined once, in
 //          services/incomingBookings.js, shared with the background push.
+//          `alerts` (additive) is the full ring queue: those bookings plus
+//          new WhatsApp leads and meaningful WhatsApp conversations, each
+//          with a type and link (services/incomingAlerts.js). `trips` is
+//          unchanged: bookings only.
 // @access  Private [owner, telecaller]
 // ============================================================
 exports.INCOMING_WINDOW_MS = incomingBookings.INCOMING_WINDOW_MS;
 exports.getIncoming = async (req, res, next) => {
   try {
-    const hits = await incomingBookings.findIncoming();
+    const { bookings, alerts } = await incomingAlerts.findAlerts();
     // toJSON masks the customer's number per viewer, as everywhere else.
     // incomingVia is additive, for the alert's "via …" line.
-    const trips = hits.map(({ trip, via }) => ({ ...trip.toJSON(), incomingVia: via }));
-    return res.json({ success: true, trips });
+    const trips = bookings.map(({ trip, via }) => ({ ...trip.toJSON(), incomingVia: via }));
+    return res.json({ success: true, trips, alerts });
   } catch (err) {
     next(err);
   }

@@ -104,6 +104,7 @@ app.use('/api/quotes',    require('./routes/quotes'));     // owner + token-keye
 app.use('/api/calls',     require('./routes/calls'));      // Plivo masked calling (Exotel stays at /api/call)
 app.use('/api/callbacks', require('./routes/callbacks'));  // missed-call callback queue (operations staff)
 app.use('/api/push',      require('./routes/push'));       // CRM Web Push subscriptions (operations staff)
+app.use('/api/alerts',    require('./routes/alerts'));     // acknowledge WhatsApp lead/chat alerts (operations staff)
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

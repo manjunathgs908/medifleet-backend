@@ -94,6 +94,7 @@ const ALLOWED = {
   Fleet            : [['GET', '/api/ambulances/admin'], ['GET', '/api/auth/users?role=driver']],
   Dispatch         : [['GET', '/api/trips/live'], ['POST', '/api/trips/estimate'], ['GET', `/api/trips/${ID}/suggested-ambulances`],
                       ['PUT', `/api/trips/${ID}/assign`], ['PUT', `/api/trips/${ID}/cancel`], ['PUT', `/api/trips/${ID}/complete`],
+                      ['GET', '/api/trips/incoming'], ['PUT', `/api/trips/${ID}/acknowledge`],
                       ['GET', '/api/quotes'], ['POST', '/api/quotes'], ['GET', '/api/hospitals'], ['GET', '/api/billing/issuer']],
   Trips            : [['GET', '/api/trips']],
   'Trip Alerts'    : [['GET', '/api/trip-call-events?type=NO_RESPONSE']],

@@ -7,12 +7,16 @@ const paymentCtrl = require('../controllers/paymentController');
 // see their own trips, and protect() alone cannot serve them because it
 // looks subjects up in the User collection. Every other route here stays
 // on protect(). See middleware/auth.js.
-const { protect, protectUserOrOwner, authorize, OPERATIONS } = require('../middleware/auth');
+const { protect, protectUserOrOwner, authorize, optionalStaff, OPERATIONS } = require('../middleware/auth');
 
 router.post('/send-otp',   tripCtrl.sendBookingOtp);
 router.post('/verify-otp', tripCtrl.verifyBookingOtp);
 router.post('/estimate', protect, tripCtrl.estimateTrip);
-router.post('/', tripCtrl.createTrip);
+// Still public. optionalStaff never blocks; it only marks a CRM operator's
+// booking (bookedBy) so it doesn't ring the CRM's incoming-booking alert.
+router.post('/', optionalStaff, tripCtrl.createTrip);
+// CRM incoming-booking alert (full-screen ring). Before '/:id'.
+router.get('/incoming', protect, authorize(...OPERATIONS), tripCtrl.getIncoming);
 // Token-keyed public tracking. Declared before '/:id/track' and
 // before any '/:id' pattern so 'track' is never read as an id.
 router.get('/track/:token', tripCtrl.trackTripByToken);
@@ -34,6 +38,7 @@ router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);
 // like the assign call it feeds.
 router.get('/:id/suggested-ambulances', protect, authorize(...OPERATIONS), tripCtrl.getSuggestedAmbulances);
 router.put('/:id/assign', protect, authorize(...OPERATIONS), tripCtrl.assignVehicle);
+router.put('/:id/acknowledge', protect, authorize(...OPERATIONS), tripCtrl.acknowledgeIncoming);
 router.put('/:id/status', protect, tripCtrl.updateStatus);
 router.put('/:id/arrive-pickup', protect, tripCtrl.arrivePickup);
 router.put('/:id/reached-hospital', protect, tripCtrl.arriveDrop);

@@ -803,6 +803,16 @@ const tripSchema = new Schema(
     // status enum or its transitions.
     driverConfirmed: { type: Boolean, default: false },
 
+    // CRM "incoming booking" ring — set ONCE, by the first operator to tap
+    // Accept or Dismiss on the full-screen alert (PUT /:id/acknowledge,
+    // conditional on crmAckAt still being null), so the booking stops
+    // ringing in every tab for every operator. Absent on CRM-made trips
+    // (bookedBy set), which never ring. Purely an alerting flag: does not
+    // touch status, dispatch or billing.
+    crmAckAt    : { type: Date },
+    crmAckBy    : { type: Schema.Types.ObjectId, ref: 'User' },
+    crmAckAction: { type: String, enum: ['accepted', 'dismissed'] },
+
     // ── Pickup OTP verification (select:false — hidden from normal
     // queries; driver app must never see this value, only the customer
     // does. Only explicitly selected when verifying.) ──

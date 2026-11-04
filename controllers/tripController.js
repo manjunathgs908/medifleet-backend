@@ -24,6 +24,7 @@ const { sendPush } = require('../utils/pushService');
 const { sendFullScreenTrip } = require('../utils/fcmService');
 const TripCallEvent = require('../models/TripCallEvent');
 const BookingOtp = require('../models/BookingOtp');
+const Quote = require('../models/Quote');
 const fareCalculator = require('../utils/fareCalculator');
 const { applyAdvancesToNewBill } = require('../services/payments');
 const smsService = require('../utils/smsService');
@@ -1863,6 +1864,101 @@ exports.getLiveBoard = async (req, res, next) => {
         ...countDispatchStates(liveTrips.map((t) => t.dispatch)),
         available: availableVehicles.length,
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/trips/incoming
+// @desc    Customer bookings nobody in the CRM has answered yet — what the
+//          CRM's full-screen "Incoming Booking" ring polls. Booked, still
+//          unassigned, not acknowledged, recent (older is the dispatch
+//          board's job, not a phone ring), and booked BY THE CUSTOMER:
+//            (a) bookedBy unset — website, customer app, WhatsApp; or
+//            (b) a quote link the customer confirmed. Those carry bookedBy
+//                (the operator who sent the quote), so bookedBy alone
+//                can't tell them from a booking an operator typed in.
+//                Both of the confirm flow's own marks are required:
+//                bookingSource 'crm' AND a confirmed Quote pointing at the
+//                trip (quoteController.confirmQuote). The Quote is the
+//                proof; bookingSource only narrows the query.
+//          A booking an operator typed in the CRM (bookedBy set, no
+//          confirmed quote) never rings.
+// @access  Private [owner, telecaller]
+// ============================================================
+const INCOMING_WINDOW_MS = 30 * 60 * 1000;
+exports.INCOMING_WINDOW_MS = INCOMING_WINDOW_MS;
+exports.getIncoming = async (req, res, next) => {
+  try {
+    const candidates = await Trip.find({
+      status   : 'booked',
+      driver   : null,
+      ambulance: null,
+      crmAckAt : null,
+      createdAt: { $gte: new Date(Date.now() - INCOMING_WINDOW_MS) },
+      $or      : [{ bookedBy: null }, { bookingSource: 'crm' }],
+    })
+      .populate('dropHospital', 'name')
+      .sort({ createdAt: 1 })
+      .limit(20);
+
+    const withBooker = candidates.filter((t) => t.bookedBy).map((t) => t._id);
+    const viaQuoteLink = new Set();
+    if (withBooker.length) {
+      const quotes = await Quote.find({ trip: { $in: withBooker }, status: 'confirmed' }).select('trip').lean();
+      quotes.forEach((q) => viaQuoteLink.add(String(q.trip)));
+    }
+
+    // toJSON masks the customer's number per viewer, as everywhere else.
+    // incomingVia is additive, for the alert's "via …" line.
+    const trips = candidates
+      .filter((t) => !t.bookedBy || viaQuoteLink.has(String(t._id)))
+      .map((t) => ({ ...t.toJSON(), incomingVia: t.bookedBy ? 'quote_link' : 'customer' }));
+    return res.json({ success: true, trips });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   PUT /api/trips/:id/acknowledge
+// @desc    Stop a booking ringing — Accept or Dismiss on the CRM alert.
+//          Set once: only the first operator's tap is recorded (conditional
+//          on crmAckAt still being null), so two operators tapping at the
+//          same moment can't overwrite each other. A later tap gets 200
+//          with acknowledged:false and who got there first. Changes no
+//          status, dispatch or billing field.
+// @access  Private [owner, telecaller]
+// ============================================================
+const ACK_ACTIONS = ['accepted', 'dismissed'];
+exports.acknowledgeIncoming = async (req, res, next) => {
+  try {
+    const { action } = req.body || {};
+    if (!ACK_ACTIONS.includes(action)) {
+      return res.status(400).json({ success: false, message: `action must be one of: ${ACK_ACTIONS.join(', ')}.` });
+    }
+    const at = new Date();
+    const claimed = await Trip.findOneAndUpdate(
+      { _id: req.params.id, crmAckAt: null },
+      { $set: { crmAckAt: at, crmAckBy: req.user._id, crmAckAction: action } },
+      { new: true, projection: { _id: 1 } },
+    );
+    if (claimed) {
+      return res.json({ success: true, acknowledged: true, ack: { at, by: { _id: req.user._id, name: req.user.name }, action } });
+    }
+    const existing = await Trip.findById(req.params.id)
+      .select('crmAckAt crmAckBy crmAckAction')
+      .populate('crmAckBy', 'name')
+      .lean();
+    if (!existing) return res.status(404).json({ success: false, message: 'Trip not found.' });
+    return res.json({
+      success: true,
+      acknowledged: false,
+      ack: { at: existing.crmAckAt, by: existing.crmAckBy || null, action: existing.crmAckAction },
     });
   } catch (err) {
     next(err);

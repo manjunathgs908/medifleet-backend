@@ -313,7 +313,32 @@ const protectUserOrOwner = async (req, res, next) => {
 // stay authorize('owner').
 const OPERATIONS = ['owner', 'telecaller'];
 
+/**
+ * optionalStaff — for PUBLIC routes that also serve the CRM (POST
+ * /api/trips: website, customer app and the CRM's booking form all post
+ * there). NEVER blocks and never answers the request: no token, a bad or
+ * expired token, a customer/driver token, a stale device — all just call
+ * next() with req.user unset, exactly as if the middleware weren't there.
+ * Only a valid, active CRM staff login (OPERATIONS) sets req.user, which is
+ * how createTrip records bookedBy and how /api/trips/incoming tells an
+ * operator's own booking from a customer's. Deliberately does not call
+ * runAsViewer: the response stays masked as it always was on this route.
+ */
+const optionalStaff = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith('Bearer ')) return next();
+    const decoded = jwt.verify(header.split(' ')[1], process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password -otp -otpExpiry -refreshToken');
+    if (user && user.isActive && decoded.deviceId === user.deviceId && OPERATIONS.includes(user.role)) {
+      req.user = user;
+      req.actorType = 'user';
+    }
+  } catch { /* not staff — carry on as a public request */ }
+  return next();
+};
+
 module.exports = {
   protect, protectOwner, protectUserOrOwner, authorize, driverSelfOnly, requireKycApproved,
-  OPERATIONS,
+  optionalStaff, OPERATIONS,
 };

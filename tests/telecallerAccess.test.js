@@ -51,6 +51,7 @@ const MOUNTS = {
   '/api/quotes'          : '../routes/quotes',
   '/api/calls'           : '../routes/calls',
   '/api/callbacks'       : '../routes/callbacks',
+  '/api/push'            : '../routes/push',
 };
 
 // Every route's own handler -> 200, keeping all the guards in front of it.
@@ -97,6 +98,7 @@ const ALLOWED = {
                       ['GET', '/api/trips/incoming'], ['PUT', `/api/trips/${ID}/acknowledge`],
                       ['GET', '/api/quotes'], ['POST', '/api/quotes'], ['GET', '/api/hospitals'], ['GET', '/api/billing/issuer']],
   Trips            : [['GET', '/api/trips']],
+  'Booking push'   : [['GET', '/api/push/public-key'], ['POST', '/api/push/subscribe'], ['POST', '/api/push/unsubscribe']],
   'Trip Alerts'    : [['GET', '/api/trip-call-events?type=NO_RESPONSE']],
   'Posting Alerts' : [['GET', '/api/geofence-events']],
   'SOS Alerts'     : [['GET', '/api/sos'], ['PATCH', `/api/sos/${ID}/resolve`]],

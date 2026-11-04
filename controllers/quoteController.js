@@ -28,6 +28,7 @@ const { maskPhone } = require('../utils/customerPhone');
 const { fullPhone } = require('../utils/phoneViewer');
 const whatsappNotifications = require('../services/whatsappNotifications');
 const { resolveTrackingUrl } = require('../services/trackingNotifications');
+const bookingPush = require('../services/bookingPush');
 
 // Served by the CRM frontend's public /q/:token route (no login).
 const QUOTE_URL_BASE = `${process.env.PUBLIC_QUOTE_BASE_URL || 'https://crm.savelife.health'}/q`;
@@ -426,6 +427,9 @@ exports.confirmPublicQuote = async (req, res, next) => {
       },
       { new: true },
     );
+    // Only now is it an incoming booking (the confirmed Quote is the proof
+    // — services/incomingBookings.js). Fire-and-forget background push.
+    bookingPush.notifyIncomingBooking(trip._id);
 
     return res.status(201).json({
       success: true,

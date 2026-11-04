@@ -46,6 +46,7 @@ const catalog = require('./whatsappServiceCatalog');
 const fareCalculator = require('../utils/fareCalculator');
 const { verifyRoadDistanceKm } = require('../controllers/tripController');
 const whatsapp = require('./whatsappService');
+const bookingPush = require('./bookingPush');
 
 // Mirrors tripController.js's own GST_RATE (module-private there, not
 // exported -- this is the one other place a fare gets computed, so it
@@ -810,6 +811,8 @@ async function handleAwaitingConfirm(session, parsed) {
       bookingSource    : 'whatsapp',
       whatsappLanguage : lang,
     });
+    // Background push to the CRM (it also rings there) — fire-and-forget.
+    bookingPush.notifyIncomingBooking(trip._id);
 
     // Terminal funnel step -- not a session.step value (the session is
     // deleted below, never transitions to a "confirmed" step of its own),

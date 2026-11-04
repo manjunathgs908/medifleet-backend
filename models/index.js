@@ -812,6 +812,10 @@ const tripSchema = new Schema(
     crmAckAt    : { type: Date },
     crmAckBy    : { type: Schema.Types.ObjectId, ref: 'User' },
     crmAckAction: { type: String, enum: ['accepted', 'dismissed'] },
+    // When the background Web Push for this incoming booking went out —
+    // the once-per-trip lock (services/bookingPush.js claims it with a
+    // conditional update before sending).
+    incomingPushAt: { type: Date },
 
     // ── Pickup OTP verification (select:false — hidden from normal
     // queries; driver app must never see this value, only the customer

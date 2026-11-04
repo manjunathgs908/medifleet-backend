@@ -28,6 +28,9 @@ router.put ('/items/:id',       ...owner, ctrl.updateItem);
 
 // Preview: the GST worked out for what is on screen; saves nothing.
 router.post('/invoices/calculate', ...owner, ctrl.calculate);
+// Monthly auto-bill: a draft for the chosen month from every issued invoice
+// marked "Repeat monthly" (skips any already billed for that month).
+router.post('/generate-monthly', ...owner, ctrl.generateMonthlyDrafts);
 router.get ('/invoices',        ...owner, ctrl.listInvoices);
 router.post('/invoices',        ...owner, ctrl.createInvoice);
 router.get ('/invoices/:id',    ...owner, ctrl.getInvoice);

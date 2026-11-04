@@ -266,6 +266,45 @@ describe('deleting a cancelled tax invoice', () => {
   });
 });
 
+describe('monthly auto-bill', () => {
+  const { targetMonth, isMonthlyOnlyUpdate, draftBodyFromTemplate } = require('../controllers/invoicingController')._internals;
+
+  it('month-end dates and names, incl. February and a leap year', () => {
+    expect(targetMonth(2026, 11)).toEqual(expect.objectContaining({ name: 'NOVEMBER', lastDay: '2026-11-30' }));
+    expect(targetMonth(2026, 12).lastDay).toBe('2026-12-31');
+    expect(targetMonth(2027, 2).lastDay).toBe('2027-02-28');
+    expect(targetMonth(2028, 2).lastDay).toBe('2028-02-29');
+    // The IST month: 1 Nov 00:00 IST to 1 Dec 00:00 IST.
+    const t = targetMonth(2026, 11);
+    expect(t.start.toISOString()).toBe('2026-10-31T18:30:00.000Z');
+    expect(t.end.toISOString()).toBe('2026-11-30T18:30:00.000Z');
+    expect(targetMonth(2026, 12).end.toISOString()).toBe('2026-12-31T18:30:00.000Z');
+  });
+
+  it('a flag-only update is told apart from a real edit', () => {
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: true })).toBe(true);
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: false, monthlyStoppedAt: '2026-11-04T10:00:00Z' })).toBe(true);
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: true, lines: [] })).toBe(false);
+    expect(isMonthlyOnlyUpdate({ rev: 3, monthlyStoppedAt: null })).toBe(false);
+    expect(isMonthlyOnlyUpdate({ rev: 3 })).toBe(false);
+  });
+
+  it('a template becomes next month\'s draft body: everything copied, month-end date, MONTH OF …', () => {
+    const tpl = {
+      party: 'p1', placeOfSupply: '29', paymentMode: 'credit', roundOff: true, terms: 'T', description: 'MONTH OF OCTOBER',
+      transport: { driverName: 'Swami', vehicleNumber: 'KA05AM0498' },
+      serviceLocation: { siteName: 'GWSB', address: 'Tumakuru Road', attention: 'Mr. X' },
+      lines: [{ item: 'i1', name: 'Hiring', code: '999315', kind: 'service', unit: 'Month', qtyMilli: 1000, ratePaise: 6400000, discountPaise: 0, taxType: 'taxable', gstRate: 18, reverseCharge: false }],
+    };
+    const b = draftBodyFromTemplate(tpl, targetMonth(2026, 11));
+    expect(b).toEqual(expect.objectContaining({
+      party: 'p1', date: '2026-11-30', description: 'MONTH OF NOVEMBER', placeOfSupply: '29', paymentMode: 'credit', roundOff: true, terms: 'T',
+      transport: tpl.transport, serviceLocation: tpl.serviceLocation,
+    }));
+    expect(b.lines).toEqual([{ item: 'i1', name: 'Hiring', description: undefined, code: '999315', kind: 'service', unit: 'Month', qty: '1', rate: '64000', taxType: 'taxable', gstRate: 18, reverseCharge: false }]);
+  });
+});
+
 describe('default terms', () => {
   it('the standard five, for agreement and quotation clients alike', () => {
     const { DEFAULT_TERMS } = require('../controllers/invoicingController');
@@ -283,7 +322,7 @@ describe('routes: owner only', () => {
   it('every invoicing route is behind login and the owner role', async () => {
     const router = require('../routes/invoicing');
     const routes = router.stack.filter((l) => l.route);
-    expect(routes.length).toBe(22);
+    expect(routes.length).toBe(23);
     for (const l of routes) {
       expect(l.route.stack.length).toBe(3);
       const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json() { return this; } };

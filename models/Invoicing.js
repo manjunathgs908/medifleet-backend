@@ -141,6 +141,13 @@ const salesInvoiceSchema = new Schema({
   cancelledBy: { type: Schema.Types.ObjectId, ref: 'User' },
   cancelledAt: Date,
   cancelReason: String,
+  // Monthly auto-bill (invoicingController.generateMonthlyDrafts): an issued
+  // invoice with isMonthly is the template copied into next month's draft;
+  // issuing that draft moves the flag to it. monthlyStoppedAt: when the
+  // owner stopped it (server time); null when never stopped or resumed.
+  isMonthly       : { type: Boolean, default: false },
+  monthlyStoppedAt: { type: Date, default: null },
+  sourceTemplateId: { type: Schema.Types.ObjectId, ref: 'SalesInvoice', default: null }, // a draft's template
   // Edits made after issue (the number never changes): who, when, whether
   // amounts/GST/party changed and the total before and after.
   edits: { type: [{ _id: false, at: Date, by: { type: Schema.Types.ObjectId, ref: 'User' }, byName: String, financial: Boolean, changed: [String], totalBeforePaise: Number, totalAfterPaise: Number }], default: undefined },

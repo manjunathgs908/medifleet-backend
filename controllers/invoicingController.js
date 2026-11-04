@@ -389,6 +389,20 @@ exports.updateInvoice = async (req, res, next) => {
     const cur = await SalesInvoice.findById(req.params.id).lean();
     if (!cur) return res.status(404).json({ success: false, message: 'Invoice not found.' });
     if (cur.status === 'cancelled') return res.status(409).json({ success: false, message: 'A cancelled invoice cannot be edited.' });
+
+    // Only the monthly flag (Repeat monthly / Stop / Resume): nothing else is
+    // touched or recomputed. The stop time is server time.
+    if (isMonthlyOnlyUpdate(req.body)) {
+      if (cur.status !== 'issued') return res.status(409).json({ success: false, message: 'Only an issued invoice can be set to repeat monthly.' });
+      const on = req.body.isMonthly === true;
+      const set = on ? { isMonthly: true, monthlyStoppedAt: null }
+        : { isMonthly: false, monthlyStoppedAt: req.body.monthlyStoppedAt === null ? null : new Date() };
+      const r = await SalesInvoice.updateOne({ _id: cur._id, status: 'issued', rev: Number(req.body.rev) }, { $set: set, $inc: { rev: 1 } });
+      if (!r.modifiedCount) return res.status(409).json({ success: false, reason: 'stale', message: 'This invoice changed since you opened it. Reload it.' });
+      console.info(`[invoicing] ${cur.number} monthly ${on ? 'on' : set.monthlyStoppedAt ? 'stopped' : 'off'} by=${req.user._id}`);
+      const invoice = await SalesInvoice.findById(cur._id).lean();
+      return res.json({ success: true, invoice, message: on ? `${cur.number} will repeat monthly.` : set.monthlyStoppedAt ? 'Monthly billing stopped for this client.' : 'Monthly billing turned off.' });
+    }
     const d = await draftFromBody({ party: cur.party, ...req.body });
     if (d.fatal) return bad(res, d.fatal);
     const rev = Number(req.body?.rev);
@@ -518,6 +532,16 @@ exports.issueInvoice = async (req, res, next) => {
         }, { session });
         // Issued or changed meanwhile: abort, so the number is not used up.
         if (!r.modifiedCount) throw Object.assign(new Error('stale'), { stale: true });
+        // Monthly auto-bill: a draft made from a monthly template takes the
+        // flag over, so next month copies this (latest) invoice.
+        if (cur.sourceTemplateId) {
+          const moved = await SalesInvoice.updateOne(
+            { _id: cur.sourceTemplateId, isMonthly: true },
+            { $set: { isMonthly: false, monthlyStoppedAt: null } },
+            { session },
+          );
+          if (moved.modifiedCount) await SalesInvoice.updateOne({ _id: cur._id }, { $set: { isMonthly: true, monthlyStoppedAt: null } }, { session });
+        }
         issued = number;
       });
     } catch (err) {
@@ -591,7 +615,7 @@ exports.listInvoices = async (req, res, next) => {
     const from = istDay(req.query.from); const to = istDay(req.query.to);
     if (from || to) filter.date = { ...(from ? { $gte: from } : {}), ...(to ? { $lte: to } : {}) };
     let list = await SalesInvoice.find(filter).sort({ date: -1, seq: -1, createdAt: -1 }).limit(500)
-      .select('status docType number date party partySnapshot serviceLocation totals receivedPaise paymentMode description createdAt')
+      .select('status docType number date party partySnapshot serviceLocation totals receivedPaise paymentMode description createdAt isMonthly monthlyStoppedAt sourceTemplateId')
       .populate('party', 'name').lean();
     list = list.map((i) => ({ ...i, partyName: i.partySnapshot?.name || i.party?.name, paymentState: i.status === 'issued' ? paymentState(i) : null, balancePaise: i.status === 'issued' ? i.totals.grandTotalPaise - (i.receivedPaise || 0) : null }));
     if (['unpaid', 'partial', 'paid'].includes(req.query.payment)) list = list.filter((i) => i.paymentState === req.query.payment);
@@ -892,4 +916,96 @@ exports.deleteCancelledInvoice = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange, restartPlan, deleteCancelledPlan };
+// ════════════════════════════════════════════════════════════
+// Monthly auto-bill (owner only)
+// ════════════════════════════════════════════════════════════
+// Issued invoices marked "Repeat monthly" are templates: for a chosen month
+// each is copied into a DRAFT — same party, place of supply, payment, site,
+// lines, driver/vehicle, round-off, terms — dated the last day of that month
+// and described "MONTH OF <MONTH>". Totals and GST are worked out by
+// draftFromBody exactly as for any draft; no number until it is issued, and
+// issuing moves the monthly flag on to it (issueInvoice).
+
+const MONTH_NAMES = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'];
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// { year, month (1–12) } → the month's last day ('YYYY-MM-DD'), its IST
+// range [start, end) and its name.
+function targetMonth(year, month) {
+  const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const next = month === 12 ? `${year + 1}-01-01` : `${year}-${pad2(month + 1)}-01`;
+  return {
+    year, month, name: MONTH_NAMES[month - 1],
+    lastDay: `${year}-${pad2(month)}-${pad2(last)}`,
+    start: istDay(`${year}-${pad2(month)}-01`), end: istDay(next),
+  };
+}
+
+// The update body only toggles the monthly flag (plus rev).
+function isMonthlyOnlyUpdate(body) {
+  const keys = Object.keys(body || {}).filter((k) => k !== 'rev');
+  return keys.length > 0 && keys.every((k) => k === 'isMonthly' || k === 'monthlyStoppedAt') && 'isMonthly' in body;
+}
+
+// A template's invoice as the body a new draft is made from.
+function draftBodyFromTemplate(tpl, tm) {
+  return {
+    party: String(tpl.party), date: tm.lastDay, placeOfSupply: tpl.placeOfSupply, paymentMode: tpl.paymentMode, roundOff: tpl.roundOff !== false,
+    description: `MONTH OF ${tm.name}`, terms: tpl.terms, transport: tpl.transport, serviceLocation: tpl.serviceLocation,
+    lines: (tpl.lines || []).map((l) => ({
+      item: l.item ? String(l.item) : undefined, name: l.name, description: l.description, code: l.code, kind: l.kind, unit: l.unit,
+      qty: String(l.qtyMilli / 1000), rate: String(l.ratePaise / 100),
+      ...(l.discountPercent != null ? { discountPercent: l.discountPercent } : l.discountPaise ? { discount: String(l.discountPaise / 100) } : {}),
+      taxType: l.taxType, gstRate: l.gstRate, reverseCharge: !!l.reverseCharge,
+    })),
+  };
+}
+
+// One generation at a time on this server, so a double press cannot race
+// past the duplicate check.
+let generating = false;
+
+// POST /generate-monthly { year?, month? } — default: this month (IST).
+exports.generateMonthlyDrafts = async (req, res, next) => {
+  if (generating) return res.status(409).json({ success: false, message: 'Monthly bills are already being generated. Wait a moment, then refresh.' });
+  generating = true;
+  try {
+    const nowIst = new Date(Date.now() + IST_MS);
+    const year = req.body?.year != null ? Number(req.body.year) : nowIst.getUTCFullYear();
+    const month = req.body?.month != null ? Number(req.body.month) : nowIst.getUTCMonth() + 1;
+    if (!Number.isInteger(year) || year < 2020 || year > 2100 || !Number.isInteger(month) || month < 1 || month > 12) {
+      return bad(res, 'Choose a month (1–12) and a year.');
+    }
+    const tm = targetMonth(year, month);
+    const templates = await SalesInvoice.find({ isMonthly: true, status: 'issued' }).sort({ date: 1, seq: 1 }).lean();
+    const created = [];
+    const skipped = [];
+    for (const tpl of templates) {
+      const site = tpl.serviceLocation?.siteName || null;
+      const label = `${tpl.number}${site ? ` (${site})` : ''}`;
+      // Already billed for that month — a draft waiting, or one issued (the
+      // template itself, or last press's draft once issued): skip.
+      const dup = await SalesInvoice.findOne({
+        party: tpl.party, 'serviceLocation.siteName': site, status: { $in: ['draft', 'issued'] },
+        date: { $gte: tm.start, $lt: tm.end },
+      }).select('number status').lean();
+      if (dup) { skipped.push({ template: label, reason: dup.status === 'draft' ? 'a draft already exists for that month' : `already billed for that month (${dup.number})` }); continue; }
+      const d = await draftFromBody(draftBodyFromTemplate(tpl, tm));
+      if (d.fatal) { skipped.push({ template: label, reason: d.fatal }); continue; }
+      const draft = await SalesInvoice.create({ ...d.doc, status: 'draft', createdBy: req.user._id, sourceTemplateId: tpl._id });
+      created.push({ _id: draft._id, template: tpl.number, party: d.party.name, siteName: site, date: draft.date, grandTotalPaise: draft.totals.grandTotalPaise, problems: d.problems });
+    }
+    console.info(`[invoicing] monthly drafts for ${tm.name} ${year}: created ${created.length}, skipped ${skipped.length} (templates ${templates.length}) by=${req.user._id}`);
+    const monthLabel = `${tm.name.charAt(0)}${tm.name.slice(1).toLowerCase()} ${year}`;
+    return res.json({
+      success: true, month: monthLabel, created, createdCount: created.length, skippedCount: skipped.length, skipped,
+      message: `Created ${created.length} draft bill${created.length === 1 ? '' : 's'} for ${monthLabel}. Check and issue each.`,
+    });
+  } catch (err) {
+    next(err);
+  } finally {
+    generating = false;
+  }
+};
+
+exports._internals = { istDay, fmtDay, paymentState, draftFromBody, issueProblems, financialChange, restartPlan, deleteCancelledPlan, targetMonth, isMonthlyOnlyUpdate, draftBodyFromTemplate };

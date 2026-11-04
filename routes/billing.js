@@ -2,12 +2,28 @@
 const express = require('express');
 const router = express.Router();
 const billingCtrl = require('../controllers/billingController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 
 router.get('/dashboard', protect, authorize('owner'), billingCtrl.getFinancialDashboard);
 router.get('/bills', protect, authorize('owner'), billingCtrl.getBills);
 router.get('/bills/:id', protect, authorize('owner'), billingCtrl.getBillById);
-router.put('/bills/:id/payment', protect, authorize('owner'), billingCtrl.recordPayment);
+router.put('/bills/:id/payment', protect, authorize('owner'), billingCtrl.legacyRecordPayment);
+// Receipts: advances and payments (owner only, like the rest of billing).
+router.post('/payments', protect, authorize('owner'), billingCtrl.recordPayment);
+router.get('/payments/:id', protect, authorize('owner'), billingCtrl.getReceipt);
+// Owner only: reverse a mistaken staff-recorded receipt (accounting correction, no refund).
+router.post('/payments/:id/reverse', protect, authorize('owner'), billingCtrl.reversePayment);
+router.get('/advances', protect, authorize('owner'), billingCtrl.getAdvances);
+router.get('/issuer', protect, authorize(...OPERATIONS), billingCtrl.getIssuer);
+router.get('/payment-readiness', protect, authorize('owner'), billingCtrl.getPaymentReadiness);
+router.get('/provider-issues', protect, authorize('owner'), billingCtrl.getProviderIssues);
+router.patch('/provider-issues/:id/resolve', protect, authorize('owner'), billingCtrl.resolveProviderIssue);
+// Owner only: record a refund already paid out (record only — sends nothing).
+router.post('/refunds', protect, authorize('owner'), billingCtrl.recordRefund);
+// Customer bills on WhatsApp: review, Send (once), Don't send (owner only).
+router.get('/customer-bills', protect, authorize('owner'), billingCtrl.getCustomerBills);
+router.post('/customer-bills/:id/send', protect, authorize('owner'), billingCtrl.sendCustomerBill);
+router.post('/customer-bills/:id/dismiss', protect, authorize('owner'), billingCtrl.dismissCustomerBill);
 router.post('/hospital-invoice/generate', protect, authorize('owner'), billingCtrl.generateHospitalInvoice);
 router.get('/hospital-invoices', protect, authorize('owner'), billingCtrl.getHospitalInvoices);
 router.put('/hospital-invoices/:id/status', protect, authorize('owner'), billingCtrl.updateInvoiceStatus);

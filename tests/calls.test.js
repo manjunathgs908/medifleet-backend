@@ -111,6 +111,8 @@ const staff  = { _id: 'stf1', role: 'owner', name: 'Desk', phone: '9000000001' }
 beforeEach(() => {
   jest.clearAllMocks();
   CallLog.create.mockImplementation(async (data) => logDoc(data));
+  // Status changes are conditional updates; by default the condition holds.
+  CallLog.updateOne.mockResolvedValue({ acknowledged: true, matchedCount: 1, modifiedCount: 1 });
   mockCreateCall.mockResolvedValue({ requestUuid: 'req-1' });
   // No per-device endpoints unless a test sets some up.
   const WebrtcEndpoint = require('../models/WebrtcEndpoint');
@@ -1484,7 +1486,7 @@ describe('telecaller performance', () => {
     User.find.mockReturnValue(chain([owner, santosh]));
     const { res } = await run(ctrl.performance, { user: owner, query: period });
     expect(res.body.scope).toBe('team');
-    expect(res.body.team).toEqual({ incoming: 6, answered: 4, answeredUnattributed: 1, missed: 2, inProgress: 0 });
+    expect(res.body.team).toEqual({ incoming: 6, answered: 4, answeredUnattributed: 1, missed: 2, inProgress: 0, unconfirmed: 0 });
     const s = res.body.people.find((p) => p.name === 'santosh');
     expect(s).toEqual(expect.objectContaining({ answered: 2, avgAnswerSec: 15, placed: 2, connected: 1 }));
     expect(res.body.people.find((p) => p.name === 'Manjunath')).toEqual(expect.objectContaining({ answered: 1, avgAnswerSec: 5 }));
@@ -1509,7 +1511,9 @@ describe('telecaller performance', () => {
   it('call list by telecaller: owner any, telecaller only themselves', async () => {
     CallLog.find.mockReturnValue(chain([]));
     await run(ctrl.listLogs, { user: owner, query: { agent: santosh._id } });
-    expect(CallLog.find.mock.calls[0][0].agentUser).toBe(santosh._id);
+    // Calls they answered, or took as a transfer.
+    expect(CallLog.find.mock.calls[0][0].$or[0].agentUser).toBe(santosh._id);
+    expect(String(CallLog.find.mock.calls[0][0].$or[1]['transfers.answeredBy'])).toBe(santosh._id);
     const other = await run(ctrl.listLogs, { user: santosh, query: { agent: '64b0000000000000000000b9' } });
     expect(other.res.statusCode).toBe(403);
     const self = await run(ctrl.listLogs, { user: santosh, query: { agent: santosh._id } });

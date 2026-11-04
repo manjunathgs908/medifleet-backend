@@ -78,7 +78,7 @@ jest.mock('../utils/fareCalculator', () => ({
 }));
 
 const Ambulance = require('../models/Ambulance');
-const { Trip, User } = require('../models');
+const { Trip, User, Notification } = require('../models');
 const pushService = require('../utils/pushService');
 const fcmService  = require('../utils/fcmService');
 const whatsappNotifications = require('../services/whatsappNotifications');
@@ -227,13 +227,20 @@ describe('B. manual assign to an on-duty ambulance', () => {
 
   test('assigns, dispatches, and notifies the driver', async () => {
     const t = trip();
-    Trip.findById = jest.fn().mockResolvedValue(t);
+    // Loaded plainly, and again inside the assignment's transaction (.session).
+    Trip.findById = jest.fn(() => ({ then: (ok, bad) => Promise.resolve(t).then(ok, bad), session: async () => t }));
     Ambulance.findById = jest.fn().mockReturnValue(chain({
       _id: 'amb1', registrationNumber: 'KA01AB1234', status: 'assigned',
       assignedDriver: { _id: 'd1', availability: { status: 'available' } },
     }));
     User.findByIdAndUpdate = jest.fn().mockResolvedValue({});
-    // dispatchTripToDriver looks the driver up for their push tokens.
+    // The assign claims the trip, then commits in a transaction that checks
+    // it still owns the claim, then releases it.
+    Trip.findOneAndUpdate = jest.fn().mockResolvedValue({ _id: 't1' });
+    Trip.updateOne = jest.fn().mockResolvedValue({ matchedCount: 1 });
+    Trip.startSession = jest.fn(async () => ({ withTransaction: async (fn) => fn(), endSession: async () => {} }));
+    Notification.create = jest.fn().mockResolvedValue([{}]);
+    // The announcement after commit looks the driver up for their push tokens.
     User.findById = jest.fn().mockReturnValue(chain({ _id: 'd1', pushToken: null, fcmToken: null }));
 
     const res = await call(tripCtrl.assignVehicle, {

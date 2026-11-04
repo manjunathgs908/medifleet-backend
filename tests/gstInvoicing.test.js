@@ -1,0 +1,338 @@
+/**
+ * tests/gstInvoicing.test.js
+ * ============================================================
+ * GST invoicing Phase 1 — the maths (services/gst.js) and the routes.
+ *
+ *   - intra-state CGST+SGST (each half the rate) vs inter-state IGST
+ *   - the Kalpataru July invoice reproduced exactly (₹64,000 @ 18% =
+ *     ₹75,520)
+ *   - exempt lines → bill of supply; any taxable line → tax invoice
+ *   - discounts, decimal quantities, round-off, reverse charge
+ *   - GSTIN check digit + state, SAC/HSN format, amounts in words
+ *   - every route is owner-only
+ *
+ * Database-backed behaviour (numbering, issue, cancel, payments) is checked
+ * end to end on an isolated in-memory MongoDB — see the commit message.
+ * ============================================================
+ */
+'use strict';
+
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
+const gst = require('../services/gst');
+
+const line = (over = {}) => ({ name: 'Hiring for BLS Eeco Ambulance', code: '999315', unit: 'Month', qtyMilli: 1000, ratePaise: 64_000_00, taxType: 'taxable', gstRate: 18, ...over });
+
+describe('intra-state vs inter-state', () => {
+  it('Karnataka party: CGST 9% + SGST 9% — the Kalpataru July invoice exactly', () => {
+    const { problems, invoice } = gst.computeInvoice({ lines: [line()], placeOfSupply: '29' });
+    expect(problems).toEqual([]);
+    expect(invoice.docType).toBe('tax_invoice');
+    expect(invoice.supplyType).toBe('intra');
+    expect(invoice.totals).toEqual({ taxablePaise: 64_000_00, cgstPaise: 5_760_00, sgstPaise: 5_760_00, igstPaise: 0, taxPaise: 11_520_00, roundOffPaise: 0, grandTotalPaise: 75_520_00 });
+    expect(invoice.taxSummary).toEqual([{ gstRate: 18, taxablePaise: 64_000_00, cgstPaise: 5_760_00, sgstPaise: 5_760_00, igstPaise: 0 }]);
+  });
+
+  it('another state: IGST at the full rate, no CGST/SGST', () => {
+    const { invoice } = gst.computeInvoice({ lines: [line()], placeOfSupply: '24' });
+    expect(invoice.supplyType).toBe('inter');
+    expect(invoice.totals).toEqual(expect.objectContaining({ cgstPaise: 0, sgstPaise: 0, igstPaise: 11_520_00, grandTotalPaise: 75_520_00 }));
+  });
+
+  it('CGST and SGST are each rounded on their own half', () => {
+    // ₹10.05 @ 5%: half = 2.5% of 1005p = 25.125p → 25p each, 50p total.
+    const { invoice } = gst.computeInvoice({ lines: [line({ ratePaise: 1005, gstRate: 5 })], placeOfSupply: '29', roundOff: false });
+    expect(invoice.lines[0]).toEqual(expect.objectContaining({ cgstPaise: 25, sgstPaise: 25, igstPaise: 0, totalPaise: 1055 }));
+  });
+});
+
+describe('exempt services and bill of supply', () => {
+  const trip = { name: 'Patient transport', code: '999315', unit: 'Trip', qtyMilli: 1000, ratePaise: 2_400_00, taxType: 'exempt', gstRate: 18 };
+
+  it('all lines exempt → bill of supply, no tax even if a rate was left on it', () => {
+    const { problems, invoice } = gst.computeInvoice({ lines: [trip], placeOfSupply: '29' });
+    expect(problems).toEqual([]);
+    expect(invoice.docType).toBe('bill_of_supply');
+    expect(invoice.totals).toEqual(expect.objectContaining({ taxPaise: 0, grandTotalPaise: 2_400_00 }));
+    expect(invoice.lines[0].gstRate).toBe(0);
+    expect(invoice.taxSummary).toEqual([]);
+  });
+
+  it('nil-rated and non-GST lines are untaxed too', () => {
+    for (const taxType of ['nil', 'non_gst']) {
+      const { invoice } = gst.computeInvoice({ lines: [{ ...trip, taxType }], placeOfSupply: '29' });
+      expect(invoice.docType).toBe('bill_of_supply');
+      expect(invoice.totals.taxPaise).toBe(0);
+    }
+  });
+
+  it('taxable + exempt on one invoice → tax invoice; tax only on the taxable line', () => {
+    const { invoice } = gst.computeInvoice({ lines: [line(), trip], placeOfSupply: '29' });
+    expect(invoice.docType).toBe('tax_invoice');
+    expect(invoice.totals).toEqual(expect.objectContaining({ taxablePaise: 66_400_00, taxPaise: 11_520_00, grandTotalPaise: 77_920_00 }));
+  });
+});
+
+describe('quantities, discounts, round-off', () => {
+  it('decimal quantity (12.5 km × ₹18.40)', () => {
+    const { invoice } = gst.computeInvoice({ lines: [line({ qtyMilli: 12_500, ratePaise: 1840, gstRate: 18 })], placeOfSupply: '29', roundOff: false });
+    expect(invoice.lines[0].taxablePaise).toBe(23000);
+    expect(invoice.lines[0].cgstPaise).toBe(2070);
+  });
+
+  it('discount in rupees and in percent come off before tax', () => {
+    let { invoice } = gst.computeInvoice({ lines: [line({ discountPaise: 4_000_00 })], placeOfSupply: '29' });
+    expect(invoice.lines[0]).toEqual(expect.objectContaining({ discountPaise: 4_000_00, taxablePaise: 60_000_00, cgstPaise: 5_400_00 }));
+    ({ invoice } = gst.computeInvoice({ lines: [line({ discountPercent: 10 })], placeOfSupply: '29' }));
+    expect(invoice.lines[0]).toEqual(expect.objectContaining({ discountPaise: 6_400_00, taxablePaise: 57_600_00 }));
+  });
+
+  it('a discount larger than the line is refused', () => {
+    const { problems } = gst.computeInvoice({ lines: [line({ discountPaise: 70_000_00 })], placeOfSupply: '29' });
+    expect(problems.join(' ')).toMatch(/discount is more than the line/);
+  });
+
+  it('round-off to the rupee, shown as its own figure', () => {
+    // ₹999.50 @ 18%: CGST = SGST = 89.955 → 89.96 each (each half rounded),
+    // so 1179.42 → 1179.00, round-off −0.42.
+    const { invoice } = gst.computeInvoice({ lines: [line({ ratePaise: 99950 })], placeOfSupply: '29' });
+    expect(invoice.totals).toEqual(expect.objectContaining({ taxablePaise: 99950, cgstPaise: 8996, sgstPaise: 8996, taxPaise: 17992, roundOffPaise: -42, grandTotalPaise: 117900 }));
+    const off = gst.computeInvoice({ lines: [line({ ratePaise: 99950 })], placeOfSupply: '29', roundOff: false });
+    expect(off.invoice.totals.grandTotalPaise).toBe(117942);
+  });
+});
+
+describe('reverse charge', () => {
+  it('tax worked out and shown, but not added to what the customer owes', () => {
+    const { problems, invoice } = gst.computeInvoice({ lines: [line({ gstRate: 5, reverseCharge: true })], placeOfSupply: '29' });
+    expect(problems).toEqual([]);
+    expect(invoice.reverseCharge).toBe(true);
+    expect(invoice.totals).toEqual(expect.objectContaining({ taxPaise: 3_200_00, grandTotalPaise: 64_000_00 }));
+  });
+
+  it('reverse-charge and ordinary taxable lines cannot be mixed', () => {
+    const { problems } = gst.computeInvoice({ lines: [line({ reverseCharge: true }), line()], placeOfSupply: '29' });
+    expect(problems.join(' ')).toMatch(/cannot be on one invoice/);
+  });
+});
+
+describe('what stops an invoice', () => {
+  it.each([
+    [{ lines: [], placeOfSupply: '29' }, /at least one line/],
+    [{ lines: [line()], placeOfSupply: '99' }, /place of supply/],
+    [{ lines: [line({ gstRate: 7 })], placeOfSupply: '29' }, /GST rate/],
+    [{ lines: [line({ taxType: 'zero' })], placeOfSupply: '29' }, /taxable, exempt/],
+    [{ lines: [line({ ratePaise: 0 })], placeOfSupply: '29' }, /more than ₹0/],
+    [{ lines: [line({ name: '' })], placeOfSupply: '29' }, /name the service/],
+  ])('%#', (input, re) => {
+    expect(gst.computeInvoice(input).problems.join(' ')).toMatch(re);
+  });
+});
+
+describe('GSTIN, state, SAC/HSN', () => {
+  it('real GSTINs pass, with their state', () => {
+    for (const g of ['29CIQPM9958R1ZK', '29AAACN7335C1ZL', '29AAACK8387R1ZF']) {
+      expect(gst.gstinProblem(g)).toBeNull();
+      expect(gst.stateOfGstin(g)).toBe('29');
+    }
+    expect(gst.stateName('29')).toBe('Karnataka');
+    expect(gst.stateName('24')).toBe('Gujarat');
+  });
+  it('a wrong check digit, bad shape or state is refused', () => {
+    expect(gst.gstinProblem('29AAACN7335C1ZM')).toMatch(/check digit/);
+    expect(gst.gstinProblem('29AAACN7335C1')).toMatch(/15 characters/);
+    expect(gst.gstinProblem('99AAACN7335C1ZL')).toMatch(/state code/);
+    expect(gst.normaliseGstin(' 29aaacn7335c1zl ')).toBe('29AAACN7335C1ZL');
+  });
+  it('SAC: 6 digits from 99; HSN: 4, 6 or 8 digits', () => {
+    expect(gst.codeProblem('999315', 'service')).toBeNull();
+    expect(gst.codeProblem('9993', 'service')).toMatch(/6 digits/);
+    expect(gst.codeProblem('', 'service')).toMatch(/SAC/);
+    expect(gst.codeProblem('3004', 'goods')).toBeNull();
+    expect(gst.codeProblem('30049099', 'goods')).toBeNull();
+    expect(gst.codeProblem('300', 'goods')).toMatch(/HSN/);
+  });
+});
+
+describe('numbering and words', () => {
+  it('series formats, within 16 characters', () => {
+    expect(gst.formatNumber('tax_invoice', '2026-27', 59)).toBe('2026-27/59');
+    expect(gst.formatNumber('bill_of_supply', '2026-27', 12345)).toBe('BS/2026-27/12345');
+    expect(gst.formatNumber('bill_of_supply', '2026-27', 12345).length).toBeLessThanOrEqual(16);
+  });
+  it('financial year changes on 1 April, India time', () => {
+    expect(gst.financialYear(new Date('2027-03-31T18:00:00Z'))).toBe('2026-27'); // 31 Mar 23:30 IST
+    expect(gst.financialYear(new Date('2027-03-31T18:31:00Z'))).toBe('2027-28'); // 1 Apr 00:01 IST
+  });
+  it('amount in words, Indian system', () => {
+    expect(gst.amountInWords(75_520_00)).toBe('Seventy Five Thousand Five Hundred Twenty Rupees only');
+    expect(gst.amountInWords(12_34_567_50)).toBe('Twelve Lakh Thirty Four Thousand Five Hundred Sixty Seven Rupees and Fifty Paise only');
+    expect(gst.amountInWords(2_00_00_000_00)).toBe('Two Crore Rupees only');
+    expect(gst.amountInWords(0)).toBe('Zero Rupees only');
+  });
+  it('typed amounts and quantities', () => {
+    expect(gst.parseRupees('64,000')).toBe(64_000_00);
+    expect(gst.parseRupees('0', { allowZero: true })).toBe(0);
+    expect(gst.parseRupees('0')).toBeNull();
+    expect(gst.parseRupees('-5')).toBeNull();
+    expect(gst.parseRupees('1.234')).toBeNull();
+    expect(gst.parseQty('12.5')).toBe(12_500);
+    expect(gst.parseQty('0')).toBeNull();
+  });
+});
+
+describe('editing an issued invoice: what counts as a change to amounts/GST/party', () => {
+  const { financialChange } = require('../controllers/invoicingController')._internals;
+  const base = () => ({
+    party: 'p1', placeOfSupply: '29', roundOff: true,
+    lines: [{ item: 'i1', name: 'Hiring', code: '999315', kind: 'service', unit: 'Month', qtyMilli: 1000, ratePaise: 6400000, discountPaise: 0, taxType: 'taxable', gstRate: 18, reverseCharge: false, taxablePaise: 6400000, taxPaise: 1152000, totalPaise: 7552000 }],
+    totals: { grandTotalPaise: 7552000 },
+    description: 'MONTH OF JULY', transport: { driverName: 'A', vehicleNumber: 'KA01' }, serviceLocation: { siteName: 'Site 1' }, terms: 'x',
+  });
+  it('text-only edits (driver, vehicle, description, site, terms) are not financial', () => {
+    const after = { ...base(), description: 'MONTH OF AUGUST', transport: { driverName: 'B', vehicleNumber: 'KA02' }, serviceLocation: { siteName: 'Site 2' }, terms: 'y' };
+    expect(financialChange(base(), after)).toEqual([]);
+  });
+  it('the same line re-sent (ids as strings, empty discount %) is not a change', () => {
+    const after = base();
+    after.lines[0] = { ...after.lines[0], item: { toString: () => 'i1' }, discountPercent: undefined };
+    expect(financialChange(base(), after)).toEqual([]);
+  });
+  it.each([
+    ['party', (a) => { a.party = 'p2'; }],
+    ['place of supply', (a) => { a.placeOfSupply = '24'; }],
+    ['round-off', (a) => { a.roundOff = false; }],
+    ['line items', (a) => { a.lines[0].ratePaise = 6500000; }],
+    ['line items', (a) => { a.lines[0].gstRate = 5; }],
+    ['line items', (a) => { a.lines.push({ ...a.lines[0] }); }],
+  ])('%s', (what, mutate) => {
+    const after = base(); mutate(after);
+    expect(financialChange(base(), after)).toContain(what);
+  });
+});
+
+describe('continue the tax-invoice series from a number', () => {
+  const { restartPlan } = require('../controllers/invoicingController')._internals;
+  const inv = (seq, over = {}) => ({ _id: `id${seq}`, number: `2026-27/${seq}`, seq, fy: '2026-27', status: 'issued', receivedPaise: 0, payments: [], ...over });
+  const plan = (numbered, { allTax = numbered, counterSeq = numbered.length ? Math.max(...numbered.map((i) => i.seq)) : null, next = 58 } = {}) =>
+    restartPlan({ allTax, numbered, counterSeq, next, fy: '2026-27' });
+
+  it('the case at hand: unpaid 2026-27/1 is deleted, series continues at 58', () => {
+    const p = plan([inv(1)]);
+    expect(p.problems).toEqual([]);
+    expect(p.toDelete.map((i) => i.number)).toEqual(['2026-27/1']);
+  });
+  it('refused if ANY tax invoice has money received — any year, even a draft', () => {
+    expect(plan([inv(1, { receivedPaise: 100 })]).problems[0]).toMatch(/Money has been received against 2026-27\/1/);
+    expect(plan([inv(1)], { allTax: [inv(1), inv(9, { fy: '2025-26', number: '2025-26/9', payments: [{}] })] }).problems[0]).toMatch(/2025-26\/9/);
+  });
+  it('refused if a number at or above the one entered is already used', () => {
+    expect(plan([inv(1), inv(58)]).problems.join(' ')).toMatch(/2026-27\/58 already uses/);
+  });
+  it('refused if the counter has already given out that number', () => {
+    expect(plan([], { counterSeq: 60 }).problems[0]).toMatch(/would reuse one/);
+  });
+  it('nothing to do when it already continues from there', () => {
+    expect(plan([], { counterSeq: 57 }).problems[0]).toMatch(/already continues from 2026-27\/58/);
+  });
+  it('a fresh series with no counter yet can be set', () => {
+    expect(plan([], { counterSeq: null }).problems).toEqual([]);
+  });
+  it('the number must be a whole number from 1', () => {
+    expect(plan([inv(1)], { next: 0 }).problems[0]).toMatch(/whole number/);
+    expect(plan([inv(1)], { next: 5.5 }).problems[0]).toMatch(/whole number/);
+  });
+});
+
+describe('deleting a cancelled tax invoice', () => {
+  const { deleteCancelledPlan } = require('../controllers/invoicingController')._internals;
+  const inv = (over = {}) => ({ docType: 'tax_invoice', status: 'cancelled', number: '2026-27/59', fy: '2026-27', seq: 59, receivedPaise: 0, payments: [], ...over });
+
+  it('the last number used: deleted and its number reused', () => {
+    expect(deleteCancelledPlan(inv(), { counterSeq: 59, higherCount: 0 })).toEqual({ problems: [], reuse: true });
+  });
+  it('not the last number: deleted, the counter stays (a gap remains)', () => {
+    expect(deleteCancelledPlan(inv(), { counterSeq: 61, higherCount: 2 })).toEqual({ problems: [], reuse: false });
+  });
+  it.each([
+    ['an issued invoice', { status: 'issued' }, /Only a cancelled invoice/],
+    ['a draft', { status: 'draft' }, /Only a cancelled invoice/],
+    ['a bill of supply', { docType: 'bill_of_supply' }, /Only a tax invoice/],
+    ['money received', { receivedPaise: 100 }, /Money has been recorded/],
+    ['a payment line', { payments: [{}] }, /Money has been recorded/],
+  ])('refused: %s', (_, over, re) => {
+    const p = deleteCancelledPlan(inv(over), { counterSeq: 59, higherCount: 0 });
+    expect(p.problems.join(' ')).toMatch(re);
+    expect(p.reuse).toBe(false);
+  });
+});
+
+describe('monthly auto-bill', () => {
+  const { targetMonth, isMonthlyOnlyUpdate, draftBodyFromTemplate } = require('../controllers/invoicingController')._internals;
+
+  it('month-end dates and names, incl. February and a leap year', () => {
+    expect(targetMonth(2026, 11)).toEqual(expect.objectContaining({ name: 'NOVEMBER', lastDay: '2026-11-30' }));
+    expect(targetMonth(2026, 12).lastDay).toBe('2026-12-31');
+    expect(targetMonth(2027, 2).lastDay).toBe('2027-02-28');
+    expect(targetMonth(2028, 2).lastDay).toBe('2028-02-29');
+    // The IST month: 1 Nov 00:00 IST to 1 Dec 00:00 IST.
+    const t = targetMonth(2026, 11);
+    expect(t.start.toISOString()).toBe('2026-10-31T18:30:00.000Z');
+    expect(t.end.toISOString()).toBe('2026-11-30T18:30:00.000Z');
+    expect(targetMonth(2026, 12).end.toISOString()).toBe('2026-12-31T18:30:00.000Z');
+  });
+
+  it('a flag-only update is told apart from a real edit', () => {
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: true })).toBe(true);
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: false, monthlyStoppedAt: '2026-11-04T10:00:00Z' })).toBe(true);
+    expect(isMonthlyOnlyUpdate({ rev: 3, isMonthly: true, lines: [] })).toBe(false);
+    expect(isMonthlyOnlyUpdate({ rev: 3, monthlyStoppedAt: null })).toBe(false);
+    expect(isMonthlyOnlyUpdate({ rev: 3 })).toBe(false);
+  });
+
+  it('a template becomes next month\'s draft body: everything copied, month-end date, MONTH OF …', () => {
+    const tpl = {
+      party: 'p1', placeOfSupply: '29', paymentMode: 'credit', roundOff: true, terms: 'T', description: 'MONTH OF OCTOBER',
+      transport: { driverName: 'Swami', vehicleNumber: 'KA05AM0498' },
+      serviceLocation: { siteName: 'GWSB', address: 'Tumakuru Road', attention: 'Mr. X' },
+      lines: [{ item: 'i1', name: 'Hiring', code: '999315', kind: 'service', unit: 'Month', qtyMilli: 1000, ratePaise: 6400000, discountPaise: 0, taxType: 'taxable', gstRate: 18, reverseCharge: false }],
+    };
+    const b = draftBodyFromTemplate(tpl, targetMonth(2026, 11));
+    expect(b).toEqual(expect.objectContaining({
+      party: 'p1', date: '2026-11-30', description: 'MONTH OF NOVEMBER', placeOfSupply: '29', paymentMode: 'credit', roundOff: true, terms: 'T',
+      transport: tpl.transport, serviceLocation: tpl.serviceLocation,
+    }));
+    expect(b.lines).toEqual([{ item: 'i1', name: 'Hiring', description: undefined, code: '999315', kind: 'service', unit: 'Month', qty: '1', rate: '64000', taxType: 'taxable', gstRate: 18, reverseCharge: false }]);
+  });
+});
+
+describe('default terms', () => {
+  it('the standard five, for agreement and quotation clients alike', () => {
+    const { DEFAULT_TERMS } = require('../controllers/invoicingController');
+    expect(DEFAULT_TERMS.split('\n')).toEqual([
+      '1. This invoice is raised based on the rates accepted in the agreement or quotation.',
+      '2. The above invoice details are true and correct, and the service has been duly provided.',
+      '3. Signature & seal are not required on this computer-generated invoice.',
+      '4. Payment is due within the agreed credit period from the invoice date.',
+      '5. E. & O.E. (Errors and Omissions Excepted).',
+    ]);
+  });
+});
+
+describe('routes: owner only', () => {
+  it('every invoicing route is behind login and the owner role', async () => {
+    const router = require('../routes/invoicing');
+    const routes = router.stack.filter((l) => l.route);
+    expect(routes.length).toBe(23);
+    for (const l of routes) {
+      expect(l.route.stack.length).toBe(3);
+      const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json() { return this; } };
+      const next = jest.fn();
+      await l.route.stack[1].handle({ user: { role: 'telecaller' } }, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(res.statusCode).toBe(403);
+    }
+    // /invoices/calculate is matched before /invoices/:id.
+    const idx = (p, m) => routes.findIndex((l) => l.route.path === p && l.route.methods[m]);
+    expect(idx('/invoices/calculate', 'post')).toBeLessThan(idx('/invoices/:id', 'get'));
+  });
+});

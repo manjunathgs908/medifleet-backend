@@ -90,11 +90,59 @@ const CallLogSchema = new mongoose.Schema(
     recordingUrl: { type: String },
     recordingId : { type: String },
     recordingSec: { type: Number },
+
+    // An incoming call answered on a ring PHONE, as Plivo reported it live
+    // (the phone Dial's callbackUrl, callController.js dialEvent), so the
+    // CRM can show it and offer Transfer while it lasts. answeredIn:
+    // 'phone' only (an in-app answer is claimed by the CRM itself).
+    // answeredLegId: Plivo's UUID of that phone leg; answeredLegEndedAt:
+    // when that phone hung up (the call itself may go on — a transfer).
+    answeredIn        : { type: String, enum: ['phone'] },
+    answeredLegId     : { type: String },
+    answeredLegEndedAt: { type: Date },
+
+    // Live transfers of an incoming call from the CRM (callController.js
+    // transferCall), oldest first. Each: {by, byName, at, targets (user ids
+    // rung), steps (e.g. ["english","all","back_app"]), outcome, answeredBy,
+    // answeredByName, answeredAt, error}. outcome: 'ringing' while it rings,
+    // then 'answered', 'rang_back' (answered by the ring-back group),
+    // 'not_answered', 'caller_hung_up' or 'failed'. At most one is ringing.
+    transfers : { type: [mongoose.Schema.Types.Mixed], default: undefined },
+    // The recording of each part after a transfer: {part (the transfer's
+    // index), url, id, sec}. The part before any transfer stays in
+    // recordingUrl/recordingSec. url and id stay server-side.
+    recordings: { type: [mongoose.Schema.Types.Mixed], default: undefined },
+
+    // Missed-call callback queue (services/callbackQueue.js).
+    //   callbackEligible: set by /incoming on a real customer's call (a
+    //     mobile number that is not one of our ring phones). Only calls
+    //     carrying it can be queued — none from before the queue existed.
+    //   callbackReview: a 'not_routed' call (created at hang-up) waiting for
+    //     a person to add it to the queue or dismiss it — {state, by, byName, at}.
+    //   callbackTask: inbound — the task this missed call belongs to;
+    //     outbound — the task this call was a callback attempt for.
+    callbackEligible: { type: Boolean },
+    callbackReview  : { type: mongoose.Schema.Types.Mixed },
+    callbackTask    : { type: mongoose.Schema.Types.ObjectId, ref: 'CallbackTask', index: true },
+    // A queued missed call later reported answered: taken off its task's
+    // missed count at this time.
+    callbackRetractedAt: { type: Date },
+    // A transfer of this call ended with nobody taking it — nobody answered,
+    // ring-back included, or the caller hung up while on hold. The call is
+    // "completed" (someone spoke to the caller first), but the caller still
+    // needs help: it is queued for a callback like a missed call, and never
+    // retracted as "answered after all". Cleared if Plivo then reports the
+    // transfer answered after all.
+    transferUnanswered: { type: Date },
   },
   { timestamps: true },
 );
 
 CallLogSchema.index({ createdAt: -1 });
+CallLogSchema.index({ callbackEligible: 1, status: 1, startedAt: 1 }, { partialFilterExpression: { callbackEligible: true } });
+
+// Whether an "active" stored status can still be true (display only).
+const { liveStateOf } = require('../utils/callLiveness');
 
 CallLogSchema.set('toJSON', {
   transform(doc, ret) {
@@ -107,6 +155,15 @@ CallLogSchema.set('toJSON', {
     delete ret.agentPhone;
     delete ret.dialledPhones;
     ret.phoneVerdict = phoneLegVerdict(ret.phoneLeg, ret.overlap);
+    // Display-only (see liveStateOf); `status` itself is never rewritten.
+    const live = liveStateOf(ret, { notLiveOnPlivo: !!doc.$locals?.notLiveOnPlivo });
+    if (live) {
+      ret.liveState = live.state;
+      if (live.state === 'unconfirmed') {
+        ret.statusUnconfirmed = true;
+        ret.statusUnconfirmedReason = live.reason;
+      }
+    }
     // The Plivo recording URL stays server-side too: with Plivo's Basic Auth
     // for recordings on, it needs our credentials, and either way the CRM
     // plays it through GET /api/calls/:id/recording, which checks the login.
@@ -119,6 +176,16 @@ CallLogSchema.set('toJSON', {
     ret.recordingState = ret.hasRecording ? 'available' : answered ? 'none' : 'not_answered';
     delete ret.recordingUrl;
     delete ret.recordingId;
+    // A transfer's part was answered by someone if Plivo gave it a length,
+    // or (length not reported yet) its transfer was answered.
+    if (Array.isArray(ret.recordings)) {
+      const answeredParts = new Set((ret.transfers || [])
+        .map((t, i) => (['answered', 'rang_back'].includes(t?.outcome) ? i : null)).filter((i) => i != null));
+      ret.recordings = ret.recordings
+        .filter((r) => r?.url && (Number(r.sec) > 0 || (r.sec == null && answeredParts.has(Number(r.part)))))
+        .map((r) => ({ part: Number(r.part), sec: r.sec ?? null }));
+    }
+    if (Array.isArray(ret.transfers)) ret.transfers = ret.transfers.map(({ targets, englishRung, ...t }) => ({ ...t, targetCount: (targets || []).length }));
     return ret;
   },
 });

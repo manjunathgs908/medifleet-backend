@@ -25,6 +25,10 @@ router.all('/incoming',  ctrl.requirePlivoSignature, ctrl.incoming);
 router.all('/events',    ctrl.requirePlivoSignature, ctrl.events);
 router.all('/recording', ctrl.requirePlivoSignature, ctrl.recording);
 router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
+// The customer's XML while their call is being transferred.
+router.all('/transfer-answer', ctrl.requirePlivoSignature, ctrl.transferAnswer);
+// The phone Dial's live report: a phone picked up, or hung up.
+router.all('/dial-event', ctrl.requirePlivoSignature, ctrl.dialEvent);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
 // cannot reach these. Telecallers (CRM_CALLS) take and return customer
@@ -39,6 +43,8 @@ router.put('/me',     protect, authorize(...CRM_CALLS), ctrl.setMe);
 router.get('/config', protect, authorize(...CRM_CALLS), ctrl.getConfig);
 // "Ring my phone now (test)" — rings the user's own ring number.
 router.post('/test-ring', protect, authorize(...CRM_CALLS), ctrl.testRing);
+// The incoming call you answered on your own phone, while it lasts (polled).
+router.get('/my-live', protect, authorize(...CRM_CALLS), ctrl.myLiveCall);
 
 // What Plivo has live right now (each call counts toward its concurrency
 // limit), and hanging up one stuck call by id.
@@ -55,6 +61,8 @@ router.get ('/webrtc/debug',    protect, authorize(...CRM_CALLS), ctrl.getWebrtc
 router.get ('/:id',             protect, authorize(...CRM_CALLS), ctrl.getCall);
 router.get ('/:id/trail',       protect, authorize(...CRM_CALLS), ctrl.getCallTrail);
 router.post('/:id/answered',    protect, authorize(...CRM_CALLS), ctrl.markAnswered);
+// Live transfer of a connected incoming call (only by the person on it).
+router.post('/:id/transfer',    protect, authorize(...CRM_CALLS), ctrl.transferCall);
 // Recording playback, proxied with Plivo Basic Auth (the Plivo URL is never
 // sent to the browser).
 router.get('/:id/recording', protect, authorize(...CRM_CALLS), ctrl.streamRecording);

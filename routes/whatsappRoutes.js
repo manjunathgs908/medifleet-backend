@@ -29,6 +29,7 @@ const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const { Trip, Lead } = require('../models');
+const LeadClaim = require('../models/LeadClaim');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { maskPhone, customerRef, phoneFromRef, isCustomerRef } = require('../utils/customerPhone');
 const { fullPhone } = require('../utils/phoneViewer');
@@ -75,7 +76,7 @@ async function findTripForCallOutcome(tripId) {
 // plain String field, not an array -- needs the CURRENT value in hand
 // first; same overall create-vs-update shape as
 // controllers/telephonyController.js's inboundCallWebhook.
-async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId }) {
+async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId, calledByName, followUpAt }) {
   const normalisedPhone = normalisePhone(phone);
   const calledAt = new Date();
 
@@ -93,35 +94,109 @@ async function upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId
   ]);
 
   const serviceLabel = latestServiceEvent?.serviceLabel || null;
-  const status = OUTCOME_TO_LEAD_STATUS[outcome];
   const trimmedNote = note?.trim();
   const noteEntry = trimmedNote ? `[${calledAt.toISOString()}] ${trimmedNote}` : null;
   const callHistoryEntry = { direction: 'outbound', status: outcome, calledAt };
 
-  if (existingLead) {
-    existingLead.status = status;
-    if (serviceLabel) existingLead.message = serviceLabel; // else leave as-is
-    if (noteEntry) {
-      existingLead.notes = existingLead.notes ? `${existingLead.notes}\n${noteEntry}` : noteEntry;
-    }
-    existingLead.assignedTo = calledByUserId;
-    if (trip) existingLead.convertedTrip = trip._id;
-    existingLead.callHistory.push(callHistoryEntry);
-    await existingLead.save();
-    return existingLead;
-  }
-
-  return Lead.create({
-    source: 'whatsapp',
-    phone: normalisedPhone,
-    status,
-    message: serviceLabel || undefined,
-    notes: noteEntry || undefined,
-    assignedTo: calledByUserId,
-    convertedTrip: trip?._id,
-    callHistory: [callHistoryEntry],
-    receivedAt: calledAt,
+  // The Leads Dashboard's follow-up fields (controllers/leadController.js):
+  // a "not interested" outcome is the Lost reason, a follow-up call time
+  // becomes the lead's follow-up reminder (one reminder, not two), and the
+  // change is recorded in the lead's history (with who logged the call).
+  // Two rules hold whatever the outcome:
+  //   - a lead booked as a trip stays converted: the call is recorded, but
+  //     it is never reopened, marked lost or given a follow-up;
+  //   - the call never changes who the lead is assigned to (that is the
+  //     dashboard's assign action); a new lead starts unassigned.
+  const effectFor = (lead) => {
+    if (trip) return { status: 'converted' };
+    if (lead?.convertedTrip) return { status: 'converted', keptBooked: true };
+    const out = { status: OUTCOME_TO_LEAD_STATUS[outcome] };
+    if (out.status === 'lost') out.lostReason = trimmedNote || 'Not interested (WhatsApp call outcome)';
+    if (outcome === 'followup' && followUpAt) out.nextFollowUpAt = followUpAt;
+    return out;
+  };
+  const historyEntry = (from, e) => ({
+    type: 'whatsapp_outcome', at: calledAt, by: calledByUserId, byName: calledByName,
+    detail: {
+      outcome, from, to: e.status,
+      ...(e.keptBooked ? { keptBooked: true } : {}),
+      ...(e.lostReason ? { reason: e.lostReason } : {}),
+      ...(e.nextFollowUpAt ? { followUpAt: e.nextFollowUpAt } : {}),
+    },
   });
+
+  // Applied only at the rev just read, so a dashboard change or a booking
+  // made in between is never overwritten: this re-reads and re-decides.
+  const updateExisting = async (found) => {
+    let lead = found;
+    for (let attempt = 0; attempt < 5 && lead; attempt += 1) {
+      const rev = lead.rev || 0;
+      const e = effectFor(lead);
+      const $set = { status: e.status };
+      const $unset = {};
+      if (serviceLabel) $set.message = serviceLabel; // else leave as-is
+      if (noteEntry) $set.notes = lead.notes ? `${lead.notes}\n${noteEntry}` : noteEntry;
+      if (trip) $set.convertedTrip = trip._id;
+      if (e.lostReason) $set.lostReason = e.lostReason;
+      else if (lead.lostReason) $unset.lostReason = 1;
+      if (e.nextFollowUpAt) $set.nextFollowUpAt = e.nextFollowUpAt;
+      else if (!['new', 'contacted'].includes(e.status) && lead.nextFollowUpAt) $unset.nextFollowUpAt = 1;
+      const updated = await Lead.findOneAndUpdate(
+        { _id: lead._id, ...(rev === 0 ? { rev: { $in: [0, null] } } : { rev }) },
+        {
+          $set,
+          ...(Object.keys($unset).length ? { $unset } : {}),
+          $inc : { rev: 1 },
+          $push: { callHistory: callHistoryEntry, history: historyEntry(lead.status, e) },
+        },
+        { new: true },
+      );
+      if (updated) return updated;
+      lead = await Lead.findById(lead._id);
+    }
+    throw new Error('Lead changed repeatedly while recording this call outcome.');
+  };
+  if (existingLead) return updateExisting(existingLead);
+
+  // A new number: create the lead in one transaction with its claim
+  // (models/LeadClaim.js). Two outcomes at the same instant both write the
+  // claim, so only one commits; the other is retried, finds that lead and
+  // updates it — one lead, not two. Existing leads are not touched.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let created = null;
+    let found = null;
+    const session = await Lead.startSession();
+    try {
+      await session.withTransaction(async () => {
+        created = null; found = null;
+        await LeadClaim.updateOne({ _id: `whatsapp:${normalisedPhone}` }, { $inc: { hits: 1 } }, { upsert: true, session });
+        found = await Lead.findOne({ source: 'whatsapp', phone: normalisedPhone }).session(session);
+        if (found) return;
+        const e = effectFor(null);
+        [created] = await Lead.create([{
+          source: 'whatsapp',
+          phone: normalisedPhone,
+          status: e.status,
+          message: serviceLabel || undefined,
+          notes: noteEntry || undefined,
+          convertedTrip: trip?._id,
+          lostReason: e.lostReason,
+          nextFollowUpAt: e.nextFollowUpAt,
+          callHistory: [callHistoryEntry],
+          history: [historyEntry(null, e)],
+          receivedAt: calledAt,
+        }], { session });
+      });
+    } catch (err) {
+      if (err?.code !== 11000) throw err; // the claim's first insert raced: try again
+      continue;
+    } finally {
+      await session.endSession();
+    }
+    if (found) return updateExisting(found);
+    return created;
+  }
+  throw new Error('Could not record this call outcome on a lead — please try again.');
 }
 
 // Last ~1000 processed wamids -- Meta can redeliver the same message
@@ -390,7 +465,7 @@ router.post('/call-outcome', protect, authorize(...OPERATIONS), async (req, res,
     // the call (above) is the primary action -- a failure here must never
     // turn an already-successfully-logged call into an error response.
     try {
-      await upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId: req.user._id });
+      await upsertWhatsAppLead({ phone, outcome, note, tripId, calledByUserId: req.user._id, calledByName: req.user.name, followUpAt: followUpDate });
     } catch (err) {
       // Full error (err, not err.message) -- console.error prints a
       // ValidationError's .errors detail and the stack trace, not just the

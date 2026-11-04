@@ -108,6 +108,11 @@ driverType    : { type: String, enum: ['shift_driver', 'trip_driver'], default: 
     // callController.js incoming).
     callDuty      : { type: Boolean, default: false },
 
+    // CRM staff only, set by the owner on the Staff page: this person takes
+    // calls in English. A live call transferred from the CRM rings the
+    // on-duty English speakers first (callController.js transferCall).
+    speaksEnglish : { type: Boolean, default: false },
+
     // The phone Plivo rings for this user -- click-to-call and incoming
     // calls while on call duty. Separate from `phone`, which is the login
     // number and may not be the handset they carry. Unset falls back to
@@ -502,6 +507,33 @@ const leadSchema = new Schema(
     notes       : { type: String },
     convertedTrip: { type: Schema.Types.ObjectId, ref: 'Trip' }, // If lead became a trip
 
+    // ── Follow-up (controllers/leadController.js) ─────────────
+    // All optional: leads from before this existed are left as they are
+    // and read as unassigned / no follow-up / rev 0.
+    assignedToName: { type: String },
+    nextFollowUpAt: { type: Date },        // CRM reminder only — never a call or message
+    lostReason    : { type: String, trim: true },
+    followUpNotes : [{
+      text  : { type: String, trim: true },
+      at    : Date,
+      by    : { type: Schema.Types.ObjectId, ref: 'User' },
+      byName: String,
+      _id   : false,
+    }],
+    // Assignment, follow-up time and status changes: who, when, from/to.
+    history: [{
+      type  : { type: String },
+      at    : Date,
+      by    : { type: Schema.Types.ObjectId, ref: 'User' },
+      byName: String,
+      detail: Schema.Types.Mixed,
+      _id   : false,
+    }],
+    // Bumped by every assignment / follow-up / status change: an update
+    // made from an out-of-date view is refused (409), never applied over
+    // someone else's.
+    rev: { type: Number },
+
     // â”€â”€ Call popup data (populated from telephony webhook) â”€â”€â”€
     callHistory: [
       {
@@ -528,9 +560,14 @@ leadSchema.set('toJSON', {
       delete ret.phone;
       if (full) ret.phone = full;
     }
+    if (!('rev' in ret) || ret.rev == null) ret.rev = 0;
     return ret;
   },
 });
+
+// The dashboard's due-today / overdue / unassigned views.
+leadSchema.index({ status: 1, nextFollowUpAt: 1 });
+leadSchema.index({ status: 1, assignedTo: 1 });
 
 const Lead = mongoose.model('Lead', leadSchema);
 
@@ -750,6 +787,13 @@ const tripSchema = new Schema(
     completedAt   : Date,
     cancelledAt   : Date,
     cancellationReason: String,
+    cancelledBy   : { type: Schema.Types.ObjectId, ref: 'User' }, // the operator who cancelled (CRM)
+    // Held for the few seconds an assign / cancel / complete is being
+    // applied, so two of them can never act on the trip at once (no double
+    // bill, no cancelled trip brought back). Claimed and released by
+    // conditional updates in tripController; a claim older than 2 minutes
+    // (interrupted request) no longer blocks.
+    transitionClaimedAt: { type: Date },
 
     // Driver's explicit accept of a 'dispatched' assignment. 'dispatched'
     // alone only means "assigned to a vehicle/driver" — this flag is what
@@ -768,6 +812,10 @@ const tripSchema = new Schema(
     // â”€â”€ Billing state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     billId        : { type: Schema.Types.ObjectId, ref: 'Bill' },
     isHospitalBilled: { type: Boolean, default: false }, // Included in hospital invoice
+    // Bumped inside every payment transaction for this trip (and written by
+    // completion's), so two payments — or a payment and the trip's billing —
+    // can never commit from the same stale balance (services/payments.js).
+    paymentRev    : { type: Number },
 
     // ── Payment preference — captured at booking, purely informational
     // (never gates booking/dispatch/completion). 'cash'/'upi' mean the
@@ -953,7 +1001,12 @@ const billSchema = new Schema(
     // manual/CRM-recorded collection exactly as before. Razorpay itself
     // may have used any underlying method (card/UPI/netbanking/wallet);
     // 'online' just means "the gateway verified it," not which one.
-    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'online', 'insurance', 'hospital_credit'] },
+    // 'bank_transfer' appended (a recorded receipt's method); existing
+    // values unchanged.
+    paymentMode : { type: String, enum: ['cash', 'upi', 'card', 'online', 'insurance', 'hospital_credit', 'bank_transfer'] },
+    // Rupees, as before. Since itemised receipts (models/Payment.js) it is
+    // always the sum of this bill's receipts, kept in step in one
+    // transaction; older bills keep the figure they had.
     paidAmount  : { type: Number, default: 0 },
     paidAt      : { type: Date },
 
@@ -962,11 +1015,50 @@ const billSchema = new Schema(
     // stay undefined for cash/manual-UPI bills. ──
     razorpayOrderId  : { type: String },
     razorpayPaymentId: { type: String },
+    razorpayOrderAmountPaise: { type: Number }, // what the latest order asks for (the balance when it was created)
+    // Every order made for this bill: an older one can still be paid after a
+    // newer one replaced it, and that money must still be found and recorded.
+    razorpayOrders: [{
+      orderId    : String,
+      amountPaise: Number,
+      currency   : String,
+      createdAt  : Date,
+      _id        : false,
+    }],
 
     // â”€â”€ Hospital Invoice Reference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     invoiceId   : { type: Schema.Types.ObjectId, ref: 'HospitalInvoice' },
 
     notes       : String,
+
+    // The customer's copy of this bill on WhatsApp (services/customerBill.js).
+    // Set when the trip completes. state:
+    //   pending_review — waiting for the owner to tap Send (always, while
+    //                    BILL_AUTO_SEND is off; with warnings, always)
+    //   sending        — claimed by one send (only one can be in flight)
+    //   sent           — delivered to WhatsApp (sentAt, messageId); final
+    //   failed         — WhatsApp refused (error); can be retried
+    //   no_phone       — no valid customer mobile on the trip
+    //   dismissed      — the owner chose not to send it
+    // warnings: why it needs a person's look (drop_wait_review, no_distance,
+    // far_from_estimate, no_total, billed_elsewhere).
+    customerBill: {
+      type: new Schema({
+        state     : { type: String, enum: ['pending_review', 'sending', 'sent', 'failed', 'no_phone', 'dismissed'], required: true },
+        warnings  : { type: [String], default: undefined },
+        queuedAt  : Date,
+        sendingAt : Date,
+        sentAt    : Date,
+        auto      : Boolean,                                // sent by BILL_AUTO_SEND, not a person
+        by        : { type: Schema.Types.ObjectId, ref: 'User' }, // who sent or dismissed it
+        byName    : String,
+        messageId : String,                                 // WhatsApp's id for the sent message
+        error     : String,
+        attempts  : Number,
+        dismissedAt: Date,
+      }, { _id: false }),
+      default: undefined,
+    },
   },
   { timestamps: true }
 );

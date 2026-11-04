@@ -19,46 +19,100 @@
 
 'use strict';
 
-const { Bill, HospitalInvoice, Trip, Hospital, Income, Notification } = require('../models');
+const mongoose = require('mongoose');
+const { Bill, HospitalInvoice, Trip, Hospital, Notification } = require('../models');
+const Payment = require('../models/Payment');
 const fareCalculator = require('../utils/fareCalculator');
+const payments = require('../services/payments');
+const { parseAmount, toPaise, formatRupees } = require('../utils/money');
+const { parseScheduleDate } = require('../utils/dispatchUrgency');
+
+const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
+
+// What customer-facing bills and receipts are issued under (business name,
+// GSTIN, address, contact — no personal name): utils/customerIssuer.js.
+const { CUSTOMER_ISSUER } = require('../utils/customerIssuer');
+
+// Paise sums of receipts, per bill.
+async function receiptsByBill(billIds) {
+  if (!billIds.length) return new Map();
+  const rows = await Payment.aggregate([
+    { $match: { bill: { $in: billIds } } },
+    { $group: { _id: '$bill', paise: { $sum: '$amountPaise' } } },
+  ]);
+  return new Map(rows.map((r) => [String(r._id), r.paise]));
+}
+
+// Balance filters of the bill list (computed exactly as balanceOf does).
+// "Outstanding" is what can be collected from customers: a bill billed to a
+// hospital is listed under hospital_invoice instead, never both.
+const BALANCE_VIEWS = {
+  outstanding: (b) => b.collectiblePaise > 0,
+  unpaid     : (b) => b.state === 'unpaid' && b.collectiblePaise > 0,
+  hospital_invoice: (b) => b.onHospitalInvoice,
+  part_paid  : (b) => b.state === 'part_paid',
+  paid       : (b) => b.state === 'paid',
+  reconcile  : (b) => b.reconcile.length > 0,
+};
 
 // ============================================================
-// @route   GET /api/billing/bills
-// @desc    List all trip bills with filters
+// @route   GET /api/billing/bills?balance=outstanding|unpaid|part_paid|paid|reconcile
+// @desc    Trip bills with total / received / outstanding for each, and
+//          totals over the whole filtered set. ?paymentStatus still works.
 // @access  Private [owner]
 // ============================================================
 exports.getBills = async (req, res, next) => {
   try {
-    const { paymentStatus, hospitalId, from, to, page = 1, limit = 30 } = req.query;
+    const { paymentStatus, hospitalId, from, to, balance } = req.query;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 30));
     const filter = {};
-
-    if (paymentStatus) filter.paymentStatus = paymentStatus;
-    if (hospitalId)    filter.hospital      = hospitalId;
+    if (paymentStatus !== undefined && paymentStatus !== '') {
+      if (!Bill.schema.path('paymentStatus').enumValues.includes(paymentStatus)) return res.status(400).json({ success: false, message: 'Unknown payment status.' });
+      filter.paymentStatus = paymentStatus;
+    }
+    if (hospitalId) {
+      if (!isObjectId(hospitalId)) return res.status(400).json({ success: false, message: 'Unknown hospital.' });
+      filter.hospital = hospitalId;
+    }
     if (from || to) {
       filter.createdAt = {};
-      if (from) filter.createdAt.$gte = new Date(from);
-      if (to)   filter.createdAt.$lte = new Date(to);
+      if (from) filter.createdAt.$gte = new Date(String(from));
+      if (to)   filter.createdAt.$lte = new Date(String(to));
     }
+    const view = balance && balance !== 'all' ? BALANCE_VIEWS[balance] : null;
+    if (balance && balance !== 'all' && !view) return res.status(400).json({ success: false, message: 'Unknown balance filter.' });
 
-    const skip  = (Number(page) - 1) * Number(limit);
-    const total = await Bill.countDocuments(filter);
-    const bills = await Bill.find(filter)
-      .populate('trip',     'tripNumber patientName patientPhone emergencyType completedAt')
-      .populate('hospital', 'name city')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(Number(limit));
+    // Balances are worked out per bill (receipts included), then filtered.
+    const all = await Bill.find(filter).select('grandTotal paidAmount paymentStatus invoiceId createdAt').sort({ createdAt: -1 }).lean();
+    const [sums, invoiced] = await Promise.all([receiptsByBill(all.map((b) => b._id)), payments.invoicedBills()]);
+    const withBal = all.map((b) => ({ id: String(b._id), bal: payments.balanceOf(b, sums.get(String(b._id)) || 0, { onInvoice: invoiced.has(String(b._id)) }) }));
+    const counts = Object.fromEntries(Object.entries(BALANCE_VIEWS).map(([k, f]) => [k, withBal.filter((x) => f(x.bal)).length]));
+    const matching = view ? withBal.filter((x) => view(x.bal)) : withBal;
 
-    // Totals for the filtered set
-    const allFiltered = await Bill.find(filter).select('grandTotal paidAmount paymentStatus');
+    const sum = (k) => matching.reduce((s, x) => s + x.bal[k], 0);
     const totals = {
-      grossRevenue   : allFiltered.reduce((s, b) => s + (b.grandTotal || 0),   0),
-      collected      : allFiltered.reduce((s, b) => s + (b.paidAmount  || 0),  0),
-      pending        : allFiltered.filter(b => b.paymentStatus === 'pending').length,
-      paidCount      : allFiltered.filter(b => b.paymentStatus === 'paid').length,
+      billedPaise     : sum('totalPaise'),
+      receivedPaise   : sum('paidPaise'),
+      outstandingPaise: sum('collectiblePaise'),           // collectible from customers
+      onHospitalInvoicePaise: matching.filter((x) => x.bal.onHospitalInvoice).reduce((t, x) => t + x.bal.totalPaise, 0),
+      timingUnverifiedPaise: sum('notItemisedPaise'),
+      // Older fields, same meaning as before (rupees).
+      grossRevenue    : sum('totalPaise') / 100,
+      collected       : sum('paidPaise') / 100,
+      pending         : matching.filter((x) => x.bal.state === 'unpaid').length,
+      paidCount       : matching.filter((x) => x.bal.state === 'paid').length,
     };
 
-    return res.json({ success: true, total, totals, bills });
+    const pageIds = matching.slice((page - 1) * limit, page * limit).map((x) => x.id);
+    const docs = await Bill.find({ _id: { $in: pageIds } })
+      .populate('trip',     'tripNumber patientName patientPhone emergencyType completedAt')
+      .populate('hospital', 'name city');
+    const byId = new Map(docs.map((d) => [String(d._id), d]));
+    const balById = new Map(matching.map((x) => [x.id, x.bal]));
+    const bills = pageIds.map((id) => byId.get(id)).filter(Boolean).map((d) => ({ ...d.toJSON(), balance: balById.get(String(d._id)) }));
+
+    return res.json({ success: true, total: matching.length, page, limit, counts, totals, bills });
   } catch (err) {
     next(err);
   }
@@ -67,17 +121,23 @@ exports.getBills = async (req, res, next) => {
 
 // ============================================================
 // @route   GET /api/billing/bills/:id
-// @desc    Get single bill with full breakdown
+// @desc    One bill: breakdown, balance and every receipt behind it
 // @access  Private [owner]
 // ============================================================
 exports.getBillById = async (req, res, next) => {
   try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Bill not found.' });
     const bill = await Bill.findById(req.params.id)
       .populate({ path: 'trip', populate: [{ path: 'vehicle', select: 'registrationNumber' }, { path: 'driver', select: 'name' }] })
       .populate('hospital', 'name address phone email');
 
     if (!bill) return res.status(404).json({ success: false, message: 'Bill not found.' });
-    return res.json({ success: true, bill });
+    const receipts = await Payment.find({ bill: bill._id }).sort({ receivedAt: 1, recordedAt: 1 });
+    const invoice = await HospitalInvoice.findOne({ bills: bill._id }).select('status billingPeriod netPayable').lean();
+    const balance = payments.balanceOf(bill, receipts.reduce((s, p) => s + p.amountPaise, 0), { onInvoice: !!invoice });
+    if (invoice) balance.hospitalInvoice = invoice;
+    // Each receipt with its reversal link and whether it can be reversed.
+    return res.json({ success: true, bill: { ...bill.toJSON(), balance }, payments: await payments.withReversalLinks(receipts, () => balance) });
   } catch (err) {
     next(err);
   }
@@ -85,27 +145,284 @@ exports.getBillById = async (req, res, next) => {
 
 
 // ============================================================
-// @route   PUT /api/billing/bills/:id/payment
-// @desc    Record payment against a bill
+// @route   POST /api/billing/payments
+// @desc    Record money received for a trip: an advance before the trip
+//          is billed, a payment against its bill after. Body: { tripId,
+//          amount, method: cash|upi|bank_transfer, reference (UPI ref /
+//          bank UTR), receivedAt (India time if no zone), note, requestId }.
+//          A repeat of the same requestId returns the same receipt.
 // @access  Private [owner]
 // ============================================================
+const STAFF_METHODS = ['cash', 'upi', 'bank_transfer'];
+const REF_RE = /^[A-Z0-9/_-]{4,40}$/;
 exports.recordPayment = async (req, res, next) => {
   try {
-    const { amount, paymentMode, notes } = req.body;
-    const bill = await Bill.findById(req.params.id);
-    if (!bill) return res.status(404).json({ success: false, message: 'Bill not found.' });
+    const b = req.body || {};
+    if (!isObjectId(b.tripId)) return res.status(400).json({ success: false, message: 'Pick the trip this payment is for.' });
+    const amountPaise = parseAmount(b.amount);
+    if (!amountPaise) return res.status(400).json({ success: false, message: 'Enter an amount in rupees (up to 2 decimals, above ₹0).' });
+    if (!STAFF_METHODS.includes(b.method)) return res.status(400).json({ success: false, message: 'Pick cash, UPI or bank transfer.' });
+    const reference = typeof b.reference === 'string' ? b.reference.replace(/\s+/g, '').toUpperCase() : '';
+    if (b.method === 'cash' && reference) return res.status(400).json({ success: false, message: 'A cash payment has no reference — put any detail in the note.' });
+    if (b.method === 'bank_transfer' && !reference) return res.status(400).json({ success: false, message: 'Enter the bank transfer\'s UTR / reference.' });
+    if (reference && !REF_RE.test(reference)) return res.status(400).json({ success: false, message: 'The reference should be 4–40 letters or digits.' });
+    const receivedAt = typeof b.receivedAt === 'string' ? parseScheduleDate(b.receivedAt) : undefined;
+    if (!receivedAt) return res.status(400).json({ success: false, message: 'Enter when the money was received.' });
+    const now = Date.now();
+    if (receivedAt.getTime() > now + 5 * 60 * 1000) return res.status(400).json({ success: false, message: 'The received time is in the future.' });
+    if (receivedAt.getTime() < now - 400 * 24 * 3600 * 1000) return res.status(400).json({ success: false, message: 'The received date is over a year ago — record it through reconciliation.' });
+    const note = typeof b.note === 'string' ? b.note.trim() : '';
+    if (note.length > 300) return res.status(400).json({ success: false, message: 'Keep the note under 300 characters.' });
+    if (typeof b.requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(b.requestId)) {
+      return res.status(400).json({ success: false, message: 'Reload the page and try again.' });
+    }
 
-    bill.paidAmount    = (bill.paidAmount || 0) + Number(amount);
-    bill.paymentMode   = paymentMode;
-    bill.paymentStatus = bill.paidAmount >= bill.grandTotal ? 'paid' : 'partial';
-    if (bill.paymentStatus === 'paid') bill.paidAt = new Date();
-    if (notes) bill.notes = notes;
-    await bill.save();
+    const { payment, created } = await payments.recordPayment({
+      tripId: b.tripId, amountPaise, method: b.method, reference: reference || undefined,
+      receivedAt, note, requestId: b.requestId, user: req.user,
+    });
+    return res.status(created ? 201 : 200).json({
+      success: true,
+      duplicate: !created,
+      message: created ? `${formatRupees(payment.amountPaise)} recorded — receipt ${payment.receiptNumber}.` : `Already recorded — receipt ${payment.receiptNumber}.`,
+      payment,
+    });
+  } catch (err) {
+    if (err instanceof payments.PaymentRefused && err.status) {
+      return res.status(err.status).json({ success: false, message: err.message, ...(err.reconcile ? { reconcile: err.reconcile } : {}), ...(err.limitPaise != null ? { limitPaise: err.limitPaise } : {}) });
+    }
+    next(err);
+  }
+};
 
+// ============================================================
+// @route   PUT /api/billing/bills/:id/payment
+// @desc    Retired: it added any amount to paidAmount with no receipt,
+//          date, limit or duplicate check. Use POST /api/billing/payments.
+// ============================================================
+exports.legacyRecordPayment = (req, res) => res.status(410).json({
+  success: false,
+  message: 'This screen is out of date — reload the CRM to record payments.',
+});
+
+
+// ============================================================
+// @route   GET /api/billing/payments/:id — one receipt, for printing
+// ============================================================
+exports.getReceipt = async (req, res, next) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Receipt not found.' });
+    const payment = await Payment.findById(req.params.id)
+      .populate('trip', 'tripNumber patientName status')
+      .populate('bill', 'billNumber grandTotal paidAmount paymentStatus invoiceId');
+    if (!payment) return res.status(404).json({ success: false, message: 'Receipt not found.' });
+    let balance = null;
+    if (payment.bill) {
+      const onInvoice = !!(await HospitalInvoice.exists({ bills: payment.bill._id }));
+      balance = payments.balanceOf(payment.bill, await payments.receiptsTotal({ bill: payment.bill._id }), { onInvoice });
+    }
+    // With its reversal link (an original shows it was reversed; a reversal
+    // what it reverses). The reason is internal: the customer document
+    // never prints it.
+    const [linked] = await payments.withReversalLinks([payment], () => balance);
+    return res.json({ success: true, payment: linked, balance, issuer: CUSTOMER_ISSUER });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/payments/:id/reverse  { reason, requestId }
+// @desc    Owner only. Reverses a mistaken staff-recorded cash/UPI/bank
+//          receipt: a linked reversal record (REV/…) with the reason, the
+//          original left unchanged, the bill's balance corrected. An
+//          accounting correction only — no money is refunded or moved.
+//          A repeat of the same requestId returns the same reversal.
+// ============================================================
+exports.reversePayment = async (req, res, next) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Receipt not found.' });
+    const { reason, requestId } = req.body || {};
+    if (typeof requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(requestId)) {
+      return res.status(400).json({ success: false, message: 'Reload the page and try again.' });
+    }
+    const { reversal, created } = await payments.reversePayment({ paymentId: req.params.id, reason, requestId, user: req.user });
+    return res.status(created ? 201 : 200).json({
+      success: true,
+      duplicate: !created,
+      message: created
+        ? `Receipt reversed — ${reversal.receiptNumber}. Accounting record corrected; no money was refunded.`
+        : `Already reversed — ${reversal.receiptNumber}.`,
+      reversal,
+    });
+  } catch (err) {
+    if (err instanceof payments.PaymentRefused && err.status) {
+      return res.status(err.status).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
+};
+
+
+// ============================================================
+// @route   GET /api/billing/payment-readiness — owner only, read-only.
+// @desc    Are the receipt uniqueness protections in place (indexes and the
+//          one-live-receipt-per-reference rule in the stored data), and has
+//          the one-time reference-index migration been run? Creates,
+//          changes or drops nothing — no payment needed to check it.
+// ============================================================
+exports.getPaymentReadiness = async (req, res, next) => {
+  try {
+    const r = await require('../services/paymentIndexMigration').readiness();
+    return res.json({ success: true, readiness: r });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   GET /api/billing/issuer — the header printed on customer bills
+//          and receipts. Operations staff (Dispatch prints the trip bill).
+// ============================================================
+exports.getIssuer = (req, res) => res.json({ success: true, issuer: CUSTOMER_ISSUER });
+
+// ============================================================
+// @route   GET /api/billing/provider-issues
+// @desc    Online (Razorpay) payments that could not simply be recorded:
+//          an order matching no bill, a non-INR payment, or a captured
+//          amount different from the one recorded. Money may have been
+//          taken — a person reviews each; nothing is refunded here.
+// ============================================================
+exports.getProviderIssues = async (req, res, next) => {
+  try {
+    const resolved = req.query.state === 'resolved';
+    const issues = await Payment.Issue.find({ resolvedAt: resolved ? { $ne: null } : null })
+      .sort(resolved ? { resolvedAt: -1 } : { createdAt: -1 }).limit(100)
+      .populate('bill', 'billNumber').populate('payment', 'receiptNumber amountPaise').lean();
+    return res.json({ success: true, issues: issues.map((i) => ({ ...i, rev: i.rev || 0 })) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   PATCH /api/billing/provider-issues/:id/resolve  { outcome, note, rev }
+// @desc    Owner only. Marks an online payment that needed review as
+//          resolved, with what was found and a note (≥10 characters). Who
+//          and when are recorded; it moves to the Resolved list. A decision
+//          only — no receipt is created and no money record changes.
+// ============================================================
+const ISSUE_OUTCOMES = ['matched_to_bill', 'refunded_at_razorpay', 'not_ours', 'duplicate_notice', 'other'];
+exports.resolveProviderIssue = async (req, res, next) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Not found.' });
+    const { outcome } = req.body || {};
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim().replace(/\s+/g, ' ') : '';
+    const rev = Number(req.body?.rev);
+    if (!ISSUE_OUTCOMES.includes(outcome)) return res.status(400).json({ success: false, message: 'Pick what was found.' });
+    if (note.length < 10) return res.status(400).json({ success: false, message: 'Add a note of at least 10 characters.' });
+    if (note.length > 300) return res.status(400).json({ success: false, message: 'Keep the note under 300 characters.' });
+    if (!Number.isInteger(rev) || rev < 0) return res.status(400).json({ success: false, message: 'Reload the page and try again.' });
+    const updated = await Payment.Issue.findOneAndUpdate(
+      { _id: req.params.id, resolvedAt: null, ...(rev === 0 ? { rev: { $in: [0, null] } } : { rev }) },
+      { $set: { resolvedAt: new Date(), resolution: { outcome, note, by: req.user._id, byName: req.user.name } }, $inc: { rev: 1 } },
+      { new: true },
+    ).lean();
+    if (!updated) {
+      const now = await Payment.Issue.findById(req.params.id).lean();
+      if (!now) return res.status(404).json({ success: false, message: 'Not found.' });
+      return res.status(409).json({
+        success: false,
+        message: now.resolvedAt ? `Already resolved by ${now.resolution?.byName || 'someone else'}.` : 'This was changed just now — reload and try again.',
+        issue: now,
+      });
+    }
+    return res.json({ success: true, message: 'Marked resolved. No receipt was created and no money record changed.', issue: updated });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/refunds
+// @desc    Owner only. Records a refund already paid OUT to the customer
+//          (cash / UPI / bank) — nothing is sent; no gateway is called.
+//          Body: { tripId, amount, method, payoutReference, paidOutAt
+//          (India time if no zone), reason (≥10), requestId }.
+// ============================================================
+exports.recordRefund = async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    if (!isObjectId(b.tripId)) return res.status(400).json({ success: false, message: 'Pick the trip this refund is for.' });
+    const amountPaise = parseAmount(b.amount);
+    if (!amountPaise) return res.status(400).json({ success: false, message: 'Enter an amount in rupees (up to 2 decimals, above ₹0).' });
+    if (!STAFF_METHODS.includes(b.method)) return res.status(400).json({ success: false, message: 'Pick cash, UPI or bank transfer.' });
+    const ref = typeof b.payoutReference === 'string' ? b.payoutReference.replace(/\s+/g, '').toUpperCase() : '';
+    if (b.method === 'cash' && ref) return res.status(400).json({ success: false, message: 'A cash refund has no reference — put any detail in the reason.' });
+    if (b.method === 'bank_transfer' && !ref) return res.status(400).json({ success: false, message: "Enter the bank transfer's UTR / reference." });
+    if (ref && !REF_RE.test(ref)) return res.status(400).json({ success: false, message: 'The reference should be 4–40 letters or digits.' });
+    const paidOutAt = typeof b.paidOutAt === 'string' ? parseScheduleDate(b.paidOutAt) : undefined;
+    if (!paidOutAt) return res.status(400).json({ success: false, message: 'Enter when the refund was paid.' });
+    if (paidOutAt.getTime() > Date.now() + 5 * 60 * 1000) return res.status(400).json({ success: false, message: 'The refund time is in the future.' });
+    if (typeof b.requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(b.requestId)) return res.status(400).json({ success: false, message: 'Reload the page and try again.' });
+    const { refund, created } = await payments.recordRefund({
+      tripId: b.tripId, amountPaise, method: b.method, payoutReference: ref || undefined, paidOutAt, reason: b.reason, requestId: b.requestId, user: req.user,
+    });
+    return res.status(created ? 201 : 200).json({
+      success: true,
+      duplicate: !created,
+      message: created
+        ? `Refund of ${formatRupees(amountPaise)} recorded — ${refund.receiptNumber}. Nothing was sent; this records money already paid back.`
+        : `Already recorded — ${refund.receiptNumber}.`,
+      refund,
+    });
+  } catch (err) {
+    if (err instanceof payments.PaymentRefused && err.status) {
+      return res.status(err.status).json({ success: false, message: err.message, ...(err.limitPaise != null ? { limitPaise: err.limitPaise } : {}) });
+    }
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   GET /api/billing/advances
+// @desc    Trips not yet billed — open bookings an advance can be taken
+//          for — and advances that need a decision (on a cancelled trip).
+// ============================================================
+exports.getAdvances = async (req, res, next) => {
+  try {
+    const open = await Trip.find({ status: { $in: ['booked', 'dispatched', 'en_route'] } })
+      .select('tripNumber patientName status scheduleType scheduleDate estimatedFare grandTotal createdAt')
+      .sort({ createdAt: -1 }).limit(200).lean();
+    const unbilled = await Payment.find({ bill: null }).sort({ receivedAt: 1 });
+    const extraIds = [...new Set(unbilled.map((p) => String(p.trip)))].filter((id) => !open.some((t) => String(t._id) === id));
+    const extra = extraIds.length
+      ? await Trip.find({ _id: { $in: extraIds } }).select('tripNumber patientName status scheduleType scheduleDate estimatedFare grandTotal createdAt billId').lean()
+      : [];
+    const linked = await payments.withReversalLinks(unbilled); // advances: not on a bill yet
+    const trips = [...open, ...extra].map((t) => {
+      const recs = unbilled.filter((p) => String(p.trip) === String(t._id));
+      const recsJson = linked.filter((p) => String(p.trip) === String(t._id));
+      const advancePaise = recs.reduce((s, p) => s + p.amountPaise, 0);
+      const estimatePaise = toPaise(t.grandTotal) || toPaise(t.estimatedFare) || null;
+      const reconcile = [];
+      if (t.status === 'cancelled' && advancePaise) reconcile.push('advance_on_cancelled_trip');
+      if (t.status === 'completed' && advancePaise) reconcile.push('advance_not_on_bill');
+      if (estimatePaise && advancePaise > estimatePaise) reconcile.push('advance_above_estimate');
+      return {
+        _id: t._id, tripNumber: t.tripNumber, patientName: t.patientName, status: t.status,
+        scheduleType: t.scheduleType, scheduleDate: t.scheduleDate, createdAt: t.createdAt,
+        estimatePaise, advancePaise,
+        coverRemainingPaise: estimatePaise ? Math.max(0, estimatePaise - advancePaise) : null,
+        canTakeAdvance: ['booked', 'dispatched', 'en_route'].includes(t.status) && !!estimatePaise && advancePaise < estimatePaise,
+        reconcile,
+        payments: recsJson,
+      };
+    });
     return res.json({
       success: true,
-      message: `Payment of ₹${amount} recorded. Status: ${bill.paymentStatus}.`,
-      bill,
+      totals: { heldPaise: trips.reduce((s, t) => s + t.advancePaise, 0), tripsWithAdvance: trips.filter((t) => t.advancePaise).length },
+      trips,
     });
   } catch (err) {
     next(err);
@@ -119,24 +436,38 @@ exports.recordPayment = async (req, res, next) => {
 //
 //          ALSO called by the cron job in scheduler.js at month-end.
 //
-//          Logic:
-//          1. Find all completed trips for the hospital in the period
-//             that are NOT yet included in any invoice.
-//          2. Sum grandTotal of all matching bills.
-//          3. Apply hospital tie-up discount.
-//          4. Create / update HospitalInvoice document.
-//          5. Auto-create Income entry for the net receivable.
+//          Rules (owner-approved):
+//          (a) The invoice, its bill links and the trips' "hospital-billed"
+//              marks are saved in ONE transaction — all or nothing.
+//          (b) Bills the customer has paid anything on (a payment or an
+//              advance) are left out, and listed as "paid by customer, not
+//              invoiced".
+//          (c) Regenerating a DRAFT keeps the trips already on it and adds
+//              new eligible ones. A sent / paid / overdue invoice can't be
+//              regenerated.
+//          (d) No Income entry: each trip's fare is already recorded as
+//              Income (trip_fare) when it completes, so a hospital_credit
+//              entry would count the same revenue twice. The tie-up
+//              discount stays on the invoice.
+//          (e) Marking an invoice paid doesn't change its trips' bills
+//              (customer outstanding already excludes invoiced bills).
+//          The invoice number is INV-<year>-<month>-<hospital>, one per
+//          hospital per month (the field was unique but never set, so a
+//          second invoice could not be saved).
 //
 // @access  Private [owner]
 // ============================================================
+class InvoiceRefused extends Error {
+  constructor(status, message, extra = {}) { super(message); this.status = status; Object.assign(this, extra); }
+}
 exports.generateHospitalInvoice = async (req, res, next) => {
   try {
-    const { hospitalId, month, year } = req.body;
+    const { hospitalId, month, year } = req.body || {};
 
     const m = Number(month);
     const y = Number(year);
 
-    if (!hospitalId || !m || !y) {
+    if (!isObjectId(hospitalId) || !Number.isInteger(m) || m < 1 || m > 12 || !Number.isInteger(y) || y < 2000 || y > 2100) {
       return res.status(400).json({ success: false, message: 'hospitalId, month, and year are required.' });
     }
 
@@ -146,98 +477,115 @@ exports.generateHospitalInvoice = async (req, res, next) => {
 
     const discountPercent = hospital.tieUp?.discountPercent || 0;
 
-    // ── 2. Date range ─────────────────────────────────────────
-    const periodStart = new Date(y, m - 1, 1);
-    const periodEnd   = new Date(y, m, 0, 23, 59, 59);
-
-    // ── 3. Find all qualifying completed trips ─────────────────
-    const trips = await Trip.find({
-      dropHospital    : hospitalId,
-      status          : 'completed',
-      completedAt     : { $gte: periodStart, $lte: periodEnd },
-      isHospitalBilled: false, // Not yet invoiced
-    }).populate('billId');
-
-    if (!trips.length) {
-      return res.status(404).json({
-        success: false,
-        message: `No un-invoiced completed trips found for ${hospital.name} in ${m}/${y}.`,
-        hospital: hospital.name,
-        period  : `${m}/${y}`,
-      });
-    }
-
-    // ── 4. Gather matching bills and compute totals ────────────
-    const billIds    = trips.map(t => t.billId).filter(Boolean);
-    const bills      = await Bill.find({ _id: { $in: billIds } });
-    const grossAmount = bills.reduce((s, b) => s + (b.grandTotal || 0), 0);
-    const discountAmt = Math.round(grossAmount * discountPercent / 100);
-    const netPayable  = grossAmount - discountAmt;
-    const dueDate     = new Date();
-    dueDate.setDate(dueDate.getDate() + (hospital.tieUp?.creditDays || 30));
-
+    // ── 2. Date range: the India calendar month (Asia/Kolkata, UTC+05:30,
+    //    no daylight saving), whatever the server's own clock — a trip
+    //    completed at 00:30 IST on the 1st belongs to that month. [start, end).
+    const IST_MS = 330 * 60 * 1000;
+    const periodStart = new Date(Date.UTC(y, m - 1, 1) - IST_MS);
+    const periodEnd   = new Date(Date.UTC(y, m, 1) - IST_MS);
     const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const invoiceNumber = `INV-${y}-${String(m).padStart(2, '0')}-${String(hospital._id).slice(-6).toUpperCase()}`;
 
-    // ── 5. Upsert invoice ─────────────────────────────────────
-    const invoice = await HospitalInvoice.findOneAndUpdate(
-      { hospital: hospitalId, 'billingPeriod.month': m, 'billingPeriod.year': y },
-      {
-        hospital        : hospitalId,
-        billingPeriod   : { month: m, year: y },
-        trips           : trips.map(t => t._id),
-        bills           : billIds,
-        totalTrips      : trips.length,
-        grossAmount,
-        discountPercent,
-        discountAmount  : discountAmt,
-        netPayable,
-        dueDate,
-        generatedBy     : req.user?._id,
-        status          : 'draft',
-      },
-      { upsert: true, new: true }
-    );
+    let result;
+    for (let attempt = 0; attempt < 2 && !result; attempt += 1) {
+      const session = await HospitalInvoice.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const existing = await HospitalInvoice.findOne({ hospital: hospitalId, 'billingPeriod.month': m, 'billingPeriod.year': y }).session(session);
+          if (existing && existing.status !== 'draft') {
+            throw new InvoiceRefused(409, `The ${months[m]} ${y} invoice for ${hospital.name} is ${existing.status} — it can't be regenerated.`);
+          }
+          const keptTrips = (existing?.trips || []).map(String);
 
-    // ── 6. Mark trips as hospital-billed ─────────────────────
-    await Trip.updateMany(
-      { _id: { $in: trips.map(t => t._id) } },
-      { isHospitalBilled: true, 'billId': { $exists: true } }
-    );
+          // ── 3. New candidate trips (not yet invoiced) ───────────
+          const candidates = await Trip.find({
+            dropHospital    : hospitalId,
+            status          : 'completed',
+            completedAt     : { $gte: periodStart, $lt: periodEnd },
+            isHospitalBilled: false,
+            _id             : { $nin: keptTrips },
+          }).select('_id tripNumber billId').session(session);
+          const candBills = await Bill.find({ _id: { $in: candidates.map((t) => t.billId).filter(Boolean) } }).select('billNumber paidAmount trip').session(session);
+          const netReceipts = new Map((await Payment.aggregate([
+            { $match: { bill: { $in: candBills.map((b) => b._id) } } },
+            { $group: { _id: '$bill', paise: { $sum: '$amountPaise' } } },
+          ]).session(session)).map((r) => [String(r._id), r.paise]));
 
-    // Link bills to this invoice
-    await Bill.updateMany(
-      { _id: { $in: billIds } },
-      { invoiceId: invoice._id }
-    );
+          // ── 4. (b) leave out bills the customer has paid on ─────
+          const excluded = [];
+          const added = [];
+          for (const t of candidates) {
+            const b = candBills.find((x) => String(x._id) === String(t.billId));
+            if (!b) continue; // no bill yet — nothing to invoice
+            const paidPaise = Math.max(toPaise(b.paidAmount) || 0, netReceipts.get(String(b._id)) || 0);
+            if (paidPaise > 0) excluded.push({ tripNumber: t.tripNumber, billNumber: b.billNumber, paidPaise });
+            else added.push({ trip: t._id, bill: b._id });
+          }
 
-    // ── 7. Auto-create Income entry for net receivable ─────────
-    await Income.create({
-      category   : 'hospital_credit',
-      amount     : netPayable,
-      description: `${hospital.name} — Invoice ${invoice._id} — ${months[m]} ${y}`,
-      date       : new Date(),
-      invoice    : invoice._id,
-      recordedBy : req.user?._id,
-    });
+          // ── 5. (c) keep a draft's trips, add the new ones ───────
+          const tripIds = [...keptTrips, ...added.map((a) => String(a.trip))];
+          const billIds = [...(existing?.bills || []).map(String), ...added.map((a) => String(a.bill))];
+          if (!tripIds.length) {
+            throw new InvoiceRefused(404, `No un-invoiced completed trips found for ${hospital.name} in ${m}/${y}.${excluded.length ? ` ${excluded.length} paid by the customer were left out.` : ''}`, { excluded });
+          }
+          const bills = await Bill.find({ _id: { $in: billIds } }).select('grandTotal').session(session);
+          const grossAmount = bills.reduce((s, b) => s + (b.grandTotal || 0), 0);
+          const discountAmt = Math.round(grossAmount * discountPercent / 100);
+          const netPayable  = grossAmount - discountAmt;
+          const dueDate     = new Date();
+          dueDate.setDate(dueDate.getDate() + (hospital.tieUp?.creditDays || 30));
 
-    // ── 8. Notify owner ───────────────────────────────────────
+          const fields = {
+            hospital: hospitalId, billingPeriod: { month: m, year: y },
+            trips: tripIds, bills: billIds, totalTrips: tripIds.length,
+            grossAmount, discountPercent, discountAmount: discountAmt, netPayable, dueDate,
+            generatedBy: req.user?._id, status: 'draft', invoiceNumber: existing?.invoiceNumber || invoiceNumber,
+          };
+          let invoice;
+          if (existing) {
+            invoice = await HospitalInvoice.findOneAndUpdate({ _id: existing._id, status: 'draft' }, { $set: fields }, { new: true, session });
+            if (!invoice) throw new InvoiceRefused(409, 'This invoice was changed just now — reload and try again.');
+          } else {
+            [invoice] = await HospitalInvoice.create([fields], { session });
+          }
+
+          // ── 6. (a) mark trips and link bills, same transaction ──
+          await Trip.updateMany({ _id: { $in: tripIds } }, { $set: { isHospitalBilled: true } }, { session });
+          await Bill.updateMany({ _id: { $in: billIds } }, { $set: { invoiceId: invoice._id } }, { session });
+          // (d) no Income entry — see the rules above.
+
+          result = { invoice, regenerated: !!existing, added: added.length, kept: keptTrips.length, excluded, grossAmount, discountAmt, netPayable };
+        });
+      } catch (err) {
+        // Two first generations at once: the second sees the first's invoice on retry.
+        if (err?.code === 11000 && attempt === 0) continue;
+        throw err;
+      } finally {
+        await session.endSession();
+      }
+    }
+    const { invoice, regenerated, added, kept, excluded, grossAmount, discountAmt, netPayable } = result;
+
+    // ── 7. Notify owner (after the commit) ────────────────────
     await Notification.create({
       type      : 'salary_generated',
-      title     : `🏥 Invoice Generated: ${hospital.name}`,
-      message   : `${trips.length} trips · ₹${grossAmount.toLocaleString('en-IN')} gross · ₹${netPayable.toLocaleString('en-IN')} net payable`,
+      title     : `🏥 Invoice ${regenerated ? 'Updated' : 'Generated'}: ${hospital.name}`,
+      message   : `${invoice.totalTrips} trips · ₹${grossAmount.toLocaleString('en-IN')} gross · ₹${netPayable.toLocaleString('en-IN')} net payable`,
       severity  : 'info',
       targetRole: 'owner',
     });
 
     await invoice.populate('hospital', 'name address');
 
-    return res.status(201).json({
+    return res.status(regenerated ? 200 : 201).json({
       success: true,
-      message: `Invoice generated for ${hospital.name} — ${months[m]} ${y}`,
+      message: `Invoice ${regenerated ? 'updated' : 'generated'} for ${hospital.name} — ${months[m]} ${y}${excluded.length ? ` (${excluded.length} trip${excluded.length === 1 ? '' : 's'} paid by the customer left out)` : ''}`,
       invoice,
-      summary: { totalTrips: trips.length, grossAmount, discountPercent, discountAmount: discountAmt, netPayable },
+      summary: { totalTrips: invoice.totalTrips, keptTrips: kept, addedTrips: added, grossAmount, discountPercent, discountAmount: discountAmt, netPayable },
+      paidByCustomerNotInvoiced: excluded,
     });
   } catch (err) {
+    if (err instanceof InvoiceRefused) return res.status(err.status).json({ success: false, message: err.message, ...(err.excluded ? { paidByCustomerNotInvoiced: err.excluded } : {}) });
     next(err);
   }
 };
@@ -299,34 +647,31 @@ exports.updateInvoiceStatus = async (req, res, next) => {
 // @desc    Owner financial dashboard aggregation
 // @access  Private [owner]
 // ============================================================
+// Month = the India calendar month. Billed (bills raised this month) and
+// collected (money received this month) are reported apart; outstanding is
+// every unpaid balance as of now (services/payments.js collectionTotals —
+// the same figures as Billing and Finance).
 exports.getFinancialDashboard = async (req, res, next) => {
   try {
-    const now        = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    const { start: monthStart, end: monthEnd } = payments.istMonth();
 
     const [
-      totalRevenue,
-      pendingRevenue,
+      totals,
+      invoiced,
+      monthBills,
       completedTrips,
       avgFare,
       pendingInvoices,
     ] = await Promise.all([
-      // Total collected this month
-      Bill.aggregate([
-        { $match: { createdAt: { $gte: monthStart, $lte: monthEnd }, paymentStatus: 'paid' } },
-        { $group: { _id: null, total: { $sum: '$grandTotal' } } },
-      ]),
-      // Pending revenue
-      Bill.aggregate([
-        { $match: { createdAt: { $gte: monthStart, $lte: monthEnd }, paymentStatus: { $in: ['pending','partial'] } } },
-        { $group: { _id: null, total: { $sum: { $subtract: ['$grandTotal', '$paidAmount'] } } } },
-      ]),
+      payments.collectionTotals({ from: monthStart, to: monthEnd }),
+      payments.invoicedBills(),
+      // This month's bills, for "still owed on this month's bills"
+      Bill.find({ createdAt: { $gte: monthStart, $lt: monthEnd } }).select('grandTotal paidAmount paymentStatus invoiceId').lean(),
       // Trip count this month
-      Trip.countDocuments({ status: 'completed', completedAt: { $gte: monthStart, $lte: monthEnd } }),
+      Trip.countDocuments({ status: 'completed', completedAt: { $gte: monthStart, $lt: monthEnd } }),
       // Average fare
       Trip.aggregate([
-        { $match: { status: 'completed', completedAt: { $gte: monthStart, $lte: monthEnd } } },
+        { $match: { status: 'completed', completedAt: { $gte: monthStart, $lt: monthEnd } } },
         { $group: { _id: null, avg: { $avg: '$grandTotal' } } },
       ]),
       // Pending hospital invoices
@@ -337,14 +682,94 @@ exports.getFinancialDashboard = async (req, res, next) => {
       success: true,
       dashboard: {
         thisMonth: {
-          collectedRevenue : totalRevenue[0]?.total   || 0,
-          pendingRevenue   : pendingRevenue[0]?.total  || 0,
+          // Rupees, as before. collectedRevenue is now money actually
+          // received this month (it was the total of bills marked paid).
+          billedRevenue    : totals.billedPaise / 100,
+          collectedRevenue : totals.collectedPaise / 100,
+          // Recorded as received with no verified date (before itemised
+          // receipts) — all-time, never part of collectedRevenue.
+          collectionTimingUnverified: totals.collectionTimingUnverifiedPaise / 100,
+          pendingRevenue   : monthBills.reduce((s, b) => s + payments.balanceOf(b, null, { onInvoice: invoiced.has(String(b._id)) }).collectiblePaise, 0) / 100,
           completedTrips,
           avgFare          : Math.round(avgFare[0]?.avg || 0),
         },
+        outstanding        : totals.outstandingPaise / 100,   // collectible from customers
+        hospitalReceivable : totals.hospital.receivablePaise / 100,
+        providerPaymentsToReview: totals.providerIssues,
+        refundedThisMonth  : totals.refundedPaise / 100,
+        advancesHeld       : totals.advancesHeldPaise / 100,
+        needsReconciliation: totals.reconcileCount,
         pendingInvoices,
       },
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// ── Customer bills on WhatsApp (services/customerBill.js) ─────────────────
+// Every completed trip's bill waits here for the owner to tap Send (unless
+// BILL_AUTO_SEND is on and it has no warnings). Numbers are masked.
+const customerBill = require('../services/customerBill');
+
+const SEND_RESULT = {
+  already_sent: [409, 'This bill was already sent to the customer.'],
+  dismissed   : [409, 'This bill was marked "Don\'t send".'],
+  warnings    : [409, 'This bill has warnings. Check them, then confirm to send.'],
+  in_progress : [409, 'This bill is being sent right now.'],
+  no_phone    : [422, 'This trip has no valid customer mobile, so the bill cannot be sent on WhatsApp.'],
+  failed      : [502, 'WhatsApp did not accept the bill.'],
+  not_found   : [404, 'Bill not found.'],
+  not_queued  : [404, 'This bill is not in the customer-bill list (it predates this feature).'],
+};
+
+// ============================================================
+// @route   GET /api/billing/customer-bills?view=to_send|sent|dismissed
+// @access  Private [owner]
+// ============================================================
+exports.getCustomerBills = async (req, res, next) => {
+  try {
+    const view = req.query.view || 'to_send';
+    const bills = await customerBill.listBills(view);
+    if (!bills) return res.status(400).json({ success: false, message: 'Unknown view.' });
+    return res.json({ success: true, view, autoSend: customerBill.autoSendOn(), bills });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/customer-bills/:id/send   { acknowledgeWarnings }
+// @desc    Sends the bill to the customer on WhatsApp — once. A bill with
+//          warnings needs acknowledgeWarnings: true. A failed send can be
+//          sent again; a sent one cannot.
+// @access  Private [owner]
+// ============================================================
+exports.sendCustomerBill = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Bill not found.' });
+    const r = await customerBill.sendBill(req.params.id, { user: req.user, acknowledgeWarnings: req.body?.acknowledgeWarnings === true });
+    if (r.ok) return res.json({ success: true, state: 'sent', message: 'Bill sent to the customer on WhatsApp.' });
+    const [status, message] = SEND_RESULT[r.code] || [500, 'The bill could not be sent.'];
+    return res.status(status).json({ success: false, reason: r.code, message: r.error ? `${message} ${r.error}` : message, warnings: r.warnings });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/billing/customer-bills/:id/dismiss
+// @desc    "Don't send": the bill stays as it is; the customer is not
+//          messaged.
+// @access  Private [owner]
+// ============================================================
+exports.dismissCustomerBill = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Bill not found.' });
+    const r = await customerBill.dismissBill(req.params.id, req.user);
+    if (!r.ok) return res.status(409).json({ success: false, message: 'This bill was already sent, dismissed, or is being sent.' });
+    return res.json({ success: true, state: 'dismissed' });
   } catch (err) {
     next(err);
   }

@@ -286,6 +286,21 @@ async function listLiveCalls({ max = 25 } = {}) {
   return { total: ids.length, calls: details };
 }
 
+// Just the ids of the calls Plivo has live right now (one request, no
+// per-call details) — for telling the CRM whether a call still marked
+// "ringing" can really still be going. Plivo answers {"calls": [uuid, ...]}.
+// Anything else — another shape, or a page of a longer list — THROWS: a
+// partial list must never make a live call look gone.
+async function listLiveCallIds() {
+  const { data } = await plivoRest('get', '/Call/?status=live');
+  if (Array.isArray(data?.calls) && data.calls.every((id) => typeof id === 'string')) return data.calls;
+  if (Array.isArray(data?.objects) && data.meta && !data.meta.next
+    && Number(data.meta.total_count ?? data.objects.length) <= data.objects.length) {
+    return data.objects.map((c) => c.call_uuid);
+  }
+  throw Object.assign(new Error('Plivo live-call list was incomplete or in an unexpected format'), { incomplete: true });
+}
+
 const hangupCall = (uuid) => plivoRest('delete', `/Call/${encodeURIComponent(uuid)}/`);
 
 const deleteEndpoint = (endpointId) => plivoRest('delete', `/Endpoint/${encodeURIComponent(endpointId)}/`);
@@ -326,14 +341,48 @@ async function issueToken(username) {
 const APP_RING_SECONDS = 15;
 const PHONE_RING_SECONDS = 40;
 
+// The phone stage of an incoming call also reports live, through the
+// Dial's callbackUrl: when a phone picks up (DialAction=answer) and when it
+// hangs up (DialAction=hangup). The action URL only fires when the Dial
+// ends, which is too late for the CRM to offer Transfer on a call answered
+// on a phone.
 function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
   const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
   const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
     + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
   const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}"` : '';
+  const live = stage === 'phone'
+    ? ` callbackUrl="${esc(apiUrl(`/api/calls/dial-event?log=${logId}&stage=phone`))}" callbackMethod="POST"`
+    : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
+    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${live}${sipHeaders}>${legs}</Dial>`,
+  );
+}
+
+// A live transfer: moves the customer's leg (the A leg) out of its current
+// <Dial> onto new XML from `url` — the person who had the call is dropped,
+// the customer stays on the line.
+const transferCall = (uuid, url) => plivoRest('post', `/Call/${encodeURIComponent(uuid)}/`, {
+  legs: 'aleg', aleg_url: url, aleg_method: 'POST',
+});
+
+// One step of a transfer: the customer hears `say`, then the targets ring
+// (first to answer takes the call). Recorded as its own part of the call.
+// The in-app legs get the call-log id and transfer=1 as SIP headers, so the
+// CRM's ringing screen says it is a transferred call. The Dial's action is
+// /transfer-answer again with done=<step>, which decides the next step.
+const TRANSFER_RING_SECONDS = 25;
+function transferXml({ numbers = [], sipUsers = [], logId, transfer, step, say, timeout = TRANSFER_RING_SECONDS }) {
+  const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}&part=${transfer}`));
+  const dialUrl = esc(apiUrl(`/api/calls/transfer-answer?log=${logId}&t=${transfer}&done=${step}`));
+  const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
+    + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
+  const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)},transfer=1"` : '';
+  return xml(
+    (say ? `<Speak language="en-IN">${esc(say)}</Speak>` : '')
+    + `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
     + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${sipHeaders}>${legs}</Dial>`,
   );
 }
@@ -346,8 +395,8 @@ module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
-  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, hangupCall, deleteEndpoint,
-  APP_RING_SECONDS, PHONE_RING_SECONDS,
-  bridgeXml, speakXml, hangupXml, emptyXml,
+  getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, listLiveCallIds, hangupCall, deleteEndpoint,
+  APP_RING_SECONDS, PHONE_RING_SECONDS, TRANSFER_RING_SECONDS,
+  bridgeXml, transferXml, transferCall, speakXml, hangupXml, emptyXml,
   PUBLIC_API_BASE,
 };

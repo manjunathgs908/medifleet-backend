@@ -39,12 +39,15 @@ const Ambulance    = require('../models/Ambulance');
 const Quote        = require('../models/Quote');
 const WhatsAppLead = require('../models/WhatsAppLead');
 const CallLog      = require('../models/CallLog');
+const CallbackTask = require('../models/CallbackTask');
+const callbackQueue = require('../services/callbackQueue');
 const WebrtcDebugEvent = require('../models/WebrtcDebugEvent');
 const WebrtcEndpoint   = require('../models/WebrtcEndpoint');
 const plivo        = require('../services/plivoService');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
 const { phoneFromRef, maskPhone } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
+const { ACTIVE_STATUSES, MAX_LIVE_MS, callHasEnded, liveStateOf, PLIVO_CHECK_AFTER_MS } = require('../utils/callLiveness');
 
 // Statuses during which a driver or partner may still reach the customer.
 const ACTIVE_TRIP_STATUSES = ['booked', 'dispatched', 'en_route'];
@@ -128,7 +131,7 @@ const serverTrail = (event, detail) => {
 // "+91 99868 44442" are one phone — two <Number>s for it in one Dial would
 // ring it once and get USER_BUSY on the other). Never the caller's own
 // number: ringing the phone that is making the call is busy by definition.
-function fallbackPhones(users, callerPhone) {
+function fallbackPhones(users, callerPhone, { envFallback = true } = {}) {
   const caller = normalisePhone(callerPhone);
   const seen = new Set();
   const pick = (list) => list.filter((p) => {
@@ -138,7 +141,7 @@ function fallbackPhones(users, callerPhone) {
     return true;
   });
   let phones = pick(users.map(ringPhoneOf));
-  if (!phones.length) {
+  if (!phones.length && envFallback) {
     phones = pick(String(process.env.PLIVO_FALLBACK_AGENTS || '').split(',').map((s) => s.trim()));
   }
   return phones.slice(0, MAX_INCOMING_AGENTS);
@@ -285,7 +288,7 @@ exports.releaseLegs = releaseLegs;
 
 // CRM admins and telecallers on call duty.
 const loadOnDuty = () => User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true, callDuty: true })
-  .select('name phone callPhone callMode appOnlineAt +plivoEndpointUsername +plivoEndpointId')
+  .select('name role phone callPhone callMode speaksEnglish appOnlineAt +plivoEndpointUsername +plivoEndpointId')
   .limit(MAX_INCOMING_AGENTS).lean();
 
 // The on-duty owner/telecaller whose ring phone is this number, if any.
@@ -389,7 +392,7 @@ class CallError extends Error {
 // a driver only the customer of a live trip assigned to them, a fleet owner
 // only on their own ambulances, CRM staff anyone the CRM shows them.
 async function resolveCustomer(req, agent) {
-  const { tripId, leadId, quoteId, whatsappLeadId, customerRef, callLogId } = req.body || {};
+  const { tripId, leadId, quoteId, whatsappLeadId, customerRef, callLogId, callbackTaskId } = req.body || {};
 
   if (tripId) {
     const query = isObjectId(String(tripId)) ? { _id: tripId } : { tripNumber: String(tripId) };
@@ -428,12 +431,24 @@ async function resolveCustomer(req, agent) {
     if (!wl) throw new CallError(404, 'Lead not found.');
     return { phone: wl.phone, context: 'whatsapp_lead', refs: { whatsappLead: wl._id } };
   }
+  if (callbackTaskId) {
+    // "Call back" from the callback queue. Only places the call: the task
+    // stays open until a person resolves it; this call is listed on it as
+    // an attempt (callbackTask).
+    if (!isObjectId(String(callbackTaskId))) throw new CallError(404, 'Callback not found.');
+    const task = await CallbackTask.findById(callbackTaskId).select('+customerPhone trip lead');
+    if (!task?.customerPhone) throw new CallError(404, 'Callback not found.');
+    return { phone: task.customerPhone, context: 'call_back', refs: { trip: task.trip, lead: task.lead, callbackTask: task._id } };
+  }
   if (callLogId) {
     // "Call back" from the call history -- typically a missed incoming call.
     if (!isObjectId(String(callLogId))) throw new CallError(404, 'Call not found.');
-    const prior = await CallLog.findById(callLogId).select('+customerPhone trip lead');
+    const prior = await CallLog.findById(callLogId).select('+customerPhone trip lead callbackTask');
     if (!prior?.customerPhone) throw new CallError(404, 'Call not found.');
-    return { phone: prior.customerPhone, context: 'call_back', refs: { trip: prior.trip, lead: prior.lead } };
+    // A missed call still waiting in the callback queue: this call counts
+    // as an attempt on that task (it does not resolve it).
+    const openTask = prior.callbackTask && await CallbackTask.exists({ _id: prior.callbackTask, state: 'open' });
+    return { phone: prior.customerPhone, context: 'call_back', refs: { trip: prior.trip, lead: prior.lead, ...(openTask ? { callbackTask: prior.callbackTask } : {}) } };
   }
   if (customerRef) {
     const phone = phoneFromRef(customerRef);
@@ -505,7 +520,7 @@ exports.clickToCall = async (req, res, next) => {
 // apart — from the Render log, or from the CRM via GET /api/calls/config.
 // In memory: it covers this server process since its last deploy, which is
 // the window anyone checking "did the call just now reach us?" needs.
-const WEBHOOKS = ['answer', 'incoming', 'events', 'recording'];
+const WEBHOOKS = ['answer', 'incoming', 'events', 'recording', 'transfer-answer', 'dial-event'];
 const SERVER_STARTED_AT = new Date();
 const webhookStats = Object.fromEntries(WEBHOOKS.map((w) => [w, {
   hits: 0, accepted: 0, rejected: 0, lastHitAt: null, lastAcceptedAt: null, lastRejectedAt: null, lastRejectReason: null,
@@ -555,10 +570,10 @@ exports.answer = async (req, res, next) => {
       return sendXml(res, plivo.speakXml('Sorry, this call could not be connected.'));
     }
 
-    log.status = 'agent_answered';
     log.answeredAt = new Date();
     if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
     await log.save();
+    await setStatusIf(log, 'agent_answered', { $in: ['initiated'] });
 
     return sendXml(res, plivo.bridgeXml({ numbers: [other], logId: log._id }));
   } catch (err) {
@@ -668,6 +683,9 @@ exports.incoming = async (req, res, next) => {
       endedAt      : ringing ? undefined : new Date(),
       // Phones go straight into this call's Dial only when no app rings first.
       dialledPhones: ringing && !sipUsers.length ? agentPhones.map(normalisePhone) : undefined,
+      // A customer's call, so a miss goes to the callback queue — not a
+      // staff member testing from their own ring phone.
+      callbackEligible: isMobile(from) && !callerWasRingPhone ? true : undefined,
     });
     plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
     serverTrail('server:incoming_routed', {
@@ -696,6 +714,22 @@ exports.incoming = async (req, res, next) => {
 };
 
 
+// Status and end time are written ONLY by these single conditional updates,
+// never by log.save(): two Plivo webhooks handled at the same moment each
+// load the call, and a plain save of the later one would overwrite the
+// other's outcome. The condition is checked by MongoDB atomically, so a
+// final outcome cannot be reopened. The in-memory log follows only when the
+// update applied.
+async function setStatusIf(log, status, whenStatus) {
+  const r = await CallLog.updateOne({ _id: log._id, status: whenStatus }, { $set: { status } });
+  if (r?.matchedCount > 0) log.status = status;
+  return r?.matchedCount > 0;
+}
+async function markEndedIfNot(log, at) {
+  const r = await CallLog.updateOne({ _id: log._id, endedAt: null }, { $set: { endedAt: at } });
+  if (r?.matchedCount > 0 && !log.endedAt) log.endedAt = at;
+}
+
 // Plivo's outcome words -> ours.
 const AGENT_LEG_FAIL = { busy: 'agent_busy', 'no-answer': 'agent_missed', timeout: 'agent_missed', failed: 'failed', cancel: 'cancelled' };
 const DIAL_FAIL      = { busy: 'customer_busy', 'no-answer': 'customer_missed', timeout: 'customer_missed', failed: 'customer_failed', cancel: 'cancelled' };
@@ -718,10 +752,28 @@ exports.events = async (req, res, next) => {
     if (req.query.leg === 'dial') {
       const dialStatus = String(b.DialStatus || '').toLowerCase();
 
+      // The call was transferred from the CRM: this is the report of the
+      // ORIGINAL Dial, which the transfer ended. It never rings phones or
+      // hangs up — the customer's leg is on the transfer's XML now.
+      if (log && ['app', 'phone'].includes(req.query.stage) && transferTookOver(log)) {
+        return sendXml(res, await originalDialAfterTransfer(log, b, dialStatus, req.query.stage));
+      }
+
       // Stage 1 (in-app) ended without an answer — for ANY reason, or with
       // no status at all. Never strand the caller: ring every on-duty phone
       // now. Only a completed app leg ends the call here.
       if (req.query.stage === 'app' && dialStatus !== 'completed') {
+        // Plivo's hang-up for the whole call can arrive BEFORE this report
+        // (the caller hung up while the app was ringing). The call is over:
+        // don't set it back to "ringing" and don't dial phones for it — that
+        // left calls stuck as Ringing with nothing ever reporting again.
+        if (log && callHasEnded(log)) {
+          log.appLeg = { sipUris: (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri), ...dialResult(b) };
+          log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}(after hangup — not redialled)`];
+          await log.save();
+          console.info(`[calls] in-app leg report after the call ended log=${logId} status=${log.status} — no phone dial`);
+          return sendXml(res, plivo.hangupXml());
+        }
         const onDuty = await loadOnDuty();
         const phones = fallbackPhones(onDuty, b.From);
         const callerWasRingPhone = callerIsRingPhone(onDuty, b.From);
@@ -736,10 +788,12 @@ exports.events = async (req, res, next) => {
           serverTrail('server:app_leg', { logId: String(log._id), DialStatus: dialStatus || null, DialHangupCause: b.DialHangupCause || b.DialBLegHangupCause || null, fellBackToPhones: phones.length });
           log.flow = [...(log.flow || []), `app:${dialStatus || 'none'}→${phones.length ? `phones:${phones.length}:${plivo.PHONE_RING_SECONDS}s` : callerWasRingPhone ? 'skipped_caller_ring_phone→busy_message' : 'busy_message'}`];
           if (callerWasRingPhone) log.routing = { ...(log.routing || {}), skippedCaller: skippedCallerNote(onDuty, b.From, phones.length) };
-          log.status = phones.length ? 'ringing' : 'missed';
           if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
           if (phones.length) log.dialledPhones = phones.map(normalisePhone);
           await log.save();
+          // Still active: it stays "ringing" while phones ring. Nobody to ring:
+          // missed — unless a concurrent report already ended it.
+          if (!phones.length) await setStatusIf(log, 'missed', { $in: ACTIVE_STATUSES });
         }
         if (phones.length && logId) {
           sendXml(res, plivo.bridgeXml({ numbers: phones, logId, stage: 'phone' }));
@@ -762,8 +816,9 @@ exports.events = async (req, res, next) => {
         const stage = req.query.stage || 'dial';
         const endsWithSorry = log.direction === 'inbound' && dialStatus && dialStatus !== 'completed';
         log.flow = [...(log.flow || []), `${stage}:${dialStatus === 'completed' ? 'answered' : (dialStatus || 'none')}${endsWithSorry ? '→sorry_message' : ''}`];
+        let nextStatus = null;
         if (dialStatus === 'completed') {
-          log.status = 'completed';
+          nextStatus = 'completed';
           const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
           if (Number.isFinite(talk)) log.talkSec = talk;
           // An incoming call answered on a ring PHONE: Plivo says which
@@ -780,13 +835,22 @@ exports.events = async (req, res, next) => {
             if (!log.answeredAt) log.answeredAt = new Date(Date.now() - (Number.isFinite(talk) ? talk * 1000 : 0));
           }
         } else if (dialStatus) {
-          log.status = log.direction === 'inbound'
+          nextStatus = log.direction === 'inbound'
             ? 'missed'
             : (DIAL_FAIL[dialStatus] || `customer_${dialStatus}`);
         }
         if (b.DialBLegUUID) log.customerLegId = b.DialBLegUUID;
         if (b.DialBLegHangupCause) log.hangupCause = b.DialBLegHangupCause;
         await log.save();
+        // A connected call is never turned back into a failure by a late,
+        // repeated or concurrent report; "completed" may replace a missed
+        // set by a hang-up that arrived first.
+        const applied = nextStatus ? await setStatusIf(log, nextStatus, { $ne: 'completed' }) : false;
+        // Already in the callback queue as missed, but answered after all:
+        // take it off at once (the queue's sweep also catches it if this fails).
+        if (applied && nextStatus === 'completed' && log.direction === 'inbound' && log.callbackTask) {
+          callbackQueue.retractAnswered(log._id).catch((err) => console.error(`[calls] callback retract failed log=${log._id}:`, err?.message || err));
+        }
       }
       // A customer whose call nobody picked up hears why before hanging up.
       if (log?.direction === 'inbound' && dialStatus && dialStatus !== 'completed') {
@@ -795,16 +859,20 @@ exports.events = async (req, res, next) => {
       return sendXml(res, plivo.hangupXml());
     }
 
-    // hangup_url for the whole call.
+    // hangup_url for the whole call. A hang-up for some OTHER leg (a dialled
+    // phone or app) is noted, but does not end this call.
+    if (log && log.providerCallId && b.CallUUID && b.CallUUID !== log.providerCallId) {
+      console.info(`[calls] hang-up of another leg (${b.CallUUID}) for log=${log._id} — call left as ${log.status}`);
+      return sendXml(res, plivo.emptyXml());
+    }
     if (log) {
       const callStatus = String(b.CallStatus || '').toLowerCase();
-      if (['initiated', 'agent_answered', 'ringing'].includes(log.status)) {
-        // Ended before the Dial reported anything: the agent never answered
-        // (outbound), or the caller gave up while it rang (inbound).
-        log.status = log.direction === 'inbound'
-          ? 'missed'
-          : (log.status === 'agent_answered' ? 'customer_missed' : (AGENT_LEG_FAIL[callStatus] || 'agent_missed'));
-      }
+      // Ended before the Dial reported anything: the agent never answered
+      // (outbound), or the caller gave up while it rang (inbound). Applied
+      // below only if the call is STILL active at that moment.
+      const finalStatus = log.direction === 'inbound'
+        ? 'missed'
+        : (log.status === 'agent_answered' ? 'customer_missed' : (AGENT_LEG_FAIL[callStatus] || 'agent_missed'));
       if (log.context === 'test_ring') log.flow = [...(log.flow || []), `test_ring:${callStatus || 'ended'}`];
       if (b.CallUUID && !log.providerCallId) log.providerCallId = b.CallUUID;
       const total = Number(b.Duration);
@@ -813,8 +881,20 @@ exports.events = async (req, res, next) => {
       // TEMPORARY diagnostic: Plivo's full hang-up report for the whole
       // call — e.g. HangupCauseCode 5030 is its concurrency limit.
       log.hangup = hangupDetail(b);
-      log.endedAt = new Date();
       await log.save();
+      await setStatusIf(log, finalStatus, { $in: ACTIVE_STATUSES });
+      // A repeated hang-up report keeps the first end time.
+      await markEndedIfNot(log, new Date());
+      // The customer hung up while their call was being transferred.
+      const ringingTransfer = (log.transfers || []).findIndex((t) => t?.outcome === 'ringing');
+      if (ringingTransfer >= 0) {
+        await CallLog.updateOne(
+          { _id: log._id, [`transfers.${ringingTransfer}.outcome`]: 'ringing' },
+          // Nobody took it: queued for a callback (unless Plivo then reports
+          // it answered — see transferAnswer).
+          { $set: { [`transfers.${ringingTransfer}.outcome`]: 'caller_hung_up', [`transfers.${ringingTransfer}.endedAt`]: new Date(), transferUnanswered: new Date() } },
+        );
+      }
       plivo.logCall(`hangup status=${log.status} cause=${b.HangupCauseName || b.HangupCause || '-'} code=${b.HangupCauseCode || '-'} source=${b.HangupSource || '-'}`, log);
       // No leg of this call may outlive it.
       if (log.direction === 'inbound') releaseLegs(log._id).catch(() => {});
@@ -844,6 +924,9 @@ exports.events = async (req, res, next) => {
         totalSec      : Number.isFinite(total) ? total : undefined,
         startedAt     : b.StartTime ? new Date(b.StartTime) : new Date(),
         endedAt       : new Date(),
+        // Not queued automatically — nothing here rang staff. Listed under
+        // "Not routed by CRM" for a person to add or dismiss.
+        callbackReview: isMobile(from) ? { state: 'pending' } : undefined,
       });
       console.warn(`[calls] inbound call ${b.CallUUID} reached hangup with no /incoming log — logged as not_routed (log=${created._id}). Check the Plivo number is linked to the "SaveLife CRM" application.`);
     } else {
@@ -866,7 +949,19 @@ exports.recording = async (req, res, next) => {
   try {
     const b = plivoParams(req);
     const logId = logIdOf(req);
-    if (logId && (b.RecordUrl || b.RecordingID)) {
+    // A part recorded after a transfer (part = the transfer's index).
+    const part = /^\d{1,2}$/.test(String(req.query.part ?? '')) ? Number(req.query.part) : null;
+    if (logId && part != null && (b.RecordUrl || b.RecordingID)) {
+      const set = {};
+      if (b.RecordUrl) set['recordings.$.url'] = b.RecordUrl;
+      if (b.RecordingID) set['recordings.$.id'] = b.RecordingID;
+      const sec = Number(b.RecordingDuration);
+      if (Number.isFinite(sec) && sec >= 0) set['recordings.$.sec'] = sec;
+      // The action and the file-ready callback can arrive together: the
+      // part's entry is added once, then filled.
+      await CallLog.updateOne({ _id: logId, 'recordings.part': { $ne: part } }, { $push: { recordings: { part } } });
+      await CallLog.updateOne({ _id: logId, 'recordings.part': part }, { $set: set });
+    } else if (logId && (b.RecordUrl || b.RecordingID)) {
       const update = {};
       if (b.RecordUrl) update.recordingUrl = b.RecordUrl;
       if (b.RecordingID) update.recordingId = b.RecordingID;
@@ -879,6 +974,514 @@ exports.recording = async (req, res, next) => {
     next(err);
   }
 };
+
+
+// ── Live transfer ──────────────────────────────────────────────────────────
+// A cold transfer of a connected incoming call. The person on the call
+// presses Transfer in the CRM; Plivo moves the customer's leg onto
+// /transfer-answer, which plays a hold message and rings, in order, until
+// someone answers:
+//   english    — on-duty telecallers marked "speaks English" (Staff page)
+//   all        — every on-duty telecaller
+//   back_app   — ring-back: the normal incoming group in the app, the
+//                person who transferred included
+//   back_phone — ring-back: every on-duty phone
+// Each step is skipped when it has nobody to ring. Nobody at all: the
+// customer hears the usual sorry message. The person who transferred is
+// never rung by the telecaller steps. Numbers stay masked: every leg shows
+// PLIVO_NUMBER, and the in-app ring screen gets only the call-log id.
+const TRANSFER_STEPS = ['english', 'all', 'back_app', 'back_phone'];
+const TRANSFER_ANSWERED = ['answered', 'rang_back'];
+const TRANSFER_HOLD_MESSAGE = 'Please hold while we transfer your call to a colleague.';
+const TRANSFER_STILL_HOLD_MESSAGE = 'Please continue to hold.';
+const TRANSFER_RING_BACK_MESSAGE = 'Please hold. We are connecting you back to our team.';
+const SORRY_MESSAGE = 'Sorry, our team could not take your call right now. We will call you back shortly.';
+
+// Who has the call now: whoever last took it as a transfer, else whoever
+// answered it in the CRM.
+function transferHolder(log) {
+  const taken = (log.transfers || []).filter((t) => t?.answeredBy && TRANSFER_ANSWERED.includes(t.outcome));
+  return taken.length ? taken[taken.length - 1].answeredBy : log.agentUser;
+}
+
+// The legs for a set of users — in the app where their app is online,
+// otherwise their ring phone — never the caller's own number.
+function legsOf(users, devices, callerPhone) {
+  const { sipUsers } = routeIncoming(users, devices);
+  const numbers = fallbackPhones(users.filter((u) => u.callMode !== 'app' || !appEndpointsOf(u, devices).length), callerPhone, { envFallback: false });
+  const reach = users.filter((u) => (u.callMode === 'app' && appEndpointsOf(u, devices).length) || numbers.some((n) => normalisePhone(n) === normalisePhone(ringPhoneOf(u))));
+  return { sipUsers, numbers, users: reach.map((u) => u._id) };
+}
+
+// The telecallers a transfer by `byId` can ring: English speakers, and all.
+function transferPlan(onDuty, devices, byId, callerPhone) {
+  const others = onDuty.filter((u) => u.role === 'telecaller' && String(u._id) !== String(byId));
+  return {
+    english: legsOf(others.filter((u) => u.speaksEnglish), devices, callerPhone),
+    all    : legsOf(others, devices, callerPhone),
+  };
+}
+exports.transferPlan = transferPlan;
+
+async function stepLegs(log, entry, step) {
+  const onDuty = await loadOnDuty();
+  const devices = await loadOnlineDevices(onDuty);
+  if (step === 'english' || step === 'all') {
+    const plan = transferPlan(onDuty, devices, entry.by, log.customerPhone);
+    if (step === 'english') return plan.english;
+    // Everyone available was already rung as an English speaker.
+    const rung = new Set((entry.englishRung || []).map(String));
+    if ((entry.steps || []).includes('english') && plan.all.users.every((id) => rung.has(String(id)))) return { sipUsers: [], numbers: [], users: [] };
+    return plan.all;
+  }
+  if (step === 'back_app') return { sipUsers: routeIncoming(onDuty, devices).sipUsers, numbers: [], users: [] };
+  return { sipUsers: [], numbers: fallbackPhones(onDuty, log.customerPhone), users: [] };
+}
+
+// The XML for the first step from `fromIdx` on that has anyone to ring; the
+// sorry message when none has.
+async function serveTransferFrom(log, t, fromIdx) {
+  const entry = log.transfers[t];
+  const served = entry.steps || [];
+  for (let k = fromIdx; k < TRANSFER_STEPS.length; k += 1) {
+    const step = TRANSFER_STEPS[k];
+    const legs = await stepLegs(log, entry, step);
+    if (!legs.sipUsers.length && !legs.numbers.length) continue;
+    const ringBack = step.startsWith('back_');
+    const say = !served.length ? TRANSFER_HOLD_MESSAGE
+      : ringBack && !served.some((s) => s.startsWith('back_')) ? TRANSFER_RING_BACK_MESSAGE
+        : TRANSFER_STILL_HOLD_MESSAGE;
+    await CallLog.updateOne({ _id: log._id }, {
+      $set : { [`transfers.${t}.step`]: step, ...(step === 'english' ? { [`transfers.${t}.englishRung`]: legs.users } : {}) },
+      $push: { [`transfers.${t}.steps`]: step, flow: `transfer${t}:${step}:${legs.sipUsers.length + legs.numbers.length}` },
+    });
+    serverTrail('server:transfer_step', { logId: String(log._id), transfer: t, step, app: legs.sipUsers.length, phones: legs.numbers.length });
+    const timeout = step === 'back_app' ? plivo.APP_RING_SECONDS : step === 'back_phone' ? plivo.PHONE_RING_SECONDS : plivo.TRANSFER_RING_SECONDS;
+    return plivo.transferXml({ numbers: legs.numbers, sipUsers: legs.sipUsers, logId: log._id, transfer: t, step, say, timeout });
+  }
+  await CallLog.updateOne(
+    { _id: log._id, [`transfers.${t}.outcome`]: 'ringing' },
+    // The caller needed help and got none: queued for a callback.
+    { $set: { [`transfers.${t}.outcome`]: 'not_answered', [`transfers.${t}.endedAt`]: new Date(), transferUnanswered: new Date() }, $push: { flow: `transfer${t}:nobody→sorry_message` } },
+  );
+  console.warn(`[calls] transfer ${t} of log=${log._id}: nobody answered, ring-back included — sorry message`);
+  return plivo.speakXml(SORRY_MESSAGE);
+}
+
+// The original Dial ends when its call is transferred. A transfer that is
+// under way (or done) means that Dial's report must not ring phones or hang
+// up. A transfer that FAILED leaves the original call as it was.
+const transferTookOver = (log) => (log.transfers || []).some((t) => t && (t.servedAt || t.outcome !== 'failed'));
+
+async function originalDialAfterTransfer(log, b, dialStatus, stage) {
+  const set = {};
+  if (dialStatus === 'completed') {
+    const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
+    if (Number.isFinite(talk)) set.talkSec = talk;
+  }
+  if (stage === 'app') set.appLeg = { sipUris: (log.routing?.appUsers || []).filter((u) => u.dialled).map((u) => u.sipUri), ...dialResult(b) };
+  else set.phoneLeg = dialResult(b);
+  await CallLog.updateOne({ _id: log._id }, { $set: set, $push: { flow: `${stage}:${dialStatus === 'completed' ? 'answered' : (dialStatus || 'none')}→transferred` } });
+  // The person who had the call dropped before Plivo moved the customer
+  // (the Dial ended first, so this reply is the customer's XML): start the
+  // transfer here. Only once — /transfer-answer and this race for servedAt.
+  const t = (log.transfers || []).findIndex((x) => x?.outcome === 'ringing');
+  if (t >= 0) {
+    const claimed = await CallLog.updateOne(
+      { _id: log._id, [`transfers.${t}.servedAt`]: { $exists: false } },
+      { $set: { [`transfers.${t}.servedAt`]: new Date(), [`transfers.${t}.servedBy`]: 'dial_action' } },
+    );
+    if (claimed?.modifiedCount > 0) {
+      const fresh = await CallLog.findById(log._id).select('+customerPhone');
+      return serveTransferFrom(fresh, t, 0);
+    }
+  }
+  return plivo.emptyXml();
+}
+
+// The person who picked up a transfer leg, from Plivo's DialBLegTo: a ring
+// phone, or an in-app endpoint.
+async function whoAnsweredLeg(raw) {
+  const s = String(raw || '');
+  const sip = s.match(/^sip:([^@]+)@/i);
+  if (!sip) return whoseRingPhone(s);
+  const dev = await WebrtcEndpoint.findOne({ username: sip[1] }).select('user').lean();
+  const user = dev?.user
+    ? await User.findById(dev.user).select('name').lean()
+    : await User.findOne({ plivoEndpointUsername: sip[1] }).select('name').lean();
+  return user || null;
+}
+
+// ============================================================
+// @route   POST /api/calls/:id/transfer
+// @desc    Transfer a connected incoming call to the other telecallers
+//          (English speakers first). Only the person on the call — who
+//          answered it in the CRM, or took it as a transfer — may. With
+//          nobody to transfer to, or if Plivo refuses, nothing changes and
+//          the caller stays connected to them.
+// @access  Private [owner, telecaller]
+// ============================================================
+exports.transferCall = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const log = await CallLog.findById(req.params.id).select('+customerPhone');
+    if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });
+    if (log.provider !== 'plivo' || log.direction !== 'inbound' || log.context !== 'incoming' || !log.providerCallId) {
+      return res.status(400).json({ success: false, reason: 'not_transferable', message: 'Only an incoming customer call can be transferred.' });
+    }
+    if (log.endedAt) return res.status(409).json({ success: false, reason: 'ended', message: 'This call has already ended.' });
+    const transfers = log.transfers || [];
+    if (transfers.some((t) => t?.outcome === 'ringing')) {
+      return res.status(409).json({ success: false, reason: 'in_progress', message: 'This call is already being transferred.' });
+    }
+    const holder = transferHolder(log);
+    if (!holder || String(holder) !== String(req.user._id)) {
+      return res.status(403).json({ success: false, reason: 'not_on_call', message: 'Only the person on this call can transfer it.' });
+    }
+    // Answered on their phone: that phone must still be on the call.
+    const onPhone = heldOnPhone(log);
+    if (onPhone && log.answeredLegEndedAt) {
+      return res.status(409).json({ success: false, reason: 'ended', message: 'Your phone has already hung up on this call.' });
+    }
+
+    const onDuty = await loadOnDuty();
+    const devices = await loadOnlineDevices(onDuty);
+    const plan = transferPlan(onDuty, devices, req.user._id, log.customerPhone);
+    if (!plan.all.users.length) {
+      console.info(`[calls] transfer of log=${log._id} refused: no other telecaller available`);
+      return res.status(409).json({ success: false, reason: 'no_one_available', message: 'No other telecaller is on call duty right now. You are still connected to the caller.' });
+    }
+
+    // One transfer at a time: the update applies only if no other transfer
+    // was added since this call was read (a double press, two tabs).
+    const t = transfers.length;
+    const entry = { by: req.user._id, byName: req.user.name, at: new Date(), targets: plan.all.users, englishAvailable: plan.english.users.length, steps: [], outcome: 'ringing' };
+    const added = await CallLog.updateOne(
+      {
+        _id: log._id,
+        endedAt: null,
+        status: { $in: [...ACTIVE_STATUSES, 'completed'] },
+        $expr: { $eq: [{ $size: { $ifNull: ['$transfers', []] } }, t] },
+      },
+      // Someone already talked to the caller: the call is answered, whatever
+      // the transfer does next.
+      { $push: { transfers: entry, flow: `transfer${t}:requested` }, $set: { status: 'completed' } },
+    );
+    if (!added?.modifiedCount) {
+      return res.status(409).json({ success: false, reason: 'in_progress', message: 'This call is already being transferred, or has ended.' });
+    }
+
+    try {
+      await plivo.transferCall(log.providerCallId, plivo.apiUrl(`/api/calls/transfer-answer?log=${log._id}&t=${t}`));
+    } catch (err) {
+      const { status } = plivoErrorDetail(err);
+      // Plivo may have moved the call after all (its reply was lost): then
+      // /transfer-answer has run, and the transfer stands.
+      const failed = await CallLog.updateOne(
+        { _id: log._id, [`transfers.${t}.outcome`]: 'ringing', [`transfers.${t}.servedAt`]: { $exists: false } },
+        { $set: { [`transfers.${t}.outcome`]: 'failed', [`transfers.${t}.error`]: `Plivo transfer failed (status ${status ?? '-'})`, [`transfers.${t}.endedAt`]: new Date() }, $push: { flow: `transfer${t}:failed(${status ?? '-'})` } },
+      );
+      if (failed?.modifiedCount > 0) {
+        // Answered on a phone: the call (or that phone) may have just hung
+        // up while the CRM still showed Transfer. Say so rather than "you
+        // are still connected".
+        if (onPhone) {
+          const now = await CallLog.findById(log._id).select('endedAt answeredLegEndedAt').lean();
+          if (status === 404 || now?.endedAt || now?.answeredLegEndedAt) {
+            console.info(`[calls] transfer of log=${log._id} too late: the call or the phone had already hung up (status ${status ?? '-'})`);
+            return res.status(409).json({ success: false, reason: 'ended', message: 'This call ended before it could be transferred.' });
+          }
+        }
+        console.error(`[calls] transfer of log=${log._id} failed at Plivo (status ${status ?? '-'}) — caller left with ${req.user.name}`);
+        return res.status(502).json({ success: false, reason: 'plivo_failed', message: 'The transfer did not go through. You are still connected to the caller.' });
+      }
+    }
+    // Plivo drops the phone that had the call when it moves the customer;
+    // if that phone is somehow still on a few seconds later, hang it up.
+    if (onPhone && log.answeredLegId) {
+      setTimeout(() => { dropAnsweredPhoneLeg(log._id).catch(() => {}); }, PHONE_LEG_DROP_MS).unref?.();
+    }
+    plivo.logCall(`transfer ${t} by=${req.user._id} english=${plan.english.users.length} all=${plan.all.users.length}${onPhone ? ' from=phone' : ''}`, log);
+    return res.json({
+      success: true,
+      transfer: t,
+      englishAvailable: plan.english.users.length,
+      available: plan.all.users.length,
+      message: plan.english.users.length
+        ? `Transferring — ringing ${plan.english.users.length} English-speaking telecaller(s) first.`
+        : `Transferring — ringing ${plan.all.users.length} telecaller(s).`,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/calls/transfer-answer?log=<id>&t=<n>[&done=<step>]
+// @desc    The customer's XML during transfer n. Without done: Plivo just
+//          moved the customer here — play the hold message and ring the
+//          first step. With done: that step's Dial finished — answered
+//          (record who took it) or ring the next step.
+// @access  Plivo (signature)
+// ============================================================
+exports.transferAnswer = async (req, res, next) => {
+  const logId = logIdOf(req);
+  try {
+    const b = plivoParams(req);
+    const t = /^\d{1,2}$/.test(String(req.query.t ?? '')) ? Number(req.query.t) : -1;
+    const log = logId ? await CallLog.findById(logId).select('+customerPhone') : null;
+    const entry = log?.transfers?.[t];
+    if (!entry) {
+      console.error(`[calls] transfer-answer for unknown transfer log=${logId || '-'} t=${req.query.t ?? '-'}`);
+      return sendXml(res, plivo.speakXml(SORRY_MESSAGE));
+    }
+    const done = TRANSFER_STEPS.includes(req.query.done) ? req.query.done : null;
+
+    if (!done) {
+      // Plivo moved the customer here, so this transfer happened — even if
+      // its API reply was lost and the entry was marked failed.
+      await CallLog.updateOne({ _id: log._id }, {
+        $set: { [`transfers.${t}.servedAt`]: entry.servedAt || new Date(), ...(entry.outcome === 'failed' ? { [`transfers.${t}.outcome`]: 'ringing' } : {}) },
+        ...(entry.outcome === 'failed' ? { $unset: { [`transfers.${t}.error`]: '', [`transfers.${t}.endedAt`]: '' } } : {}),
+      });
+      if (entry.servedAt && (entry.steps || []).length) {
+        // Already started from the original Dial's report: keep ringing.
+        console.warn(`[calls] transfer ${t} of log=${log._id} served twice — continuing`);
+      }
+      const fresh = await CallLog.findById(log._id).select('+customerPhone');
+      return sendXml(res, await serveTransferFrom(fresh, t, 0));
+    }
+
+    const dialStatus = String(b.DialStatus || '').toLowerCase();
+    if (dialStatus === 'completed') {
+      const talk = Number(b.DialBLegDuration ?? b.DialBLegBillDuration);
+      const set = {
+        [`transfers.${t}.outcome`]: done.startsWith('back_') ? 'rang_back' : 'answered',
+        [`transfers.${t}.endedAt`]: new Date(),
+      };
+      if (Number.isFinite(talk)) set[`transfers.${t}.talkSec`] = talk;
+      // Answered on a phone, or the CRM's claim never arrived: Plivo says
+      // which leg picked up.
+      if (!entry.answeredBy) {
+        const who = await whoAnsweredLeg(b.DialBLegTo);
+        if (who) {
+          set[`transfers.${t}.answeredBy`] = who._id;
+          set[`transfers.${t}.answeredByName`] = who.name;
+          set[`transfers.${t}.answeredIn`] = /^sip:/i.test(String(b.DialBLegTo || '')) ? 'app' : 'phone';
+        }
+        if (!entry.answeredAt) set[`transfers.${t}.answeredAt`] = new Date(Date.now() - (Number.isFinite(talk) ? talk * 1000 : 0));
+      }
+      // Answered after all (its report came after the hang-up): not a
+      // caller to call back. Off the queue if it was already put there.
+      await CallLog.updateOne({ _id: log._id }, { $set: set, $unset: { transferUnanswered: '' }, $push: { flow: `transfer${t}:${done}:answered` } });
+      if (log.transferUnanswered && log.callbackTask) {
+        callbackQueue.retractAnswered(log._id).catch((err) => console.error(`[calls] callback retract failed log=${log._id}:`, err?.message || err));
+      }
+      return sendXml(res, plivo.hangupXml());
+    }
+
+    // Not answered. The customer hung up meanwhile: nothing more to ring.
+    if (log.endedAt) return sendXml(res, plivo.hangupXml());
+    // A claim from the CRM that Plivo says never connected is withdrawn.
+    const unset = entry.answeredBy ? { [`transfers.${t}.answeredBy`]: '', [`transfers.${t}.answeredByName`]: '', [`transfers.${t}.answeredAt`]: '', [`transfers.${t}.answeredIn`]: '' } : {};
+    await CallLog.updateOne({ _id: log._id }, {
+      $set: { [`transfers.${t}.outcome`]: 'ringing' },
+      ...(entry.answeredBy ? { $unset: unset } : {}),
+      $push: { flow: `transfer${t}:${done}:${dialStatus || 'none'}` },
+    });
+    const fresh = await CallLog.findById(log._id).select('+customerPhone');
+    return sendXml(res, await serveTransferFrom(fresh, t, TRANSFER_STEPS.indexOf(done) + 1));
+  } catch (err) {
+    // Never leave the customer in silence: say sorry, and log it.
+    console.error(`[calls] transfer-answer failed log=${logId || '-'}:`, err?.message || err);
+    if (logId) CallLog.updateOne({ _id: logId }, { $push: { flow: 'transfer:error→sorry_message' } }).catch(() => {});
+    return sendXml(res, plivo.speakXml(SORRY_MESSAGE));
+  }
+};
+
+
+// ── Transfer of a call answered on a phone ─────────────────────────────────
+// Ring mode "My phone": the call is answered on the native dialer, not in
+// the CRM. The phone Dial's callbackUrl tells us live who picked up (and
+// when that phone hangs up); the CRM polls GET /my-live and shows the call
+// with Transfer, which is the same transfer as in the app.
+
+// The person who has the call now answered it on their own phone (nobody
+// has taken it as a transfer since).
+function heldOnPhone(log) {
+  if (log?.answeredIn !== 'phone' || !log.agentUser) return false;
+  return String(transferHolder(log)) === String(log.agentUser)
+    && !(log.transfers || []).some((t) => t?.answeredBy && TRANSFER_ANSWERED.includes(t.outcome));
+}
+
+// Plivo drops the phone leg itself when it moves the customer; this is the
+// backstop if it is still on after this long (as the app hangs up its own
+// leg after 5s).
+const PHONE_LEG_DROP_MS = 5 * 1000;
+exports.PHONE_LEG_DROP_MS = PHONE_LEG_DROP_MS;
+
+async function dropAnsweredPhoneLeg(logId) {
+  const log = await CallLog.findById(logId).select('answeredLegId answeredLegEndedAt').lean();
+  if (!log?.answeredLegId || log.answeredLegEndedAt) return false;
+  // Only that one phone leg — never the customer's, never a transfer leg.
+  // Already gone (404) is fine: hangupLegs says nothing about it.
+  const done = await hangupLegs([log.answeredLegId], `phone still on after transfer log=${logId}`);
+  if (done.length) {
+    await CallLog.updateOne({ _id: logId, answeredLegEndedAt: null }, { $set: { answeredLegEndedAt: new Date() }, $push: { flow: 'phone:dropped_after_transfer' } });
+  }
+  return done.length > 0;
+}
+exports.dropAnsweredPhoneLeg = dropAnsweredPhoneLeg;
+
+// ============================================================
+// @route   POST /api/calls/dial-event?log=<id>&stage=phone
+// @desc    The phone Dial's callbackUrl: a phone picked up
+//          (DialAction=answer) or hung up (DialAction=hangup). On answer,
+//          the on-duty person whose ring phone it is has the call — as the
+//          Dial's end report would say, but now, while it lasts. First
+//          answer wins; an answer already recorded is never replaced.
+//          Nothing here changes what the caller hears.
+// @access  Plivo (signature)
+// ============================================================
+exports.dialEvent = async (req, res, next) => {
+  try {
+    const b = plivoParams(req);
+    const logId = logIdOf(req);
+    const action = String(b.DialAction || '').toLowerCase();
+    const legId = b.DialBLegUUID ? String(b.DialBLegUUID) : null;
+    if (!logId || req.query.stage !== 'phone') return sendXml(res, plivo.emptyXml());
+
+    if (action === 'answer' || action === 'connected') {
+      const log = await CallLog.findById(logId).select('direction context agentUser answeredAt answeredLegId endedAt');
+      if (!log || log.direction !== 'inbound' || log.endedAt) return sendXml(res, plivo.emptyXml());
+      // 'connected' follows 'answer' for the same leg: recorded once.
+      if (log.answeredLegId) return sendXml(res, plivo.emptyXml());
+      const who = b.DialBLegTo ? await whoseRingPhone(b.DialBLegTo) : null;
+      const now = new Date();
+      const set = { answeredIn: 'phone', ...(legId ? { answeredLegId: legId } : {}) };
+      let r;
+      if (who) {
+        r = await CallLog.updateOne(
+          { _id: log._id, agentUser: { $exists: false }, answeredLegId: { $exists: false } },
+          { $set: { ...set, agentUser: who._id, agentName: who.name, agentType: 'staff', answeredAt: now }, $push: { flow: 'phone:answered(live)' } },
+        );
+      } else {
+        // A phone that is nobody's on-duty ring phone (PLIVO_FALLBACK_AGENTS):
+        // the call is shown to nobody, but its answer time is still right.
+        r = await CallLog.updateOne(
+          { _id: log._id, agentUser: { $exists: false }, answeredLegId: { $exists: false } },
+          { $set: { ...set, ...(log.answeredAt ? {} : { answeredAt: now }) }, $push: { flow: 'phone:answered(live, not a ring phone)' } },
+        );
+      }
+      serverTrail('server:phone_answered', { logId: String(log._id), user: who ? String(who._id) : null, recorded: r?.modifiedCount > 0 });
+      return sendXml(res, plivo.emptyXml());
+    }
+
+    if (action === 'hangup' && legId) {
+      // Only the phone that had the call; another phone's leg ending (it
+      // rang and stopped) is not recorded.
+      const r = await CallLog.updateOne(
+        { _id: logId, answeredLegId: legId, answeredLegEndedAt: null },
+        { $set: { answeredLegEndedAt: new Date() }, $push: { flow: 'phone:hung_up(live)' } },
+      );
+      if (r?.modifiedCount > 0) serverTrail('server:phone_hung_up', { logId });
+    }
+    return sendXml(res, plivo.emptyXml());
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   GET /api/calls/my-live
+// @desc    The incoming call the signed-in user answered on their own
+//          phone and is still on, if any — masked, as GET /:id — with
+//          whether they can transfer it now. call: null when there is none.
+//          Polled by the CRM every few seconds.
+// @access  Private [owner, telecaller]
+// ============================================================
+exports.myLiveCall = async (req, res, next) => {
+  try {
+    const log = await CallLog.findOne({
+      // createdAt is indexed: only calls young enough to still be live.
+      createdAt         : { $gte: new Date(Date.now() - MAX_LIVE_MS) },
+      direction         : 'inbound',
+      context           : 'incoming',
+      agentUser         : req.user._id,
+      answeredIn        : 'phone',
+      endedAt           : null,
+      answeredLegEndedAt: null,
+    })
+      .sort({ createdAt: -1 })
+      .select('+customerPhone') // for toJSON: masked, or in full for a CRM owner
+      .populate('trip', 'tripNumber patientName status')
+      .populate('lead', 'patientName');
+    // Taken by a colleague as a transfer: no longer this user's call.
+    if (!log || !heldOnPhone(log)) return res.json({ success: true, call: null });
+    const transfers = log.transfers || [];
+    const ringing = transfers.some((t) => t?.outcome === 'ringing');
+    const last = transfers[transfers.length - 1];
+    return res.json({
+      success: true,
+      call: {
+        id          : log._id,
+        answeredAt  : log.answeredAt,
+        transferring: ringing,
+        canTransfer : !ringing,
+        // The last attempt that left the caller with this user, if any.
+        lastTransferFailed: last?.outcome === 'failed' ? true : undefined,
+        log,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+// Plivo's live call ids, cached briefly — the Call Logs page polls every 30s.
+// At most one Plivo request per 20s across all open CRMs: concurrent
+// requests share one lookup, and a failure is remembered for the same 20s
+// (it then flags nothing).
+const LIVE_IDS_TTL_MS = 20 * 1000;
+let liveIdsCache = { at: 0, ids: null, error: null, inFlight: null };
+async function liveCallIds() {
+  const fresh = Date.now() - liveIdsCache.at < LIVE_IDS_TTL_MS;
+  if (fresh && liveIdsCache.error) throw liveIdsCache.error;
+  if (fresh && liveIdsCache.ids) return liveIdsCache.ids;
+  if (!liveIdsCache.inFlight) {
+    liveIdsCache.inFlight = plivo.listLiveCallIds()
+      .then((ids) => { liveIdsCache = { at: Date.now(), ids: new Set(ids), error: null, inFlight: null }; return liveIdsCache.ids; })
+      .catch((err) => { liveIdsCache = { at: Date.now(), ids: null, error: err, inFlight: null }; throw err; });
+  }
+  return liveIdsCache.inFlight;
+}
+exports._resetLiveIdsCache = () => { liveIdsCache = { at: 0, ids: null, error: null, inFlight: null }; };
+
+// For calls still marked active, older than a few minutes, with a Plivo id:
+// flag those Plivo no longer has live (doc.$locals, read by toJSON). If
+// Plivo can't be asked, nothing is flagged.
+async function markNotLiveOnPlivo(logs) {
+  const now = Date.now();
+  const candidates = (logs || []).filter((l) => {
+    const state = liveStateOf(l, { now })?.state;
+    return l.providerCallId && (state === 'active' || state === 'in_call')
+      && now - new Date(l.startedAt || l.createdAt || now).getTime() > PLIVO_CHECK_AFTER_MS;
+  });
+  if (!candidates.length || !plivo.isConfigured()) return;
+  try {
+    const live = await liveCallIds();
+    for (const l of candidates) {
+      if (!live.has(l.providerCallId)) {
+        l.$locals = l.$locals || {};
+        l.$locals.notLiveOnPlivo = true;
+      }
+    }
+  } catch (err) {
+    console.warn(`[calls] could not read Plivo live calls for status check (status ${plivoErrorDetail(err).status ?? '-'})`);
+  }
+}
+exports.markNotLiveOnPlivo = markNotLiveOnPlivo;
 
 
 // ============================================================
@@ -910,7 +1513,8 @@ exports.listLogs = async (req, res, next) => {
       if (req.user.role !== 'owner' && agent !== String(req.user._id)) {
         return res.status(403).json({ success: false, message: 'You can filter by your own calls only.' });
       }
-      filter.agentUser = agent;
+      // Or took it as a transfer.
+      filter.$or = [{ agentUser: agent }, { 'transfers.answeredBy': new mongoose.Types.ObjectId(agent) }];
     }
 
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
@@ -920,6 +1524,11 @@ exports.listLogs = async (req, res, next) => {
       .limit(limit)
       .populate('trip', 'tripNumber patientName')
       .populate('lead', 'patientName');
+
+    // A call still marked active that Plivo no longer has live has ended
+    // without its final report: shown as "Status unconfirmed" (read only —
+    // nothing is written back).
+    await markNotLiveOnPlivo(logs);
 
     return res.json({ success: true, logs });
   } catch (err) {
@@ -957,7 +1566,7 @@ exports.performance = async (req, res, next) => {
 
     const [calls, staff] = await Promise.all([
       CallLog.find({ startedAt: { $gte: from, $lt: to }, context: { $ne: 'test_ring' } })
-        .select('direction status agentUser startedAt answeredAt').lean(),
+        .select('direction status agentUser transfers startedAt answeredAt endedAt createdAt').lean(),
       isOwner
         ? User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true }).select('name role').lean()
         : Promise.resolve([{ _id: req.user._id, name: req.user.name, role: req.user.role }]),
@@ -967,7 +1576,7 @@ exports.performance = async (req, res, next) => {
       user: u._id, name: u.name, role: u.role,
       answered: 0, answerSecTotal: 0, answerSecCount: 0, placed: 0, connected: 0,
     }]));
-    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0 };
+    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0, unconfirmed: 0 };
 
     for (const c of calls || []) {
       const row = c.agentUser ? rows.get(String(c.agentUser)) : null;
@@ -983,8 +1592,23 @@ exports.performance = async (req, res, next) => {
               if (sec >= 0 && sec < 600) { row.answerSecTotal += sec; row.answerSecCount += 1; }
             }
           }
+          // Each person who took it as a transfer is credited too — once per
+          // call, however many times it came back to them. The team counts
+          // the call once. A transfer ring nobody picked up counts against
+          // nobody.
+          const credited = new Set(row ? [String(c.agentUser)] : []);
+          for (const t of c.transfers || []) {
+            const by = t?.answeredBy ? String(t.answeredBy) : null;
+            if (!by || !TRANSFER_ANSWERED.includes(t.outcome) || credited.has(by)) continue;
+            credited.add(by);
+            const tRow = rows.get(by);
+            if (tRow) tRow.answered += 1;
+          }
         } else if (MISSED_STATUSES.includes(c.status)) {
           team.missed += 1;
+        } else if (liveStateOf(c)?.state === 'unconfirmed') {
+          // Ended, but its outcome never arrived — neither answered nor missed.
+          team.unconfirmed += 1;
         } else {
           team.inProgress += 1;
         }
@@ -1035,7 +1659,16 @@ exports.streamRecording = async (req, res, next) => {
     if (!isObjectId(String(req.params.id))) {
       return res.status(404).json({ success: false, message: 'Recording not found.' });
     }
-    const log = await CallLog.findById(req.params.id).select('recordingUrl recordingSec status talkSec');
+    const found = await CallLog.findById(req.params.id).select('recordingUrl recordingSec status talkSec recordings');
+    // ?part=<n>: the part recorded after transfer n. Without it: the call's
+    // first part, as before.
+    let log = found;
+    if (found && req.query?.part != null) {
+      const part = /^\d{1,2}$/.test(String(req.query.part)) ? Number(req.query.part) : NaN;
+      const rec = (found.recordings || []).find((r) => Number(r?.part) === part);
+      if (!rec?.url) return res.status(404).json({ success: false, reason: 'none', message: 'This part of the call has no recording.' });
+      log = { _id: found._id, status: found.status, recordingUrl: rec.url, recordingSec: rec.sec, talkSec: rec.sec };
+    }
     // Recording starts only when someone answers (<Record startOnDialAnswer>),
     // so an unanswered call has nothing to fetch — even if Plivo posted a URL.
     const answered = log?.status === 'completed' || Number(log?.talkSec) > 0 || Number(log?.recordingSec) > 0;
@@ -1821,11 +2454,11 @@ exports.testAnswer = async (req, res, next) => {
     const logId = logIdOf(req);
     const log = logId ? await CallLog.findById(logId) : null;
     if (log?.context === 'test_ring') {
-      log.status = 'completed';
       log.answeredAt = new Date();
       if (plivoParams(req).CallUUID) log.providerCallId = plivoParams(req).CallUUID;
       log.flow = [...(log.flow || []), 'test_ring:answered'];
       await log.save();
+      await setStatusIf(log, 'completed', { $ne: 'completed' });
     }
     return sendXml(res, plivo.speakXml(TEST_RING_MESSAGE));
   } catch (err) {
@@ -1843,6 +2476,24 @@ exports.testAnswer = async (req, res, next) => {
 exports.markAnswered = async (req, res, next) => {
   try {
     if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    // Answering a transferred call: the transfer that is ringing records who
+    // took it (first answer wins). The call's original agent is unchanged.
+    const current = await CallLog.findById(req.params.id, 'direction transfers');
+    const t = current?.direction === 'inbound' ? (current.transfers || []).findIndex((x) => x?.outcome === 'ringing') : -1;
+    if (t >= 0) {
+      const step = current.transfers[t].step;
+      const r = await CallLog.updateOne(
+        { _id: req.params.id, [`transfers.${t}.outcome`]: 'ringing' },
+        { $set: {
+          [`transfers.${t}.outcome`]       : String(step || '').startsWith('back_') ? 'rang_back' : 'answered',
+          [`transfers.${t}.answeredBy`]    : req.user._id,
+          [`transfers.${t}.answeredByName`]: req.user.name,
+          [`transfers.${t}.answeredAt`]    : new Date(),
+          [`transfers.${t}.answeredIn`]    : 'app',
+        } },
+      );
+      return res.json({ success: true, claimed: r?.modifiedCount > 0, transfer: t });
+    }
     const updated = await CallLog.findOneAndUpdate(
       // First answer wins, matching Plivo: a later claim changes nothing.
       { _id: req.params.id, direction: 'inbound', agentUser: { $exists: false } },

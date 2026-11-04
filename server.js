@@ -49,6 +49,7 @@ mongoose.connect(process.env.MONGO_URI)
 
 const authRoutes     = require('./routes/auth');
 const billingRoutes  = require('./routes/billing');
+const invoicingRoutes = require('./routes/invoicing');
 const tripRoutes     = require('./routes/trips');
 const hospitalRoutes = require('./routes/hospitals');
 const leadsRoutes    = require('./routes/leads');
@@ -72,6 +73,7 @@ const whatsappRoutes = require('./routes/whatsappRoutes');
 const whatsappLeadRoutes = require('./routes/whatsappLeads');
 app.use('/api/auth',      authRoutes);
 app.use('/api/billing',   billingRoutes);
+app.use('/api/invoicing', invoicingRoutes); // GST invoicing (owner only)
 app.use('/api/trips',     tripRoutes);
 app.use('/api/hospitals', hospitalRoutes);
 app.use('/api/leads',     leadsRoutes);
@@ -100,6 +102,7 @@ app.use('/api/seo',       require('./routes/seo'));       // owner-only
 app.use('/api/guides',    require('./routes/seoPublic'));  // public, approved articles only
 app.use('/api/quotes',    require('./routes/quotes'));     // owner + token-keyed public quote page
 app.use('/api/calls',     require('./routes/calls'));      // Plivo masked calling (Exotel stays at /api/call)
+app.use('/api/callbacks', require('./routes/callbacks'));  // missed-call callback queue (operations staff)
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });

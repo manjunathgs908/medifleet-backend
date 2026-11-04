@@ -69,6 +69,7 @@ const EDITABLE_USER_FIELDS = [
   'shiftType', 'driverType', 'shiftHours',
   'postingName', 'postingLat', 'postingLng',
   'baseSalary', 'perTripBonus',
+  'speaksEnglish',
 ];
 
 // PUT /api/auth/users/:id — edit user (name, salary config, etc.)

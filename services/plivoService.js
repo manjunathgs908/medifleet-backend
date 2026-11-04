@@ -391,6 +391,48 @@ const speakXml = (text) => xml(`<Speak language="en-IN">${esc(text)}</Speak><Han
 const hangupXml = () => xml('<Hangup/>');
 const emptyXml = () => xml('');
 
+// ── AI telecaller (PILOT — services/aiCaller) ───────────────────────────
+// Rings an allowlisted test number from the company number. Only the
+// AiCall id travels in the URLs. timeLimit is Plivo's own hard cap on the
+// call, a second guard behind the session's timer.
+async function callAiLeg({ phone, callId, timeLimit }) {
+  const res = await getClient().calls.create(
+    companyNumber(),
+    toE164(phone),
+    apiUrl(`/api/ai-caller/plivo/answer?call=${callId}`),
+    {
+      answerMethod: 'POST',
+      hangupUrl   : apiUrl(`/api/ai-caller/plivo/hangup?call=${callId}`),
+      hangupMethod: 'POST',
+      ringTimeout : 30,
+      timeLimit,
+    },
+  );
+  return { requestId: res.requestUuid || res.request_uuid || null };
+}
+
+// The answered AI call: record the whole session in the background, then a
+// two-way audio stream (8 kHz mu-law, Plivo's phone format — passed to
+// OpenAI Realtime as-is, no transcoding) to our websocket. keepCallAlive:
+// the call lives as long as the stream does.
+function aiStreamXml({ streamUrl, recordUrl, maxSeconds }) {
+  return xml(
+    `<Record recordSession="true" redirect="false" maxLength="${maxSeconds}" fileFormat="mp3" playBeep="false" callbackUrl="${esc(recordUrl)}" callbackMethod="POST"/>`
+    + `<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" streamTimeout="${maxSeconds}">${esc(streamUrl)}</Stream>`,
+  );
+}
+
+// Hand an AI call to people: say a line, then ring the on-duty phones; the
+// Dial's action reports whether anyone answered.
+function aiHandoffXml({ numbers = [], actionUrl, say }) {
+  return xml(
+    (say ? `<Speak language="en-IN">${esc(say)}</Speak>` : '')
+    + `<Dial callerId="${esc(companyNumber())}" action="${esc(actionUrl)}" method="POST" redirect="true" timeout="${TRANSFER_RING_SECONDS}" timeLimit="3600">`
+    + numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
+    + '</Dial>',
+  );
+}
+
 module.exports = {
   isConfigured, companyNumber, toE164, apiUrl,
   callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
@@ -398,5 +440,6 @@ module.exports = {
   getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, listLiveCallIds, hangupCall, deleteEndpoint,
   APP_RING_SECONDS, PHONE_RING_SECONDS, TRANSFER_RING_SECONDS,
   bridgeXml, transferXml, transferCall, speakXml, hangupXml, emptyXml,
+  callAiLeg, aiStreamXml, aiHandoffXml,
   PUBLIC_API_BASE,
 };

@@ -3,8 +3,11 @@
 const express = require('express');
 const router = express.Router();
 const { askAstra } = require('../services/openaiService');
+const { protect, authorize } = require('../middleware/auth');
 
-router.get('/test', async (req, res) => {
+// Owner-only OpenAI connection check (costs one small request). Mounted at
+// /api/ai/test.
+router.get('/test', protect, authorize('owner'), async (req, res) => {
   try {
     const answer = await askAstra(
       'Reply with exactly: SaveLife GPT connection successful.'

@@ -31,7 +31,8 @@
     "openai": "^6.49.0",
     "plivo": "^4.79.0",
     "razorpay": "^2.9.8",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "eslint": "^8.54.0",

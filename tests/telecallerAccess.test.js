@@ -53,6 +53,7 @@ const MOUNTS = {
   '/api/callbacks'       : '../routes/callbacks',
   '/api/push'            : '../routes/push',
   '/api/alerts'          : '../routes/alerts',
+  '/api/ai'              : '../routes/aiChat',
 };
 
 // Every route's own handler -> 200, keeping all the guards in front of it.
@@ -100,6 +101,7 @@ const ALLOWED = {
                       ['GET', '/api/quotes'], ['POST', '/api/quotes'], ['GET', '/api/hospitals'], ['GET', '/api/billing/issuer']],
   Trips            : [['GET', '/api/trips']],
   'Booking push'   : [['GET', '/api/push/public-key'], ['POST', '/api/push/subscribe'], ['POST', '/api/push/unsubscribe']],
+  'SaveLife AI chat': [['POST', '/api/ai/chat']],
   'Incoming alerts': [['PUT', `/api/alerts/wa_lead/${ID}/acknowledge`], ['PUT', `/api/alerts/wa_chat/${ID}/acknowledge`]],
   'Trip Alerts'    : [['GET', '/api/trip-call-events?type=NO_RESPONSE']],
   'Posting Alerts' : [['GET', '/api/geofence-events']],

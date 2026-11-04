@@ -658,7 +658,10 @@ const tripSchema = new Schema(
     // Drives whether outbound WhatsApp lifecycle notifications fire (see
     // services/whatsappNotifications.js): only 'whatsapp'-origin trips get
     // them, since app/CRM customers may not be on WhatsApp at all.
-    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web'], default: 'app' },
+    // 'ai_telecaller': booked by the outbound AI telecaller pilot
+    // (services/aiCaller) — no bookedBy, so it rings the CRM like any
+    // customer booking and a person dispatches it.
+    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web', 'ai_telecaller'], default: 'app' },
 
     // Set once at booking time from the customer's WhatsAppSession.language
     // and read back for every notification after -- the session itself is

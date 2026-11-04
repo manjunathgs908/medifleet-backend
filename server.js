@@ -105,6 +105,9 @@ app.use('/api/calls',     require('./routes/calls'));      // Plivo masked calli
 app.use('/api/callbacks', require('./routes/callbacks'));  // missed-call callback queue (operations staff)
 app.use('/api/push',      require('./routes/push'));       // CRM Web Push subscriptions (operations staff)
 app.use('/api/alerts',    require('./routes/alerts'));     // acknowledge WhatsApp lead/chat alerts (operations staff)
+app.use('/api/ai',        require('./routes/aiChat'));     // SaveLife AI chat (operations staff, rate-limited)
+app.use('/api/ai',        require('./routes/aiTest'));     // OpenAI connection check (owner)
+app.use('/api/ai-caller', require('./routes/aiCaller'));   // AI telecaller PILOT (owner + Plivo-signed webhooks)
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });
@@ -113,10 +116,12 @@ app.get('/', (req, res) => {
 app.use(require('./middleware/errorHandler'));
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`==================================================`);
     console.log(`🚀 MEDIFLEET BACKEND RUNNING SUCCESSFULLY ON PORT: ${PORT}`);
     console.log(`==================================================`);
 });
 
-app.use('/api/ai', require('./routes/aiChat'));
+// AI telecaller PILOT: Plivo's audio-stream websocket (/api/ai-caller/stream
+// only; every other upgrade request is left alone, as before).
+require('./services/aiCaller/streamServer').attach(server);

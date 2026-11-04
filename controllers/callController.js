@@ -290,6 +290,7 @@ exports.releaseLegs = releaseLegs;
 const loadOnDuty = () => User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true, callDuty: true })
   .select('name role phone callPhone callMode speaksEnglish appOnlineAt +plivoEndpointUsername +plivoEndpointId')
   .limit(MAX_INCOMING_AGENTS).lean();
+exports.loadOnDuty = loadOnDuty; // also the AI telecaller's human handoff
 
 // The on-duty owner/telecaller whose ring phone is this number, if any.
 async function whoseRingPhone(raw) {

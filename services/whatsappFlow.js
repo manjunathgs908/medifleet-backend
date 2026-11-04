@@ -935,4 +935,7 @@ async function handleMessage(message) {
   }
 }
 
-module.exports = { handleMessage, FUNNEL_STEPS, TERMINAL_STEP, STEP_LABELS };
+// resolvePlaceFromText: also the AI telecaller's address lookup
+// (services/aiCaller/tools.js) — same Bengaluru bias, same "never pick one
+// of several matches silently" rule.
+module.exports = { handleMessage, FUNNEL_STEPS, TERMINAL_STEP, STEP_LABELS, resolvePlaceFromText };

@@ -44,7 +44,9 @@ const CallbackTaskSchema = new mongoose.Schema(
     state : { type: String, enum: ['open', 'resolved', 'withdrawn'], default: 'open', index: true },
     // missed_call: queued automatically. not_routed: added by a person from
     // the "Not routed by CRM" list.
-    source: { type: String, enum: ['missed_call', 'not_routed'], default: 'missed_call' },
+    // ai_call: queued by the AI telecaller pilot when its call could not
+    // finish the job (services/aiCaller/calls.js queueFollowUp).
+    source: { type: String, enum: ['missed_call', 'not_routed', 'ai_call'], default: 'missed_call' },
 
     calls: [{
       _id   : false,

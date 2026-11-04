@@ -18,11 +18,14 @@ function getOpenAIClient() {
   return openaiClient;
 }
 
-async function askAstra(prompt) {
+// instructions (optional): the system rules, sent separately from `input`
+// so text a customer typed is never read as part of the rules.
+async function askAstra(prompt, { instructions } = {}) {
   const openai = getOpenAIClient();
 
   const response = await openai.responses.create({
     model: 'gpt-6-astra',
+    ...(instructions ? { instructions } : {}),
     input: prompt,
     reasoning: {
       effort: 'low',

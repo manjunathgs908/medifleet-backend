@@ -35,6 +35,24 @@ async function askAstra(prompt, { instructions } = {}) {
   return response.output_text;
 }
 
+// Strict-JSON answer: the reply must match `schema` (OpenAI structured
+// outputs, strict), parsed here. The rules go in `instructions`, the data
+// (a call transcript) in `input`, so the data is never read as rules.
+async function extractJson({ instructions, input, schema, name = 'extraction', model = 'gpt-6-astra' }) {
+  const openai = getOpenAIClient();
+
+  const response = await openai.responses.create({
+    model,
+    instructions,
+    input,
+    reasoning: { effort: 'low' },
+    text: { format: { type: 'json_schema', name, schema, strict: true } },
+  });
+
+  return JSON.parse(response.output_text);
+}
+
 module.exports = {
   askAstra,
+  extractJson,
 };

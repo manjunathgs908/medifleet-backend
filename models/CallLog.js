@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const { maskPhone } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
 const { fullPhone } = require('../utils/phoneViewer');
+const { maskNumbersInText } = require('../utils/maskNumbersInText');
 
 // One masked, recorded phone call through Plivo (or the Exotel fallback):
 // an agent -- a driver, a fleet owner, or CRM staff -- and a customer.
@@ -45,6 +46,14 @@ const CallLogSchema = new mongoose.Schema(
     lead        : { type: mongoose.Schema.Types.ObjectId, ref: 'Lead', index: true },
     quote       : { type: mongoose.Schema.Types.ObjectId, ref: 'Quote' },
     whatsappLead: { type: mongoose.Schema.Types.ObjectId, ref: 'WhatsAppLead' },
+
+    // LIVE CALL CAPTURE (services/callCapture): the draft booking the
+    // listen-only transcriber filled while this call was going, and — once
+    // the call ended — its full transcript and a short summary. 10-digit
+    // numbers in them go out masked except to the CRM owner.
+    callCapture: { type: mongoose.Schema.Types.ObjectId, ref: 'CallCapture' },
+    transcript : [{ _id: false, role: { type: String, enum: ['customer', 'operator'] }, text: String, at: Date }],
+    summary    : { type: String },
 
     // initiated -> agent_answered -> completed, or one of the failures.
     // Inbound: ringing -> completed / missed / no_agents.
@@ -154,6 +163,8 @@ CallLogSchema.set('toJSON', {
     }
     delete ret.agentPhone;
     delete ret.dialledPhones;
+    if (Array.isArray(ret.transcript)) ret.transcript = ret.transcript.map((t) => ({ ...t, text: maskNumbersInText(t.text) }));
+    if (ret.summary) ret.summary = maskNumbersInText(ret.summary);
     ret.phoneVerdict = phoneLegVerdict(ret.phoneLeg, ret.overlap);
     // Display-only (see liveStateOf); `status` itself is never rewritten.
     const live = liveStateOf(ret, { notLiveOnPlivo: !!doc.$locals?.notLiveOnPlivo });

@@ -1344,6 +1344,18 @@ exports.dropAnsweredPhoneLeg = dropAnsweredPhoneLeg;
 //          Nothing here changes what the caller hears.
 // @access  Plivo (signature)
 // ============================================================
+// LIVE CALL CAPTURE (services/callCapture): fire-and-forget once an
+// operator has the call. It checks for itself that capture is switched on
+// and that this is a customer's call; any failure stays inside it.
+function startCallCapture(logId, agentUser) {
+  try {
+    require('../services/callCapture/session').startForCall(logId, { agentUser })
+      .catch((err) => console.error('[callCapture] start failed:', err.message));
+  } catch (err) {
+    console.error('[callCapture] start failed:', err.message);
+  }
+}
+
 exports.dialEvent = async (req, res, next) => {
   try {
     const b = plivoParams(req);
@@ -1375,6 +1387,7 @@ exports.dialEvent = async (req, res, next) => {
         );
       }
       serverTrail('server:phone_answered', { logId: String(log._id), user: who ? String(who._id) : null, recorded: r?.modifiedCount > 0 });
+      if (r?.modifiedCount > 0) startCallCapture(log._id, who?._id);
       return sendXml(res, plivo.emptyXml());
     }
 
@@ -2501,6 +2514,9 @@ exports.markAnswered = async (req, res, next) => {
       { $set: { agentUser: req.user._id, agentName: req.user.name, agentType: 'staff', answeredAt: new Date() } },
       { new: true },
     );
+    // Live call capture (listen-only) — after the answer is recorded, never
+    // awaited: whatever it does, this reply and the call are unaffected.
+    if (updated) startCallCapture(updated._id, req.user._id);
     return res.json({ success: true, claimed: !!updated });
   } catch (err) {
     next(err);

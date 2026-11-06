@@ -661,7 +661,10 @@ const tripSchema = new Schema(
     // 'ai_telecaller': booked by the outbound AI telecaller pilot
     // (services/aiCaller) — no bookedBy, so it rings the CRM like any
     // customer booking and a person dispatches it.
-    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web', 'ai_telecaller'], default: 'app' },
+    // 'ai_call_entry': typed by an operator from a LIVE CALL CAPTURE draft
+    // (services/callCapture) — the form the transcriber pre-filled, reviewed
+    // and booked by that person (bookedBy set, so it does not ring).
+    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web', 'ai_telecaller', 'ai_call_entry'], default: 'app' },
 
     // Set once at booking time from the customer's WhatsAppSession.language
     // and read back for every notification after -- the session itself is

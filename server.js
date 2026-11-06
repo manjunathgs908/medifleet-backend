@@ -108,6 +108,7 @@ app.use('/api/alerts',    require('./routes/alerts'));     // acknowledge WhatsA
 app.use('/api/ai',        require('./routes/aiChat'));     // SaveLife AI chat (operations staff, rate-limited)
 app.use('/api/ai',        require('./routes/aiTest'));     // OpenAI connection check (owner)
 app.use('/api/ai-caller', require('./routes/aiCaller'));   // AI telecaller PILOT (owner + Plivo-signed webhooks)
+app.use('/api/call-capture', require('./routes/callCapture')); // live call capture drafts (operations staff)
 
 app.get('/', (req, res) => {
     res.json({ message: 'MediFleet Backend API is running smoothly.' });
@@ -122,6 +123,7 @@ const server = app.listen(PORT, () => {
     console.log(`==================================================`);
 });
 
-// AI telecaller PILOT: Plivo's audio-stream websocket (/api/ai-caller/stream
-// only; every other upgrade request is left alone, as before).
+// Plivo's audio-stream websockets: the AI telecaller PILOT
+// (/api/ai-caller/stream) and live call capture (/api/call-capture/stream);
+// every other upgrade request is left alone, as before.
 require('./services/aiCaller/streamServer').attach(server);

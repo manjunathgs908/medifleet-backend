@@ -27,6 +27,7 @@ const BookingOtp = require('../models/BookingOtp');
 const incomingBookings = require('../services/incomingBookings');
 const incomingAlerts = require('../services/incomingAlerts');
 const bookingPush = require('../services/bookingPush');
+const callCaptureBooking = require('../services/callCapture/booking');
 const fareCalculator = require('../utils/fareCalculator');
 const { applyAdvancesToNewBill } = require('../services/payments');
 const smsService = require('../utils/smsService');
@@ -266,13 +267,26 @@ exports.estimateTrip = async (req, res, next) => {
 // @access  Private [owner]
 // ============================================================
 exports.createTrip = async (req, res, next) => {
+  let claimed = null;
   try {
-    const trip = await createBookedTrip(req.body, { bookedBy: req.user?._id });
+    // Booked by an operator from a LIVE CALL CAPTURE draft (optional
+    // callCaptureId, CRM staff only): the same booking, sourced
+    // 'ai_call_entry' and linked to the draft — once per draft.
+    let body = req.body;
+    if (req.body?.callCaptureId) {
+      const r = await callCaptureBooking.claim(req.body.callCaptureId, req.user);
+      if (!r.ok) return res.status(r.status).json({ success: false, message: r.message });
+      claimed = r.capture;
+      body = callCaptureBooking.withPhone(req.body, r.capture, r.callerPhone);
+    }
+    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, ...(claimed ? { bookingSource: 'ai_call_entry' } : {}) });
+    if (claimed) { await callCaptureBooking.link(claimed, trip); claimed = null; }
     // Background push to the CRM — fire-and-forget, never affects the
     // booking. Sends only if the trip is incoming (not an operator's own).
     bookingPush.notifyIncomingBooking(trip._id);
     return res.status(201).json({ success: true, trip });
   } catch (err) {
+    if (claimed) callCaptureBooking.release(claimed).catch(() => {});
     if (err.isFareError) return res.status(400).json({ success: false, message: err.message });
     next(err);
   }

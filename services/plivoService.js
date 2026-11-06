@@ -427,6 +427,22 @@ function aiStreamXml({ streamUrl, recordUrl, nextUrl, maxSeconds }) {
   );
 }
 
+// LIVE CALL CAPTURE: stream an answered call's audio to our websocket,
+// LISTEN-ONLY (bidirectional false — nothing can be played into the call).
+// Plivo's REST stream on a call already in progress, so the call's own XML
+// (the Record + Dial) is untouched. audio_track 'both' on the customer's
+// leg: 'inbound' = the customer, 'outbound' = what they hear (the operator).
+async function startStream({ callUuid, serviceUrl, audioTrack = 'inbound', contentType, streamTimeout }) {
+  const res = await plivoRest('post', `/Call/${encodeURIComponent(callUuid)}/Stream/`, {
+    service_url  : serviceUrl,
+    bidirectional: false,
+    audio_track  : audioTrack,
+    ...(contentType ? { content_type: contentType } : {}),
+    ...(streamTimeout ? { stream_timeout: streamTimeout } : {}),
+  });
+  return { streamId: res.data?.stream_id || null };
+}
+
 // Hand an AI call to people: say a line, then ring the on-duty phones; the
 // Dial's action reports whether anyone answered.
 function aiHandoffXml({ numbers = [], actionUrl, say }) {
@@ -446,5 +462,6 @@ module.exports = {
   APP_RING_SECONDS, PHONE_RING_SECONDS, TRANSFER_RING_SECONDS,
   bridgeXml, transferXml, transferCall, speakXml, hangupXml, emptyXml,
   callAiLeg, aiStreamXml, aiHandoffXml,
+  startStream,
   PUBLIC_API_BASE,
 };

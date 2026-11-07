@@ -245,6 +245,46 @@ async function quoteTrip({ pickupLat, pickupLng, dropLat, dropLng, selectedType,
 }
 exports.quoteTrip = quoteTrip;
 
+// The waiting charge for a PLANNED wait, for a quote (the AI telecaller's
+// "up and down, wait 2 hours"). Not a new rule: the same Pricing fields and
+// the same computeSegmentAmount (models/index.js) that completeTrip bills
+// the drop wait with —
+//   round trip: returnDropFreeWaitMinutes free, then
+//               returnDropWaitTier1PerMin for returnDropWaitTier1Minutes,
+//               then returnDropWaitTier2PerMin;
+//   one way   : dropFreeWaitMinutes free, then dropWaitPerMin.
+// Like completeTrip, no cap is applied (none is implemented yet). The real
+// charge is still billed from the event log at completion; this is only the
+// estimate read to the caller. Rupees, as the rest of the fare. null when
+// the service has no active Pricing.
+async function quoteWaitCharge({ selectedType, tripType, waitMinutes }) {
+  const doc = await fareCalculator.findPricingDoc(selectedType);
+  if (!doc) return null;
+  const segment = tripType === 'round_trip'
+    ? {
+        ratePerMin     : doc.returnDropWaitTier1PerMin ?? 0,
+        freeSeconds    : (doc.returnDropFreeWaitMinutes ?? 0) * 60,
+        tier1CapMinutes: doc.returnDropWaitTier1Minutes ?? 0,
+        tier2RatePerMin: doc.returnDropWaitTier2PerMin ?? 0,
+      }
+    : {
+        ratePerMin : doc.dropWaitPerMin ?? 0,
+        freeSeconds: (doc.dropFreeWaitMinutes ?? 0) * 60,
+      };
+  const minutes = Math.max(0, Math.round(Number(waitMinutes) || 0));
+  const { billableMinutes, amount } = computeSegmentAmount(segment, minutes * 60000);
+  return {
+    waitMinutes    : minutes,
+    freeMinutes    : Math.round(segment.freeSeconds / 60),
+    billableMinutes,
+    amount,
+    ratePerMin     : segment.ratePerMin,
+    tier1Minutes   : segment.tier1CapMinutes ?? null,
+    tier2RatePerMin: segment.tier2RatePerMin ?? null,
+  };
+}
+exports.quoteWaitCharge = quoteWaitCharge;
+
 exports.estimateTrip = async (req, res, next) => {
   try {
     const quote = await quoteTrip(req.body);

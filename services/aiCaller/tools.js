@@ -31,7 +31,7 @@
  */
 const catalog = require('../whatsappServiceCatalog');
 const { resolvePlaceFromText } = require('../whatsappFlow');
-const { quoteTrip, createBookedTrip } = require('../../controllers/tripController');
+const { quoteTrip, quoteWaitCharge, createBookedTrip } = require('../../controllers/tripController');
 const bookingPush = require('../bookingPush');
 const AiCall = require('../../models/AiCall');
 const { isPastIst } = require('./prompt');
@@ -68,6 +68,8 @@ function definitions() {
           use_shared_location  : { type: 'boolean', description: 'true to use the pickup location the caller shared on WhatsApp (after send_location_request).' },
           drop_nearest_hospital: { type: 'boolean', description: 'true when the caller wants the nearest / any nearby hospital — no name needed.' },
           helper_needed        : { type: 'boolean', description: 'true if the caller wants a helper to lift or carry the patient.' },
+          round_trip           : { type: 'boolean', description: 'true for a return / round trip ("up and down", "ಅಪ್ ಅಂಡ್ ಡೌನ್", "ಹೋಗಿ-ಬರೋದು"), or whenever the ambulance must wait and bring them back.' },
+          wait_hours           : { type: 'number', description: 'Round trip only: how long the ambulance waits at the drop before coming back, in hours (e.g. 1.5). 0 if no wait or not known.' },
         },
         required: ['service_code'],
       },
@@ -151,6 +153,8 @@ async function sharedPickup(callId) {
     : null;
 }
 
+const MAX_WAIT_HOURS = 24;
+
 const placeAddress = (place) => [place.name, place.address].filter(Boolean).join(', ');
 
 async function getQuote(args, ctx) {
@@ -160,6 +164,14 @@ async function getQuote(args, ctx) {
 
   const usesShared = args.use_shared_location === true;
   const nearest = args.drop_nearest_hospital === true;
+  const roundTrip = args.round_trip === true;
+  const waitHours = args.wait_hours == null ? 0 : Number(args.wait_hours);
+  if (!Number.isFinite(waitHours) || waitHours < 0 || waitHours > MAX_WAIT_HOURS) {
+    return { ok: false, reason: 'bad_wait', say: `Ask how many hours the ambulance should wait (0 to ${MAX_WAIT_HOURS}).` };
+  }
+  if (waitHours > 0 && !roundTrip) {
+    return { ok: false, reason: 'wait_needs_round_trip', say: 'Waiting means the ambulance waits and brings them back: confirm it is a round trip, then get_quote with round_trip true and wait_hours.' };
+  }
   if (!usesShared && !args.pickup && !Number.isInteger(args.pickup_choice)) {
     return { ok: false, reason: 'need_pickup', say: 'Ask the pickup area (or send the WhatsApp location request).' };
   }
@@ -204,14 +216,31 @@ async function getQuote(args, ctx) {
   const helper = args.helper_needed === true;
   const pickup = { address: placeAddress(p.place), lat: p.place.lat, lng: p.place.lng };
   const drop = { address: placeAddress(d.place), lat: d.place.lat, lng: d.place.lng };
+  // The app's own quote: round trip = the Pricing round-trip slabs (or
+  // one-way slabs at twice the distance), helper charged per leg —
+  // quoteTrip / fareCalculator.compute, exactly as the booking apps.
+  const tripType = roundTrip ? 'round_trip' : 'one_way';
   const quote = await quoteTrip({
     pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng,
-    selectedType: service.code, tripType: 'one_way', ...(helper ? { helperEnabled: true } : {}),
+    selectedType: service.code, tripType, ...(helper ? { helperEnabled: true } : {}),
   });
   if (!quote) return { ok: false, reason: 'no_route', say: 'Could not find a road route. Ask the caller to check the places, or hand off.' };
   if (!quote.fare) return { ok: false, reason: 'no_price', say: 'No price for this service right now. Offer a callback from the team (end_call follow_up).' };
 
-  ctx.state.quote = { service, pickup, drop, quote, helper };
+  // Waiting at the drop, from the Pricing wait fields (quoteWaitCharge).
+  let wait = null;
+  if (roundTrip) {
+    wait = await quoteWaitCharge({ selectedType: service.code, tripType, waitMinutes: waitHours * 60 });
+    if (!wait) return { ok: false, reason: 'no_price', say: 'No waiting price for this service right now. Offer a callback from the team (end_call follow_up).' };
+  }
+  const tripFare = quote.fare.grandTotal;
+  const waitCharge = wait ? wait.amount : 0;
+  const total = tripFare + waitCharge;
+
+  ctx.state.quote = { service, pickup, drop, quote, helper, tripType, waitHours: roundTrip ? waitHours : 0 };
+  const waitRule = wait
+    ? `first ${wait.freeMinutes} minutes of waiting free, then ₹${wait.ratePerMin}/min${wait.tier2RatePerMin != null ? ` for ${wait.tier1Minutes} minutes, then ₹${wait.tier2RatePerMin}/min` : ''}`
+    : '';
   return {
     ok: true,
     service    : service.label,
@@ -219,9 +248,18 @@ async function getQuote(args, ctx) {
     drop       : drop.address,
     ...(nearest ? { drop_is_nearest_hospital: true } : {}),
     helper,
+    trip_type  : tripType,
     distance_km: Math.round(quote.distanceKm * 10) / 10,
-    estimated_fare_rupees: quote.fare.grandTotal,
-    say: `This is an estimate; the final bill can differ (waiting time, extra distance).${nearest ? ' Tell the caller this is the nearest hospital found, by name; the team can change it.' : ''}`,
+    ...(roundTrip ? {
+      trip_fare_rupees      : tripFare,
+      wait_hours            : waitHours,
+      waiting_charge_rupees : waitCharge,
+      waiting_rule          : waitRule,
+    } : {}),
+    estimated_fare_rupees: total,
+    say: roundTrip
+      ? `Read back clearly: up-and-down fare ₹${tripFare}${waitHours ? ` + about ${waitHours} hour${waitHours === 1 ? '' : 's'} waiting ₹${waitCharge}` : ''} = total about ₹${total}. Waiting is billed by the actual minutes (${waitRule}). It is an estimate.${nearest ? ' Say this is the nearest hospital found, by name; the team can change it.' : ''}`
+      : `This is an estimate; the final bill can differ (waiting time, extra distance).${nearest ? ' Tell the caller this is the nearest hospital found, by name; the team can change it.' : ''}`,
   };
 }
 
@@ -237,7 +275,7 @@ async function createBooking(args, ctx) {
   if (args.when === 'later' && isPastIst(args.scheduled_time)) {
     return { ok: false, reason: 'past_time', say: 'That date and time has already passed. Check it with the caller using the DATE AND TIME list.' };
   }
-  const { service, pickup, drop, quote, helper } = ctx.state.quote;
+  const { service, pickup, drop, quote, helper, tripType = 'one_way', waitHours = 0 } = ctx.state.quote;
   // The fare read back was for this helper choice; a different one is a
   // different price.
   if (typeof args.helper_needed === 'boolean' && args.helper_needed !== helper) {
@@ -253,7 +291,9 @@ async function createBooking(args, ctx) {
     dist         : quote.oneWayKm,
     effectiveDist: quote.distanceKm,
     selectedType : service.code,
-    tripType     : 'one_way',
+    tripType,
+    // Same as the CRM form: a round trip returns to the pickup.
+    ...(tripType === 'round_trip' ? { returnAddress: pickup.address } : {}),
     ...(helper ? { helperEnabled: true } : {}),
     scheduleType : args.when === 'later' ? 'later' : 'now',
     scheduleDate : args.when === 'later' ? args.scheduled_time.replace(' ', 'T') : undefined,
@@ -265,6 +305,8 @@ async function createBooking(args, ctx) {
     ...(typeof args.oxygen_needed === 'boolean' ? { oxygen: args.oxygen_needed } : {}),
     helper,
     ...(['home', 'hospital', 'other'].includes(args.patient_at) ? { patientAt: args.patient_at } : {}),
+    // So dispatch knows the ambulance waits and comes back.
+    ...(tripType === 'round_trip' ? { roundTrip: true, waitHours } : {}),
   };
   await AiCall.updateOne({ _id: ctx.callId }, { $set: { trip: trip._id, outcome: 'booked', needs } });
   bookingPush.notifyIncomingBooking(trip._id); // rings the CRM — a person dispatches it

@@ -118,7 +118,7 @@ jest.mock('../services/whatsappFlow', () => ({
 }));
 jest.mock('../services/callCapture/session', () => ({ applySharedPickup: jest.fn(async () => true) }));
 jest.mock('../services/nearbyHospital', () => ({ nearestHospital: jest.fn() }));
-jest.mock('../controllers/tripController', () => ({ quoteTrip: jest.fn(), createBookedTrip: jest.fn() }));
+jest.mock('../controllers/tripController', () => ({ quoteTrip: jest.fn(), quoteWaitCharge: jest.fn(), createBookedTrip: jest.fn() }));
 jest.mock('../services/bookingPush', () => ({ notifyIncomingBooking: jest.fn() }));
 
 const express = require('express');
@@ -134,7 +134,7 @@ const whatsapp = require('../services/whatsappService');
 const captureSession = require('../services/callCapture/session');
 const { nearestHospital } = require('../services/nearbyHospital');
 const { resolvePlaceFromText } = require('../services/whatsappFlow');
-const { quoteTrip, createBookedTrip } = require('../controllers/tripController');
+const { quoteTrip, quoteWaitCharge, createBookedTrip } = require('../controllers/tripController');
 const prompt = require('../services/aiCaller/prompt');
 const session = require('../services/aiCaller/session');
 const tools = require('../services/aiCaller/tools');
@@ -334,6 +334,79 @@ describe('C. tools', () => {
     const r = await run('send_location_request', {}, ctx(call));
     expect(r).toMatchObject({ ok: true, status: 'sent' });
     expect(LocationRequest.store[0]).toMatchObject({ source: 'ai_caller', aiCall: call._id, phone: '9876543210', status: 'sent' });
+  });
+
+  describe('round trip and waiting — the existing pricing, quoted, never handed off', () => {
+    const quoteRT = async (c, args) => {
+      resolvePlaceFromText.mockResolvedValueOnce(single('Jayanagar', 1, 2)).mockResolvedValueOnce(single('NIMHANS', 3, 4));
+      return run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'NIMHANS', ...args }, c);
+    };
+
+    test('round trip: quoteTrip with tripType round_trip + the Pricing waiting charge; the total read back', async () => {
+      quoteTrip.mockResolvedValueOnce({ fare: { grandTotal: 2400 }, distanceKm: 16, oneWayKm: 8 });
+      quoteWaitCharge.mockResolvedValueOnce({ waitMinutes: 120, freeMinutes: 10, billableMinutes: 110, amount: 550, ratePerMin: 5, tier1Minutes: 120, tier2RatePerMin: 10 });
+      const c = ctx(AiCall.add({}));
+      const r = await quoteRT(c, { round_trip: true, wait_hours: 2 });
+      expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ selectedType: 'bls', tripType: 'round_trip' }));
+      expect(quoteWaitCharge).toHaveBeenCalledWith({ selectedType: 'bls', tripType: 'round_trip', waitMinutes: 120 });
+      expect(r).toMatchObject({
+        ok: true, trip_type: 'round_trip', trip_fare_rupees: 2400, wait_hours: 2, waiting_charge_rupees: 550, estimated_fare_rupees: 2950,
+        waiting_rule: 'first 10 minutes of waiting free, then ₹5/min for 120 minutes, then ₹10/min',
+      });
+      expect(r.say).toMatch(/up-and-down fare ₹2400 \+ about 2 hours waiting ₹550 = total about ₹2950/);
+    });
+
+    test('round trip with no wait: the round-trip fare, waiting rule still explained', async () => {
+      quoteTrip.mockResolvedValueOnce({ fare: { grandTotal: 2400 }, distanceKm: 16, oneWayKm: 8 });
+      quoteWaitCharge.mockResolvedValueOnce({ waitMinutes: 0, freeMinutes: 10, billableMinutes: 0, amount: 0, ratePerMin: 5, tier1Minutes: 120, tier2RatePerMin: 10 });
+      const r = await quoteRT(ctx(AiCall.add({})), { round_trip: true });
+      expect(r).toMatchObject({ ok: true, waiting_charge_rupees: 0, estimated_fare_rupees: 2400 });
+    });
+
+    test('booked as a round trip back to the pickup; dispatch sees the planned wait', async () => {
+      quoteTrip.mockResolvedValueOnce({ fare: { grandTotal: 2400 }, distanceKm: 16, oneWayKm: 8 });
+      quoteWaitCharge.mockResolvedValueOnce({ waitMinutes: 90, freeMinutes: 10, billableMinutes: 80, amount: 400, ratePerMin: 5, tier1Minutes: 120, tier2RatePerMin: 10 });
+      const call = AiCall.add({});
+      const c = ctx(call);
+      await quoteRT(c, { round_trip: true, wait_hours: 1.5 });
+      expect((await run('create_booking', { when: 'now', customer_confirmed: true }, c)).ok).toBe(true);
+      expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ tripType: 'round_trip', returnAddress: 'Jayanagar, Bengaluru', dist: 8, effectiveDist: 16 });
+      expect(call.needs).toMatchObject({ roundTrip: true, waitHours: 1.5 });
+    });
+
+    test('waiting asked without a round trip: confirm round trip first', async () => {
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', wait_hours: 2 }, ctx(AiCall.add({})));
+      expect(r).toMatchObject({ ok: false, reason: 'wait_needs_round_trip' });
+      expect(quoteTrip).not.toHaveBeenCalled();
+    });
+
+    test('a nonsense wait is asked again', async () => {
+      expect(await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', round_trip: true, wait_hours: -1 }, ctx(AiCall.add({})))).toMatchObject({ reason: 'bad_wait' });
+      expect(await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', round_trip: true, wait_hours: 99 }, ctx(AiCall.add({})))).toMatchObject({ reason: 'bad_wait' });
+    });
+
+    test('no waiting price for the service: a callback, never a guess', async () => {
+      quoteTrip.mockResolvedValueOnce({ fare: { grandTotal: 2400 }, distanceKm: 16, oneWayKm: 8 });
+      quoteWaitCharge.mockResolvedValueOnce(null);
+      expect(await quoteRT(ctx(AiCall.add({})), { round_trip: true, wait_hours: 1 })).toMatchObject({ ok: false, reason: 'no_price' });
+    });
+
+    test('one way is unchanged: no waiting lookup, same fields as before', async () => {
+      const r = await quoteRT(ctx(AiCall.add({})), {});
+      expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ tripType: 'one_way' }));
+      expect(quoteWaitCharge).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ ok: true, trip_type: 'one_way', estimated_fare_rupees: 1450 });
+      expect(r).not.toHaveProperty('waiting_charge_rupees');
+    });
+
+    test('the instructions: ask the waiting time, quote it, never hand off for it', () => {
+      expect(prompt.BASE_INSTRUCTIONS).toMatch(/"ಅಪ್ ಅಂಡ್ ಡೌನ್", "ಹೋಗಿ-ಬರೋದು"\) or say the ambulance must wait, ask how long it should wait/);
+      expect(prompt.BASE_INSTRUCTIONS).toMatch(/get_quote with round_trip true and wait_hours/);
+      expect(prompt.BASE_INSTRUCTIONS).toMatch(/never hand off or say you will check with the team for a round trip or waiting/);
+      expect(session.DELEGATE_INSTRUCTIONS).toMatch(/round_trip true and wait_hours — quote it, never hand off/);
+      const def = tools.definitions().find((d) => d.name === 'get_quote');
+      expect(Object.keys(def.parameters.properties)).toEqual(expect.arrayContaining(['round_trip', 'wait_hours']));
+    });
   });
 
   test('the tool definitions offer the new fields', () => {

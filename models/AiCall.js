@@ -47,6 +47,9 @@ const AiCallSchema = new mongoose.Schema(
       oxygen   : { type: Boolean },
       helper   : { type: Boolean },
       patientAt: { type: String, enum: ['home', 'hospital', 'other'] },
+      // Round trip: the ambulance waits (about waitHours) and brings them back.
+      roundTrip: { type: Boolean },
+      waitHours: { type: Number },
     },
     // A request the team prices and calls back about (not bookable here).
     request: {

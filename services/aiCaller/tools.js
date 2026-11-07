@@ -121,7 +121,7 @@ function definitions() {
     {
       type: 'function',
       name: 'create_booking',
-      description: 'Book exactly what read_back_booking read back. Only after the caller clearly said yes to that read-back — the server checks the caller\'s own words and refuses otherwise. Never call it after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ".',
+      description: 'Book exactly what read_back_booking read back — call it THE MOMENT the caller says yes ("ಬುಕ್ ಮಾಡಿ"); patient_name is optional, never hold the booking for it. Only after the caller clearly said yes to that read-back — the server checks the caller\'s own words and refuses otherwise. Never call it after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ".',
       parameters: {
         type: 'object',
         properties: {
@@ -344,10 +344,13 @@ async function getQuote(args, ctx) {
   // without asking again.
   const tripType = roundTrip ? 'round_trip' : 'one_way';
   const atHospital = args.patient_at === 'hospital';
+  // A deceased body: no nurse, oxygen, helper or medical questions — those
+  // are for living patients only (a real call asked "ನರ್ಸ್ ಬೇಕಾ?" for one).
+  const isBody = serviceFacts.facts(service.code)?.kind === 'body';
   const base = { pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng, selectedType: service.code, tripType };
   const [plain, withHelper] = await Promise.all([
     quoteTrip(base),
-    atHospital ? null : quoteTrip({ ...base, helperEnabled: true }),
+    atHospital || isBody ? null : quoteTrip({ ...base, helperEnabled: true }),
   ]);
   if (!plain) return { ok: false, reason: 'no_route', say: 'Could not find a road route. Ask the caller to check the places, or hand off.' };
   if (!plain.fare) return { ok: false, reason: 'no_price', say: 'No price for this service right now. Offer a callback from the team (end_call follow_up).' };
@@ -374,7 +377,7 @@ async function getQuote(args, ctx) {
   const oneWayKm = plain.oneWayKm ?? (roundTrip ? plain.distanceKm / 2 : plain.distanceKm);
   const longTrip = oneWayKm > LONG_TRIP_KM;
   const twoDrivers = oneWayKm > TWO_DRIVER_KM;
-  const nurse = args.nurse_needed === true;
+  const nurse = !isBody && args.nurse_needed === true;
 
   // What this service is and includes (serviceFacts — the booking pages),
   // checked against the vehicle the quote's Pricing doc names. A mismatch
@@ -403,7 +406,7 @@ async function getQuote(args, ctx) {
     usedShared: usesShared,
     quotes: { plain, helper: helperOption },
     helper, waitHours: roundTrip ? waitHours : 0, waitCharge, longTrip, twoDrivers,
-    freezer, verified, vehicle: verified ? f.vehicle : null,
+    freezer, verified, vehicle: verified ? f.vehicle : null, isBody,
   };
   const waitRule = wait
     ? `first ${wait.freeMinutes} minutes of waiting free, then ₹${wait.ratePerMin}/min${wait.tier2RatePerMin != null ? ` for ${wait.tier1Minutes} minutes, then ₹${wait.tier2RatePerMin}/min` : ''}`
@@ -423,7 +426,8 @@ async function getQuote(args, ctx) {
     priceLine,
     atHospital ? 'The patient is at a hospital: do NOT ask about a helper.' : '',
     twoDrivers ? 'Over 1000 km: tell the caller two drivers are assigned for this trip.' : '',
-    longTrip ? 'Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care — only what you do not know yet.' : '',
+    longTrip && !isBody ? 'Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care — only what you do not know yet.' : '',
+    isBody ? 'Body transport: NEVER ask about a nurse, oxygen, a helper or what happened medically. Only what is needed — pickup, drop, pickup time; the name of the deceased once if not given (optional). Then ask to book.' : '',
     nurse && nurseIncluded ? 'Nurse: a nurse is INCLUDED in this service — say so; no extra charge.' : '',
     nurse && !nurseIncluded ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
     freezer === 'included' ? 'Freezer: INCLUDED in this Body Shifting — Tempo fare. Say so with the price. Do not offer it as an add-on and never say the team will quote a separate freezer charge.' : '',
@@ -510,7 +514,7 @@ async function readBackBooking(args, ctx) {
     return { ok: false, reason: 'need_pickup_details', say: 'Home pickup: ask the exact address — house or flat, street — and a landmark (or send the WhatsApp location request). Then read_back_booking with pickup_details.' };
   }
 
-  const helper = !q.atHospital && (typeof args.helper_needed === 'boolean' ? args.helper_needed : q.helper);
+  const helper = !q.atHospital && !q.isBody && (typeof args.helper_needed === 'boolean' ? args.helper_needed : q.helper);
   if (helper && !q.quotes.helper) return { ok: false, reason: 'requote_helper', say: 'Call get_quote again with helper_needed true, and read back the new fare.' };
   if (args.freezer_needed === true && q.freezer === 'not_included') {
     return { ok: false, reason: 'freezer_not_on_eeco', say: `${q.service.label} has no freezer. Offer Body Shifting — Tempo (freezer included); only if they choose it, get_quote with service_code ${serviceFacts.TEMPO_FOR[q.service.code]}.` };
@@ -646,12 +650,13 @@ async function book(args, ctx, d) {
   ctx.state.booked = trip.tripNumber || String(trip._id);
   ctx.state.pending = null;
   const patientAt = ['home', 'hospital', 'other'].includes(args.patient_at) ? args.patient_at : d.patientAt || (atHospital ? 'hospital' : undefined);
+  const living = !ctx.state.quote.isBody; // nurse / oxygen / condition / helper: living patients only
   const needs = {
-    ...(clean(args.patient_condition, 300) ? { condition: clean(args.patient_condition, 300) } : {}),
-    ...(typeof args.oxygen_needed === 'boolean' ? { oxygen: args.oxygen_needed } : {}),
+    ...(living && clean(args.patient_condition, 300) ? { condition: clean(args.patient_condition, 300) } : {}),
+    ...(living && typeof args.oxygen_needed === 'boolean' ? { oxygen: args.oxygen_needed } : {}),
     helper,
-    ...(typeof args.nurse_needed === 'boolean' ? { nurse: args.nurse_needed } : {}),
-    ...(clean(args.special_care, 300) ? { specialCare: clean(args.special_care, 300) } : {}),
+    ...(living && typeof args.nurse_needed === 'boolean' ? { nurse: args.nurse_needed } : {}),
+    ...(living && clean(args.special_care, 300) ? { specialCare: clean(args.special_care, 300) } : {}),
     ...(patientAt ? { patientAt } : {}),
     // So dispatch knows the ambulance waits and comes back, and that a
     // trip this long needs two drivers.

@@ -483,8 +483,8 @@ describe('C. tools', () => {
       expect(I).toMatch(/NEVER ask the same question twice/);
       expect(I).toMatch(/If they already said no helper, quote without one and just mention "\+₹X if you want a helper"/);
       expect(I).toMatch(/If the patient is AT A HOSPITAL, never ask about a helper/);
-      expect(I).toMatch(/NURSE: ask once, briefly/);
-      expect(I).toMatch(/LONG TRIPS \(get_quote says long_trip\)/);
+      expect(I).toMatch(/NURSE \(living patients only\): ask once, briefly/);
+      expect(I).toMatch(/LONG TRIPS \(living patients; get_quote says long_trip\)/);
       expect(I).toMatch(/OVER 1000 km \(get_quote says two_drivers\): tell the caller two drivers are assigned/);
       expect(session.DELEGATE_INSTRUCTIONS).toMatch(/never quote a nurse charge/);
     });
@@ -1180,5 +1180,59 @@ describe('H. services knowledge, hospital checks, spoken language', () => {
     test('instructions: reply in Telugu / Tamil / Malayalam / Hindi, not just understand', () => {
       expect(prompt.BASE_INSTRUCTIONS).toMatch(/If the caller keeps speaking Telugu, Tamil, Malayalam or Hindi, REPLY in that language/);
     });
+  });
+});
+
+// ============================================================
+describe('I. body transport: no living-patient questions', () => {
+  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes' }) });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const single = (name, lat, lng) => ({ status: 'single', place: { name, address: 'India', lat, lng } });
+  beforeEach(() => {
+    resolvePlaceFromText.mockReset();
+    resolvePlaceFromText.mockImplementation(async (q) => single(q, q === 'Nagarabhavi' ? 12.96 : 17.68, 77.5));
+    quoteTrip.mockResolvedValue({ fare: { grandTotal: 31945, vehicleType: 'Tempo Traveller' }, distanceKm: 736.1, oneWayKm: 736.1 });
+    createBookedTrip.mockResolvedValue({ _id: 'tripS', tripNumber: 'TRP-S', estimatedFare: 31945 });
+  });
+
+  test('Nagarabhavi -> Satara, 736 km, Body Shifting Tempo: no nurse / oxygen / helper / "what happened"', async () => {
+    const r = await run('get_quote', { service_code: 'body_tempo', pickup: 'Nagarabhavi', drop: 'Satara', patient_at: 'home', nurse_needed: true }, ctx(AiCall.add({})));
+    expect(r.ok).toBe(true);
+    expect(quoteTrip).toHaveBeenCalledTimes(1);                 // no helper price for a body
+    expect(r).not.toHaveProperty('fare_with_helper_rupees');
+    expect(r.say).not.toMatch(/whether oxygen or a nurse is needed/);
+    expect(r.say).not.toMatch(/Nurse:/);
+    expect(r.say).toMatch(/Body transport: NEVER ask about a nurse, oxygen, a helper or what happened medically/);
+    expect(r.long_trip).toBe(true);                             // still flagged for dispatch
+  });
+
+  test('the booking records no nurse, oxygen, condition or helper for a body — and says nothing about a nurse', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await run('get_quote', { service_code: 'body_tempo', pickup: 'Nagarabhavi', drop: 'Satara', patient_at: 'hospital' }, c);
+    await run('read_back_booking', { when: 'now', helper_needed: true }, c);
+    const r = await run('create_booking', { customer_confirmed: true, nurse_needed: true, oxygen_needed: true, patient_condition: 'accident', special_care: 'x' }, c);
+    expect(r.ok).toBe(true);
+    expect(r.say).not.toMatch(/nurse/);
+    expect(call.needs).not.toHaveProperty('nurse');
+    expect(call.needs).not.toHaveProperty('oxygen');
+    expect(call.needs).not.toHaveProperty('condition');
+    expect(call.needs.helper).toBe(false);
+    expect(createBookedTrip.mock.calls[0][0].helperEnabled).toBeUndefined();
+  });
+
+  test('a living patient on a long trip is still asked about oxygen and a nurse', async () => {
+    quoteTrip.mockResolvedValue({ fare: { grandTotal: 18000, vehicleType: 'Tempo Traveller' }, distanceKm: 450, oneWayKm: 450 });
+    const r = await run('get_quote', { service_code: 'als_tempo', pickup: 'Nagarabhavi', drop: 'Satara', patient_at: 'hospital' }, ctx(AiCall.add({})));
+    expect(r.say).toMatch(/whether oxygen or a nurse is needed/);
+  });
+
+  test('instructions: body jobs get no nurse / oxygen / helper; the name is asked once; booking never stalls', () => {
+    const I = prompt.BASE_INSTRUCTIONS;
+    expect(I).toMatch(/BODY TRANSPORT \(Body Mini, Body Shifting\) and FREEZER BOX jobs: the person has passed away — NEVER ask about a nurse, oxygen, a helper or what happened medically/);
+    expect(I).toMatch(/PATIENT NAME: ask it once, before the read-back\. Never ask it again after the read-back/);
+    expect(I).toMatch(/The moment they say yes \("ಬುಕ್ ಮಾಡಿ"\), call create_booking — no more questions, never "please wait \/ processing"/);
+    expect(session.DELEGATE_INSTRUCTIONS).toMatch(/BOOKING — never stall/);
+    expect(session.DELEGATE_INSTRUCTIONS).toMatch(/BODY TRANSPORT \(body_mini \/ body_tempo\) and freezer box: never ask about a nurse, oxygen, a helper/);
   });
 });

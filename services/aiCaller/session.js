@@ -88,8 +88,23 @@ const TAIL_GRACE_MS = 1800;    // cut within the last 1.8 s ("ಬುಕ್ ಮ�
 const ANSWER_OVERLAP_MS = 1500; // a "yes" over the closing question counts as the answer
 const HANDOFF_AFTER_LINE_MS = 6000;
 // Words that are only an acknowledgement — they never cut Sahana off.
-const ACK_WORDS = /^(?:ಹೂಂ|ಹೂ|ಹಾ|ಹಾಂ|ಆ|ಆಂ|ಜಿ|ಜೀ|ಹೌದು|ಸರಿ|ಓಕೆ|ಮೇಡಮ್|ಮೇಡಂ|ಸರ್|ಆಯ್ತು|ok|okay|haan|han|ha|hmm|hm|ji|yes|yeah|madam|sir|हाँ|हां|हम्म|जी|ठीक|अच्छा|అవును|సరే|ఆ|హా|మేడమ్|ம்ம்|சரி|ஆமா|ശരി|അതെ|ഉം)$/i;
-const isOnlyAck = (text) => String(text || '').toLowerCase().replace(/[.,!?।\-–—]/g, ' ').split(/\s+/).filter(Boolean).every((w) => ACK_WORDS.test(w));
+// Includes the dialect forms real callers use ("ಆವದು" for ಹೌದು, "ಮೇಡ"),
+// "ಹಲೋ" (checking the line), and Kannada heard in Telugu letters.
+const ACK_WORDS = /^(?:ಹೂಂ|ಹೂ|ಹಾ|ಹಾಂ|ಹ|ಆ|ಆಂ|ಓ|ಜಿ|ಜೀ|ಹೌದು|ಹೌದಾ|ಆವದು|ಆವುದು|ಆವದಾ|ಆವುದಾ|ಸರಿ|ಸರೀ|ಓಕೆ|ಓಕೇ|ಮೇಡ|ಮೇಡಮ್|ಮೇಡಂ|ಮ್ಯಾಡಮ್|ಸರ್|ಸಾರ್|ಆಯ್ತು|ಆಯ್ತಾ|ಹಲೋ|ಹೆಲೋ|ಹೇಳಿ|ok|okk|okay|haan|han|ha|hmm|hm|ji|yes|yeah|hello|helo|madam|sir|accha|achha|theek|thik|हाँ|हां|हा|हम्म|जी|ठीक|है|अच्छा|हैलो|हेलो|हलो|అవును|సరే|ఆ|హా|ఆవదు|హలో|మేడమ్|మేడం|ம்ம்|சரி|ஆமா|ஹலோ|ശരി|അതെ|ഉം|ഹലോ)$/i;
+// One or two Indic letters on their own ("ಹ", "ಆ", "ಓ") are a sound, not a word.
+const TINY_INDIC = /^[\u0900-\u0D7F]{1,2}$/;
+const isOnlyAck = (text) => String(text || '').toLowerCase().replace(/[.,!?।\-–—]/g, ' ').split(/\s+/).filter(Boolean).every((w) => ACK_WORDS.test(w) || TINY_INDIC.test(w));
+// Acknowledgements are never a reason to cut her off, however long they go
+// on — only this much continuous sound with nothing else heard.
+const ACK_MAX_MS = 4000;
+// The booking watchdog (see watchBooking).
+const BOOK_NUDGE_MS = 3000;   // caller approved / asked: remind the model to book
+const BOOK_SELF_MS = 8000;    // approved read-back still not booked: the server books it
+const BOOK_STUCK_MS = 25000;  // asked to book, no booking step at all: a person takes over with the details
+// Signs a booking is stuck: she stalls, or the caller asks again / asks if it is done.
+const STALL_WORDS = /ಮುಂದುವರಿಸ್ತ|ಮುಂದುವರಿಸುತ್ತ|ಪ್ರಕ್ರಿಯೆ|ಲೈನ್‌?ನಲ್ಲಿ ಇರಿ|ಸ್ವಲ್ಪ ಸಮಯ ಕೊಡಿ|ಮುಗಿಸುತ್ತಿದ್ದೀನಿ|ದೃಢಪಡಿಸ್ತಿದ್ದ|processing|please wait|hold on|stay on the line|प्रोसेस|रुकिए|लाइन पर रहिए/i;
+const ASKED_AGAIN = /ಆಯ್ತಾ|ಆಗಿಲ್ಲ|ಎಷ್ಟೊತ್ತ|ಜಾಸ್ತಿ ಟೈಮ್|ಮಾಡಿ ಮೇಡಮ್|ಬೇಗ|is it done|how long|हो गया क्या|कितना टाइम/i;
+const BOOK_REQUEST = /ಬುಕ್ ಮಾಡಿ|ಬುಕ್ ಮಾಡ್ಕೊಡಿ|ಬುಕ್ ಮಾಡ್ಕ|ಬುಕ್ಕಿಂಗ್ ಮಾಡಿ|ಬುಕ್ ಮಾಡ್ಬಿಡಿ|\bbook (it|now|pannunga|cheyandi)\b|please book|बुक कर|बुकिंग कर|బుక్ చేయ|புக் பண்ண|ബുക്ക് ചെയ്യ/i;
 const MAX_CALLER_FRAGMENTS = 400;
 
 // The opening, said as soon as the call connects: hello, the disclosure
@@ -137,7 +152,11 @@ const NOT_BOOKED_LINE = 'ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಖಚಿ�
 // Telugu / Tamil / Malayalam get the English text, which the voice model
 // says in the locked language).
 const LINES = {
-  kn: { price: PRICE_HOLD_LINE, hold: HOLD_LINE, waFailed: WHATSAPP_FAILED_LINE, notBooked: NOT_BOOKED_LINE, resume: RESUME_LINE, timeUp: TIME_UP_BOOKED_LINE },
+  kn: {
+    price: PRICE_HOLD_LINE, hold: HOLD_LINE, waFailed: WHATSAPP_FAILED_LINE, notBooked: NOT_BOOKED_LINE, resume: RESUME_LINE, timeUp: TIME_UP_BOOKED_LINE,
+    booked: 'ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು. ಟ್ರಿಪ್ ನಂಬರ್ {trip}. ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡಿ ವಾಹನವನ್ನು ಖಚಿತಪಡಿಸ್ತಾರೆ.',
+    stuck: 'ಕ್ಷಮಿಸಿ, ನಮ್ಮ ತಂಡದವರು ಈಗಲೇ ನಿಮ್ಮ ಬುಕ್ಕಿಂಗ್ ಖಚಿತಪಡಿಸ್ತಾರೆ.',
+  },
   hi: {
     price: 'एक मिनट, सही किराया बताती हूँ।',
     hold: 'माफ़ कीजिए, लिंक अभी भेजा नहीं गया है।',
@@ -145,6 +164,8 @@ const LINES = {
     notBooked: 'बुकिंग अभी पक्की नहीं हुई है।',
     resume: 'माफ़ कीजिए, लाइन थोड़ी कट गई थी।',
     timeUp: 'आपकी बुकिंग हो गई है, हमारी टीम थोड़ी देर में कॉल करेगी। धन्यवाद!',
+    booked: 'बुकिंग हो गई। ट्रिप नंबर {trip}। हमारी टीम थोड़ी देर में कॉल करके गाड़ी पक्की करेगी।',
+    stuck: 'माफ़ कीजिए, हमारी टीम अभी आपकी बुकिंग पक्की करेगी।',
   },
   en: {
     price: "One moment, I'll tell you the exact fare.",
@@ -153,6 +174,8 @@ const LINES = {
     notBooked: 'The booking is not confirmed yet.',
     resume: 'Sorry, the line dropped for a moment.',
     timeUp: 'Your booking is done; our team will call you shortly. Thank you!',
+    booked: 'Your booking is done. Trip number {trip}. Our team will call shortly to confirm the vehicle.',
+    stuck: 'Sorry — a team member will confirm your booking with you right now.',
   },
 };
 const linesFor = (lang) => LINES[lang] || (lang ? LINES.en : LINES.kn);
@@ -210,6 +233,8 @@ You run the tools for SaveLife's phone assistant. Use only these tools; never an
 get_quote is the only source of prices; any change to the route (pickup, hospital or branch, service, round trip, wait) needs a new get_quote. To book: read_back_booking, the assistant reads it back and asks; create_booking ONLY after the caller's clear yes to that read-back (the server checks the caller's words) — never after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", never twice. Never say it is booked unless create_booking returned ok. Never say a WhatsApp link was sent unless send_location_request returned status sent. A freezer box kept at home is never priced: freezer_box_request (address, start time, how long), then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
 Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
+BOOKING — never stall: when the caller says to book, call read_back_booking at once (if not done), and after their yes call create_booking at once. Never answer with text like "please wait / processing" instead of calling the tool. patient_name is optional: never hold a booking for it, never ask it again after the read-back.
+BODY TRANSPORT (body_mini / body_tempo) and freezer box: never ask about a nurse, oxygen, a helper or the medical condition — those are only for living patients.
 Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it) — ALS/ACLS/NICU include a nurse. Over 1000 km: two drivers are assigned.
 Vehicles and inclusions only from service_info / get_quote: Body Shifting — Tempo includes the freezer (never a separate charge); Body Mini — Eeco has none (offer the Tempo; new get_quote only if chosen). Eeco over 800 km: recommend a Tempo Traveller, never switch it yourself. A vague place (a whole state) is refused: ask the town and exact place. Discount / advance / settlement / conditional yes: record_question, never promise, never book on a condition. A clear no: no booking, a polite close, end_call not_needed.
 Dates: take them from the DATE AND TIME list in the instructions; never ask the caller for a month or year.
@@ -286,6 +311,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     // Caller speech detector (in audio time, from the frames themselves).
     vad: { voiced: 0, silence: 0, talking: false, holdMs: 0, capped: false },
     callerFrags: [], // { at, text } — what the caller said and when (approval)
+    bookWatch: null, lastToolAt: 0, // the booking watchdog
   };
   active.set(callId, s);
   // This call's instructions: today's IST date (server time) and the real
@@ -325,6 +351,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     s.turnTimer[who] = null;
     const text = s.turns[who];
     s.turns[who] = '';
+    noteStallSign(who, text);
     if (who === 'assistant') s.guarded.clear(); // claim guards are per spoken turn
     else { s.langFrom = 0; if (text && !s.ended) onCallerTurnDone(text); }
     note(who, text);
@@ -469,7 +496,9 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     if (v.capped) { if (done) v.capped = false; return; }
     if (s.pendingBarge) {
       s.pendingBarge.voiced += rms >= config.bargeInRms() ? ms : 0;
-      if (s.pendingBarge.voiced >= config.bargeInConfirmMs()) confirmBarge();
+      // Only acknowledgements heard so far: never a cut for how long it lasts.
+      const onlyAcks = s.pendingBarge.text.trim() && isOnlyAck(s.pendingBarge.text);
+      if (s.pendingBarge.voiced >= (onlyAcks ? ACK_MAX_MS : config.bargeInConfirmMs())) confirmBarge();
       else if (v.silence >= ACK_SILENCE_MS) cancelBarge(); // just an acknowledgement
       return;
     }
@@ -591,6 +620,80 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     }
     return v;
   };
+
+  // ── Booking watchdog: an approved booking always completes ─
+  // A real call: the caller said "ಬುಕ್ ಮಾಡಿ" three times, the model never
+  // called create_booking, said "ಬುಕ್ಕಿಂಗ್ ಮುಂದುವರಿಸ್ತಿದ್ದೀನಿ" for five
+  // minutes and the time limit handed the call off unbooked. Now:
+  //   - the caller's clear yes to a read-back (judgeApproval) -> after
+  //     BOOK_NUDGE_MS the model is told to book; after BOOK_SELF_MS, if it
+  //     still has not, the SERVER calls create_booking itself (the same
+  //     tool, the same approval and duplicate checks) and she says it;
+  //   - "ಬುಕ್ ಮಾಡಿ" with a quote but no read-back yet -> the model is told
+  //     to read back now; if no booking step happens for BOOK_STUCK_MS, a
+  //     person takes over WITH the details — never minutes of "processing".
+  const toolCtx = () => ({ callId, phone: s.phone, state: s.state, approval, now, language: s.language });
+  const watchActive = (w) => s.bookWatch === w && !s.state.booked && !s.ended && !s.ending;
+  function watchBooking(turn) {
+    if (s.state.booked || s.ending || s.ended || s.bookWatch) return;
+    let kind = null;
+    if (s.state.pending) { if (judgeApproval().status === 'yes') kind = 'approved'; }
+    else if (s.state.quote && BOOK_REQUEST.test(turn) && !approvalWords.saysNo(turn) && !approvalWords.saysConditional(turn)) kind = 'asked';
+    if (!kind) return;
+    // callerTurn: the turn that started the watch never counts as a stall sign.
+    const w = { kind, at: now(), toolAt: s.lastToolAt, signs: 0, callerTurn: s.turnStart.caller };
+    s.bookWatch = w;
+    s.timers.push(setTimeout(() => {
+      if (!watchActive(w)) return;
+      sendAI({
+        type: 'session.instructions.append', event_id: `event_book_nudge_${Date.now()}`, delegation_id: null,
+        content: kind === 'approved'
+          ? 'The caller has APPROVED the read-back. Call create_booking NOW (customer_confirmed true). No more questions, no "please wait".'
+          : 'The caller asked to book. Call read_back_booking NOW with the pickup time they gave (ask only if it is truly missing), read it back once, then create_booking after their yes. Never say "processing" or "please wait".',
+      });
+      sendAI({ type: 'response.create', event_id: `event_book_nudge_go_${Date.now()}` });
+    }, BOOK_NUDGE_MS));
+    if (kind === 'approved') s.timers.push(setTimeout(() => { if (watchActive(w) && !s.state.bookingInFlight) selfBook(w); }, BOOK_SELF_MS));
+    else {
+      // Stuck = no booking step at all AND a sign of it (she stalls, or the
+      // caller asks again). Still asking for the time or a name is not stuck.
+      const check = () => {
+        if (!watchActive(w) || s.lastToolAt > w.toolAt) return;
+        if (w.signs > 0) bookingStuck();
+        else s.timers.push(setTimeout(check, 10000));
+      };
+      s.timers.push(setTimeout(check, BOOK_STUCK_MS));
+    }
+  }
+  // Stall signs for the open watch (assistant turns, caller fragments).
+  const noteStallSign = (who, text) => {
+    const w = s.bookWatch;
+    if (!w || w.kind !== 'asked' || !text) return;
+    if (who === 'caller' && s.turnStart.caller === w.callerTurn) return;
+    if ((who === 'assistant' && STALL_WORDS.test(text)) || (who === 'caller' && (ASKED_AGAIN.test(text) || BOOK_REQUEST.test(text)))) w.signs += 1;
+  };
+  async function selfBook(w) {
+    let out;
+    try { out = await tools.HANDLERS.create_booking({ customer_confirmed: true }, toolCtx()); } catch (err) { out = { ok: false, reason: `error: ${err.message}` }; }
+    note('system', `create_booking (by the server — the caller approved, the assistant had not booked) -> ${out.ok ? 'ok' : out.reason}`);
+    if (s.bookWatch === w) s.bookWatch = null;
+    if (out.ok) {
+      sendAI({ type: 'session.thinking.append', event_id: `event_selfbook_${Date.now()}`, delegation_id: null, content: `create_booking has ALREADY succeeded: trip ${out.trip_number}. Never call it again. Say goodbye after this.` });
+      sendAI({ type: 'session.commentary.append', event_id: `event_selfbook_say_${Date.now()}`, delegation_id: null, content: linesFor(s.language).booked.replace('{trip}', out.trip_number) });
+    } else if (out.handoff || !['already_booked', 'booking_in_progress'].includes(out.reason)) {
+      bookingStuck();
+    }
+  }
+  async function bookingStuck() {
+    if (s.state.booked || s.ended || s.ending) return;
+    const q = s.state.quote;
+    const summary = s.state.pending?.summary
+      || (q ? `Pickup: ${q.pickup.address}. Drop: ${q.drop.address}. Vehicle: ${q.service.label}. Quoted: ₹${q.quotes.plain.fare.grandTotal + (q.waitCharge || 0)}. Pickup time: ask the caller.` : 'No quote yet.');
+    note('system', 'Booking did not complete — handing to a person with the details');
+    await AiCall.updateOne({ _id: callId }, { $set: { pendingBooking: { summary: summary.slice(0, 1000), reason: 'booking_stuck', at: new Date() } } }).catch(() => {});
+    sendAI({ type: 'session.commentary.append', event_id: `event_stuck_${Date.now()}`, delegation_id: null, content: linesFor(s.language).stuck });
+    s.timers.push(setTimeout(() => handOff('booking_stuck'), HANDOFF_AFTER_LINE_MS));
+  }
 
   // ── OpenAI ────────────────────────────────────────────────
   // GPT-Live dropping AFTER the session started (OpenAI closed the socket,
@@ -737,6 +840,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
             s.callerFrags.push({ at: now(), text: ev.delta });
             if (!audible() && !s.pendingBarge) s.stretchBreak = true;
             onCallerWordsDuringBarge(ev.delta);
+            watchBooking(turn);
             if (s.callerFrags.length > MAX_CALLER_FRAGMENTS) s.callerFrags.shift();
           }
           // Which letters the transcript used — kept for diagnosis only; the
@@ -797,6 +901,13 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   // Delegated work: function calls from the Responses model, usage.
   async function onResponseEvent(ev) {
     const inner = ev.event || {};
+    // What the tool model SAID (not just did): logged, so a booking that
+    // never happens explains itself.
+    if (inner.type === 'response.completed') {
+      const said = (inner.response?.output || []).filter((o) => o.type === 'message')
+        .flatMap((o) => o.content || []).map((c) => c.text || '').join(' ').trim();
+      if (said) note('system', `delegate: ${said.slice(0, 300)}`);
+    }
     if (inner.type === 'response.completed' && inner.response?.usage) {
       const f = usageFields(inner.response.usage);
       const textIn = inner.response.usage.input_tokens || f.textIn;
@@ -817,8 +928,10 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     if (item.name === 'end_call') return endCall(args);
 
     const handler = tools.HANDLERS[item.name];
+    s.lastToolAt = now();
+    if (item.name === 'read_back_booking' || item.name === 'create_booking') s.bookWatch = null; // the model is booking
     const output = handler
-      ? await handler(args, { callId, phone: s.phone, state: s.state, approval, now, language: s.language })
+      ? await handler(args, toolCtx())
       : { ok: false, reason: 'unknown_tool' };
     // The read-back is the NEXT thing she says: start a fresh stretch of speech.
     if (item.name === 'read_back_booking' && output.ok) s.stretchBreak = true;
@@ -854,6 +967,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
 module.exports = {
   createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
-  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, LINES, isOnlyAck, TAIL_GRACE_MS, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
+  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, LINES, isOnlyAck, TAIL_GRACE_MS, BOOK_REQUEST, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
   MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

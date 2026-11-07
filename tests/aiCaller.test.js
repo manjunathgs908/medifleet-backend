@@ -1053,7 +1053,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     clock.t += 20;
     sahanaSays(3000);
     clock.t += 800;
-    callerAudio(1300, true);                   // talks over it, well before the end
+    callerAudio(1600, true);                   // talks over it, well before the end
     callerAudio(700, false);
     callerSays('ಹೌದು ಹೌದು ಮಾಡಿ');
     clock.t += 3000;
@@ -1291,6 +1291,147 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     await turn('अभी घर से हॉस्पिटल जाना है, आप कब आएंगे');
     expect(langAppends()).toEqual([expect.stringMatching(/speaking Hindi\. REPLY in Hindi/)]);
   }, 10000);
+
+  // ── Satara call: fillers cut her off; an approved booking never completed ──
+  test.each([
+    ['ಆವದು ಆವದು ಮೇಡಮ್'], ['ಹ ಮೇಡಮ್'], ['ಹಲೋ ಹಲೋ'], ['ಆ, ಓಕೆ ಮೇಡಮ್'], ['ಮೇಡ'], ['हाँ जी ठीक है'],
+  ])('a filler "%s" never cuts her off — even when it goes on for 2.5 s', async (filler) => {
+    await begin();
+    pastOpening();
+    sahanaSays(5000);
+    clock.t += 500;
+    const before = plivoWs.of('playAudio').length;
+    callerAudio(700, true);
+    callerSays(filler);
+    callerAudio(1800, true);   // 2.5 s of sound in all — longer than the 1.5 s confirm
+    sahanaSays(300);           // held while they speak, not dropped
+    callerAudio(400, false);
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+    expect(plivoWs.of('playAudio')).toHaveLength(before + 1);
+    expect(call().bargeIns || 0).toBe(0);
+  });
+
+  test('a real correction over her still interrupts at once', async () => {
+    await begin();
+    pastOpening();
+    sahanaSays(4000);
+    clock.t += 500;
+    callerAudio(700, true);
+    callerSays('ಆವದು, ಆದ್ರೆ ಡ್ರಾಪ್ ಸತಾರಾ ಅಲ್ಲ, ಪುಣೆ');
+    expect(plivoWs.of('clearAudio')).toHaveLength(1);
+  });
+
+  // Fake timers for the watchdog's seconds (setImmediate stays real for flush()).
+  const fakeTime = () => jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+  const satara = async () => {
+    resolvePlaceFromText.mockImplementation(async (q) => ({ status: 'single', place: { name: q, address: 'India', lat: q === 'Nagarabhavi' ? 12.96 : 17.68, lng: q === 'Nagarabhavi' ? 77.51 : 74.0 } }));
+    quoteTrip.mockResolvedValue({ oneWayKm: 736.1, distanceKm: 736.1, fare: { grandTotal: 31945, vehicleType: 'Tempo Traveller' } });
+    createBookedTrip.mockResolvedValue({ _id: 'tripS', tripNumber: 'TRP-SATARA', estimatedFare: 31945 });
+    ai.push(fnCall('get_quote', { service_code: 'body_tempo', pickup: 'Nagarabhavi', drop: 'Satara', patient_at: 'hospital' }, 'q1'));
+    await flush();
+  };
+
+  test('SATARA REPLAY: the caller says "ಬುಕ್ ಮಾಡಿ" after the read-back and the model never books — the server books it within seconds', async () => {
+    await begin();
+    pastOpening();
+    await satara();
+    ai.push(fnCall('read_back_booking', { when: 'later', scheduled_time: '2099-01-02 22:00' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(4000);
+    clock.t += 4100;
+    fakeTime();
+    try {
+      callerSays('ಓಕೆ. ಆ ಬುಕ್ ಮಾಡಿ ಮೇಡಮ್ ಬೇಗ ಬುಕ್ ಮಾಡ್ಕ ಕೊಡಿ ಮೇಡಮ್');
+      // The model stalls ("ಬುಕ್ಕಿಂಗ್ ಮುಂದುವರಿಸ್ತಿದ್ದೀನಿ") — no create_booking.
+      jest.advanceTimersByTime(3100);
+      expect(ai.of('session.instructions.append').map((m) => m.content)).toContain('The caller has APPROVED the read-back. Call create_booking NOW (customer_confirmed true). No more questions, no "please wait".');
+      expect(createBookedTrip).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(5000);
+    } finally {
+      jest.useRealTimers();
+    }
+    await flush(10);
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+    expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ selectedType: 'body_tempo', scheduleDate: '2099-01-02T22:00' });
+    expect(call()).toMatchObject({ trip: 'tripS', outcome: 'booked' });
+    expect(ai.of('session.commentary.append').map((m) => m.content)).toContain('ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು. ಟ್ರಿಪ್ ನಂಬರ್ TRP-SATARA. ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡಿ ವಾಹನವನ್ನು ಖಚಿತಪಡಿಸ್ತಾರೆ.');
+    expect(call().transcript.map((t) => t.text)).toEqual(expect.arrayContaining([expect.stringMatching(/create_booking \(by the server — the caller approved, the assistant had not booked\) -> ok/)]));
+  });
+
+  test('if the model does book after the reminder, the server never books a second time', async () => {
+    await begin();
+    pastOpening();
+    await satara();
+    ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(3000);
+    clock.t += 3100;
+    fakeTime();
+    try {
+      callerSays('ಹೌದು, ಬುಕ್ ಮಾಡಿ');
+      jest.advanceTimersByTime(3100);
+    } finally {
+      jest.useRealTimers();
+    }
+    ai.push(fnCall('create_booking', { customer_confirmed: true }, 'b1'));
+    await flush(10);
+    fakeTime();
+    try { jest.advanceTimersByTime(10000); } finally { jest.useRealTimers(); }
+    await flush(10);
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+  });
+
+  test('"ಬುಕ್ ಮಾಡಿ" with no read-back step at all (she read it out herself): reminded, then a person takes over WITH the details — not minutes of "processing"', async () => {
+    await begin();
+    pastOpening();
+    await satara();
+    fakeTime();
+    try {
+      callerSays('ಆ ಬುಕ್ ಮಾಡಿ ಮೇಡಮ್');
+      jest.advanceTimersByTime(3100);
+      expect(ai.of('session.instructions.append').map((m) => m.content)).toEqual(expect.arrayContaining([expect.stringMatching(/The caller asked to book\. Call read_back_booking NOW/)]));
+      // She stalls, the caller asks again — the signs of a stuck booking.
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಬುಕ್ಕಿಂಗ್ ಮುಂದುವರಿಸ್ತಿದ್ದೀನಿ, ಲೈನ್‌ನಲ್ಲಿ ಇರಿ.' });
+      jest.advanceTimersByTime(2000);
+      callerSays(' ಮೇಡಮ್ ಆಯ್ತಾ?');
+      jest.advanceTimersByTime(20000);
+    } finally {
+      jest.useRealTimers();
+    }
+    await flush(10);
+    expect(call().pendingBooking).toMatchObject({ reason: 'booking_stuck', summary: expect.stringMatching(/Pickup: Nagarabhavi, India\. Drop: Satara, India\. Vehicle: Dead Body Transport - Body Shifting \(Tempo\)\. Quoted: ₹31945/) });
+    expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.LINES.kn.stuck);
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('"ಬುಕ್ ಮಾಡಿ", then she is still asking the pickup time — not treated as stuck', async () => {
+    await begin();
+    pastOpening();
+    await satara();
+    fakeTime();
+    try {
+      callerSays('ಬುಕ್ ಮಾಡಿ');
+      jest.advanceTimersByTime(3100);
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಪಿಕಪ್ ಯಾವಾಗ ಬೇಕು?' });
+      jest.advanceTimersByTime(2000);
+      callerSays('ಇವತ್ತು ರಾತ್ರಿ ಹತ್ತು ಗಂಟೆಗೆ');
+      jest.advanceTimersByTime(30000);
+    } finally {
+      jest.useRealTimers();
+    }
+    await flush(10);
+    expect(call().pendingBooking).toBeUndefined();
+    expect(call().handoff).toBeFalsy();
+  });
+
+  test('the tool model\'s own words are logged, so a stalled booking explains itself', async () => {
+    await begin();
+    ai.push({ type: 'response.event', event: { type: 'response.completed', response: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'Please ask the caller for the patient name first.' }] }], usage: { input_tokens: 10, output_tokens: 5 } } } });
+    await flush();
+    expect(call().transcript.map((t) => t.text)).toEqual(expect.arrayContaining(['delegate: Please ask the caller for the patient name first.']));
+  });
 
   test('time limit after a booking: a goodbye and hang up — not a handoff', async () => {
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });

@@ -98,6 +98,9 @@ async function checkCanCall(raw, { atAnswer = false } = {}) {
 
 // ── Call limits and models (env, with pilot defaults) ───────
 const maxCallSeconds = () => Math.min(Math.max(Number(process.env.AI_CALL_MAX_SECONDS) || 300, 60), 600);
+// The AI's own deadline (default 3 minutes): not booked by then -> the
+// team takes over WITH the details. Never later than the hard limit above.
+const targetSeconds = () => Math.min(Math.max(Number(process.env.AI_CALL_TARGET_SECONDS) || 180, 60), maxCallSeconds());
 // GPT-Live: a voice model (session.model) plus a Responses model it
 // delegates tool work to (session.delegation.responses.model).
 const realtimeModel = () => process.env.AI_REALTIME_MODEL || 'gpt-live-1';
@@ -153,7 +156,7 @@ function estimateCostPaise(usage = {}, durationSec = 0) {
 
 module.exports = {
   envEnabled, allowlist, isAllowlisted, toggleEnabled, missingConfig, contactedUsVia,
-  activeCall, checkCanCall, maxCallSeconds, realtimeModel, delegateModel, realtimeVoice, liveUrl,
+  activeCall, checkCanCall, maxCallSeconds, targetSeconds, realtimeModel, delegateModel, realtimeVoice, liveUrl,
   bargeInRms, bargeInMs, callerDoneMs, bargeInConfirmMs,
   costRates, estimateCostPaise, ACTIVE_STATES,
 };

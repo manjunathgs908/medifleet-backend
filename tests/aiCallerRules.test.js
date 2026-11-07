@@ -1236,3 +1236,161 @@ describe('I. body transport: no living-patient questions', () => {
     expect(session.DELEGATE_INSTRUCTIONS).toMatch(/BODY TRANSPORT \(body_mini \/ body_tempo\) and freezer box: never ask about a nurse, oxygen, a helper/);
   });
 });
+
+// ============================================================
+describe('J. equipment, staffing, access, AC — from the package, never guessed', () => {
+  const models = require('../models');
+  const ctx = (call, extra = {}) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes' }), ...extra });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const VEHICLE = { bls: 'Maruti Eeco', bls_tempo: 'Tempo Traveller', als_tempo: 'Tempo Traveller', acls_tempo: 'Tempo Traveller', nicu_tempo: 'Tempo Traveller' };
+  const quote = (c, args) => run('get_quote', { pickup: 'Rajajinagar', drop: 'Narayana Health', ...args }, c);
+  beforeEach(() => {
+    resolvePlaceFromText.mockReset();
+    resolvePlaceFromText.mockImplementation(async (q) => ({ status: 'single', place: { name: q, address: 'Bengaluru', lat: q === 'Rajajinagar' ? 12.99 : 12.89, lng: 77.55 } }));
+    quoteTrip.mockImplementation(async (q) => ({ distanceKm: 18, oneWayKm: 18, fare: { grandTotal: 2000 + (q.helperEnabled ? 300 : 0) + (q.acEnabled ? 54 : 0), vehicleType: VEHICLE[q.selectedType] } }));
+    createBookedTrip.mockResolvedValue({ _id: 'tripE', tripNumber: 'TRP-E', estimatedFare: 2000 });
+  });
+
+  describe('ventilator / ICU / cardiac enquiries', () => {
+    test('patient on a ventilator: BLS is refused, ALS recommended — nothing quoted until they agree', async () => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'bls', on_device: 'ventilator', patient_at: 'hospital' });
+      expect(r).toMatchObject({ ok: false, reason: 'equipment_not_in_package', missing: ['ventilator'], recommend_service_code: 'als_tempo' });
+      expect(r.say).toMatch(/Never switch it yourself/);
+      expect(quoteTrip).not.toHaveBeenCalled();
+      const als = await quote(ctx(AiCall.add({})), { service_code: 'als_tempo', on_device: 'ventilator', patient_at: 'hospital' });
+      expect(als.ok).toBe(true);
+      expect(als.say).toMatch(/A nurse is mandatory and included in this package/);
+    });
+
+    test('patient already on BiPAP: ALS does not carry BiPAP -> ACLS recommended; ACLS quotes', async () => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'als_tempo', on_device: 'bipap', patient_at: 'hospital' });
+      expect(r).toMatchObject({ ok: false, reason: 'equipment_not_in_package', missing: ['bipap'], recommend_service_code: 'acls_tempo' });
+      expect((await quote(ctx(AiCall.add({})), { service_code: 'acls_tempo', on_device: 'bipap', patient_at: 'hospital' })).ok).toBe(true);
+    });
+
+    test('"ICU ambulance" but the caller cannot say the device: ask the hospital\'s equipment, then a person — never a guess', async () => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'acls_tempo', on_device: 'unknown' });
+      expect(r).toMatchObject({ ok: false, reason: 'device_unclear' });
+      expect(r.say).toMatch(/Ask once what equipment the hospital has asked for.*handoff_to_human.*never guess a package from the words "ICU" or "cardiac"/);
+      expect(quoteTrip).not.toHaveBeenCalled();
+    });
+
+    test('equipment no verified package carries ("ECMO"): a person confirms', async () => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'acls_tempo', equipment_requested: ['other'], equipment_other: 'ECMO' });
+      expect(r).toMatchObject({ ok: false, reason: 'equipment_unverified' });
+      expect(r.say).toMatch(/handoff_to_human/);
+    });
+  });
+
+  describe('BLS', () => {
+    test('home pickup: asks ground floor or upstairs first', async () => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'bls', patient_at: 'home' });
+      expect(r.say).toMatch(/"ಪೇಷಂಟ್ ಗ್ರೌಂಡ್ ಫ್ಲೋರ್‌ನಲ್ಲಿದ್ದಾರಾ, ಅಥವಾ ಮೇಲಿನ ಮಹಡಿಯಲ್ಲಿದ್ದಾರಾ\?"/);
+    });
+
+    test('upstairs: lift asked; no lift -> helper recommended with its price; access goes to the team', async () => {
+      const call = AiCall.add({});
+      const c = ctx(call);
+      expect((await quote(c, { service_code: 'bls', patient_at: 'home', floor: 'upstairs' })).say).toMatch(/Upstairs: ask once if there is a lift/);
+      const r = await quote(c, { service_code: 'bls', patient_at: 'home', floor: 'upstairs', lift: false, access_note: '3rd floor, narrow stairs' });
+      expect(r).toMatchObject({ ok: true, fare_without_helper_rupees: 2000, fare_with_helper_rupees: 2300 });
+      expect(r.say).toMatch(/Upstairs with no lift: a helper is recommended/);
+      await run('read_back_booking', { when: 'now', helper_needed: true, patient_at: 'home', pickup_details: '12, 3rd floor, near Gopalan Mall' }, c);
+      await run('create_booking', { customer_confirmed: true }, c);
+      expect(call.needs).toMatchObject({ helper: true, access: { floor: 'upstairs', lift: false, note: '3rd floor, narrow stairs' } });
+    });
+
+    test('a BLS caller asking for a monitor or suction (long trip too): ALS recommended in Kannada, ALS quoted after they agree', async () => {
+      quoteTrip.mockImplementation(async (q) => ({ distanceKm: 520, oneWayKm: 520, fare: { grandTotal: 21000, vehicleType: VEHICLE[q.selectedType] } }));
+      const r = await quote(ctx(AiCall.add({})), { service_code: 'bls_tempo', equipment_requested: ['monitor', 'suction'], patient_at: 'hospital' });
+      expect(r).toMatchObject({ ok: false, reason: 'equipment_not_in_package', recommend_service_code: 'als_tempo' });
+      expect(r.say).toMatch(/"ಮಾನಿಟರ್ ಅಥವಾ ಸಕ್ಷನ್ ಮಷೀನ್ ಬೇಕಿದ್ದರೆ ನಮ್ಮ ALS ಆಂಬುಲೆನ್ಸ್ ಆಯ್ಕೆ ಮಾಡಬೇಕು\."/);
+      expect(quoteTrip).not.toHaveBeenCalled();
+      const als = await quote(ctx(AiCall.add({})), { service_code: 'als_tempo', equipment_requested: ['monitor', 'suction'], patient_at: 'hospital' });
+      expect(als).toMatchObject({ ok: true, estimated_fare_rupees: 21000 });
+    });
+
+    test('wheelchair on BLS: recorded, availability checked by the team — not promised', async () => {
+      const call = AiCall.add({});
+      const c = ctx(call);
+      const r = await quote(c, { service_code: 'bls', patient_at: 'hospital', wheelchair_needed: true });
+      expect(r.say).toMatch(/Wheelchair: noted — say the team will check availability/);
+      await run('read_back_booking', { when: 'now' }, c);
+      const b = await run('create_booking', { customer_confirmed: true }, c);
+      expect(call.needs.wheelchair).toBe(true);
+      expect(b.say).toMatch(/the wheelchair/);
+    });
+
+    test('AC on BLS: the Pricing AC add-on is quoted, read back and booked at that fare', async () => {
+      const call = AiCall.add({});
+      const c = ctx(call);
+      const r = await quote(c, { service_code: 'bls', patient_at: 'hospital', ac_needed: true });
+      expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ acEnabled: true }));
+      expect(r).toMatchObject({ ok: true, estimated_fare_rupees: 2054 });
+      expect(r.say).toMatch(/AC: the AC add-on is included in this price.*the team confirms an AC vehicle is available/);
+      expect((await run('read_back_booking', { when: 'now' }, c)).summary).toMatch(/AC: included in this fare/);
+      await run('create_booking', { customer_confirmed: true }, c);
+      expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ acEnabled: true });
+      expect(call.needs.ac).toBe('addon');
+    });
+  });
+
+  describe('ALS / ACLS / NICU: never a helper question', () => {
+    test.each(['als_tempo', 'acls_tempo', 'nicu_tempo'])('%s home pickup: no helper price, "NEVER ask about a helper"', async (code) => {
+      const r = await quote(ctx(AiCall.add({})), { service_code: code, patient_at: 'home' });
+      expect(r.ok).toBe(true);
+      expect(quoteTrip).toHaveBeenCalledTimes(1);
+      expect(r).not.toHaveProperty('fare_with_helper_rupees');
+      expect(r.say).toMatch(/NEVER ask about a helper — the driver and nurse help shift the patient/);
+      expect(r.say).not.toMatch(/ಗ್ರೌಂಡ್ ಫ್ಲೋರ್/);
+    });
+
+    test('AC on ALS: not assumed — the team confirms; no AC charge added', async () => {
+      const call = AiCall.add({});
+      const c = ctx(call);
+      const r = await quote(c, { service_code: 'als_tempo', patient_at: 'hospital', ac_needed: true });
+      expect(quoteTrip.mock.calls[0][0].acEnabled).toBeUndefined();
+      expect(r.say).toMatch(/we cannot confirm AC for .*ALS.* never promise AC/);
+      await run('read_back_booking', { when: 'now' }, c);
+      const b = await run('create_booking', { customer_confirmed: true }, c);
+      expect(createBookedTrip.mock.calls[0][0].acEnabled).toBeUndefined();
+      expect(b.say).toMatch(/AC/);
+    });
+
+    test('equipment answers come from the package lists', async () => {
+      const als = await run('service_info', { service_code: 'als_tempo', question: 'what equipment' }, ctx(AiCall.add({})));
+      expect(als.includes.join(' ')).toMatch(/patient monitor, ventilator, suction machine, airway kit, Ambu bag, IV supplies, emergency kit/);
+      expect(als.includes.join(' ')).toMatch(/2 syringe pumps/);
+      expect(als.includes.join(' ')).toMatch(/nurse \(mandatory, included\)/);
+      const acls = await run('service_info', { service_code: 'acls_tempo', question: 'what equipment' }, ctx(AiCall.add({})));
+      expect(acls.includes.join(' ')).toMatch(/plus a defibrillator and a BiPAP machine/);
+      const bls = await run('service_info', { service_code: 'bls', question: 'what equipment' }, ctx(AiCall.add({})));
+      expect(bls.includes.join(' ')).toMatch(/oxygen \(the basic medical equipment\).*a stretcher/);
+    });
+  });
+
+  test('booking status uncertain: a trip this call already made is found — never booked twice', async () => {
+    models.Trip.findOne.mockReturnValueOnce({ select: async () => ({ _id: 'tripEarlier', tripNumber: 'TRP-EARLIER' }) });
+    const call = AiCall.add({});
+    const c = ctx(call, { callStartedAt: new Date(Date.now() - 60000) });
+    await quote(c, { service_code: 'bls', patient_at: 'hospital' });
+    await run('read_back_booking', { when: 'now' }, c);
+    const r = await run('create_booking', { customer_confirmed: true }, c);
+    expect(r).toMatchObject({ ok: false, reason: 'already_booked', trip_number: 'TRP-EARLIER' });
+    expect(models.Trip.findOne).toHaveBeenCalledWith(expect.objectContaining({ patientPhone: '9876543210', bookingSource: 'ai_telecaller' }));
+    expect(createBookedTrip).not.toHaveBeenCalled();
+    expect(call).toMatchObject({ trip: 'tripEarlier', outcome: 'booked' });
+  });
+
+  test('instructions: the exact device question, equipment lists, BLS floor question, no helper for ALS/ACLS/NICU, 3 minutes', () => {
+    const I = prompt.BASE_INSTRUCTIONS;
+    expect(I).toMatch(/"ಪೇಷಂಟ್ ಈಗ ವೆಂಟಿಲೇಟರ್‌ಗೆ ಕನೆಕ್ಟ್ ಆಗಿದ್ದಾರಾ, ಅಥವಾ BiPAP ಮಷೀನ್‌ಗೆ ಕನೆಕ್ಟ್ ಆಗಿದ್ದಾರಾ\?"/);
+    expect(I).toMatch(/"ventilator ambulance", "ICU ambulance", "cardiac ambulance", "ವೆಂಟಿಲೇಟರ್ ಆಂಬುಲೆನ್ಸ್"/);
+    expect(I).toMatch(/Never infer clinical needs from the service name/);
+    expect(I).toMatch(/ACLS: everything in ALS plus a defibrillator and a BiPAP machine\. A nurse is mandatory/);
+    expect(I).toMatch(/For ALS, ACLS and NICU NEVER ask "do you need a helper\?"/);
+    expect(I).toMatch(/Never assume a vehicle has AC/);
+    expect(I).toMatch(/FINISH IN ABOUT 3 MINUTES/);
+    expect(I).toMatch(/Never keep the caller waiting with "booking is in progress"/);
+  });
+});

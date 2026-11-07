@@ -95,6 +95,14 @@ function definitions() {
           patient_at           : { type: 'string', enum: ['home', 'hospital', 'other'], description: 'Where the patient is picked up from, if known. hospital = discharge / hospital pickup: no helper is offered.' },
           nurse_needed         : { type: 'boolean', description: 'true if the caller asked for a nurse.' },
           freezer_needed       : { type: 'boolean', description: 'Body transport: true if they need a freezer during the transport.' },
+          equipment_requested  : { type: 'array', items: { type: 'string', enum: ['oxygen', 'stretcher', 'monitor', 'ventilator', 'suction', 'airway_kit', 'ambu_bag', 'iv_supplies', 'emergency_kit', 'safety_straps', 'wheelchair', 'syringe_pump', 'defibrillator', 'bipap', 'incubator', 'other'] }, description: 'Medical equipment the caller or the hospital asked for (living patients only).' },
+          equipment_other      : { type: 'string', description: 'Equipment asked for that is not in the list, in a few English words.' },
+          on_device            : { type: 'string', enum: ['ventilator', 'bipap', 'oxygen', 'none', 'unknown'], description: 'For a "ventilator / ICU / cardiac ambulance" request: what the patient is connected to NOW. unknown = the caller could not say.' },
+          floor                : { type: 'string', enum: ['ground', 'upstairs'], description: 'BLS home pickup: ground floor or upstairs.' },
+          lift                 : { type: 'boolean', description: 'Upstairs: true if there is a lift that takes a stretcher / wheelchair.' },
+          wheelchair_needed    : { type: 'boolean', description: 'true if they asked for a wheelchair.' },
+          ac_needed            : { type: 'boolean', description: 'true if they asked for AC.' },
+          access_note          : { type: 'string', description: 'Stairs, narrow lane, heavy patient — anything about shifting, in a few English words.' },
         },
         required: ['service_code'],
       },
@@ -263,6 +271,35 @@ async function getQuote(args, ctx) {
   if (!Number.isFinite(waitHours) || waitHours < 0 || waitHours > MAX_WAIT_HOURS) {
     return { ok: false, reason: 'bad_wait', say: `Ask how many hours the ambulance should wait (0 to ${MAX_WAIT_HOURS}).` };
   }
+  // Equipment (living patients): never inferred from the service name —
+  // checked against what the package carries (serviceFacts). Missing
+  // equipment: recommend the package that has it; nothing quoted until the
+  // caller agrees. Not in any package / patient's device unknown: ask, or
+  // a person (staff confirm).
+  const svcFacts = serviceFacts.facts(service.code);
+  const wanted = [...new Set([
+    ...(Array.isArray(args.equipment_requested) ? args.equipment_requested : []),
+    ...(args.on_device === 'ventilator' ? ['ventilator'] : args.on_device === 'bipap' ? ['bipap'] : []),
+  ])].filter((k) => k !== 'other');
+  if (svcFacts?.kind === 'patient') {
+    if (args.on_device === 'unknown') {
+      return { ok: false, reason: 'device_unclear', say: 'Ask once what equipment the hospital has asked for, for the transport (ventilator? BiPAP? monitor? oxygen only?). If they still cannot say, handoff_to_human (low_confidence) — never guess a package from the words "ICU" or "cardiac".' };
+    }
+    if (clean(args.equipment_other, 120) || (Array.isArray(args.equipment_requested) && args.equipment_requested.includes('other'))) {
+      return { ok: false, reason: 'equipment_unverified', equipment: clean(args.equipment_other, 120), say: 'That equipment is not in our verified package lists: say a team member will confirm it, and handoff_to_human (low_confidence) with the details.' };
+    }
+    const gap = serviceFacts.equipmentGap(service.code, wanted);
+    if (gap) {
+      const names = gap.missing.map((k) => serviceFacts.EQUIPMENT_NAMES[k] || k).join(', ');
+      const up = gap.upgrade ? services.find((x) => x.code === gap.upgrade) : null;
+      return up
+        ? {
+          ok: false, reason: 'equipment_not_in_package', missing: gap.missing, recommend_service_code: up.code, recommend_service: up.label,
+          say: `${service.label} does not carry: ${names}. Recommend ${up.label} in the caller's language${gap.upgrade === 'als_tempo' && gap.missing.some((k) => k === 'monitor' || k === 'suction') ? ' (Kannada: "ಮಾನಿಟರ್ ಅಥವಾ ಸಕ್ಷನ್ ಮಷೀನ್ ಬೇಕಿದ್ದರೆ ನಮ್ಮ ALS ಆಂಬುಲೆನ್ಸ್ ಆಯ್ಕೆ ಮಾಡಬೇಕು.")' : ''} and ask if they want its price. Only if they agree, get_quote with service_code ${up.code}. Never switch it yourself.`,
+        }
+        : { ok: false, reason: 'equipment_unverified', missing: gap.missing, say: `No package we can verify carries: ${names}. Say a team member will confirm, and handoff_to_human (low_confidence).` };
+    }
+  }
   if (roundTrip && serviceFacts.facts(service.code)?.oneWayOnly) {
     return { ok: false, reason: 'one_way_only', say: `${service.label} is one way only (the booking pages do not offer a return). Quote it one way.` };
   }
@@ -347,10 +384,15 @@ async function getQuote(args, ctx) {
   // A deceased body: no nurse, oxygen, helper or medical questions — those
   // are for living patients only (a real call asked "ನರ್ಸ್ ಬೇಕಾ?" for one).
   const isBody = serviceFacts.facts(service.code)?.kind === 'body';
-  const base = { pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng, selectedType: service.code, tripType };
+  // Helper: only BLS (the booking pages' rule). ALS / ACLS / NICU: the
+  // driver and nurse shift the patient — no helper is ever offered.
+  const helperAllowed = !atHospital && !isBody && svcFacts?.helper === true;
+  // AC: a BLS add-on priced from Pricing (acPerKm); elsewhere not verifiable.
+  const acPriced = args.ac_needed === true && svcFacts?.ac === 'addon';
+  const base = { pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng, selectedType: service.code, tripType, ...(acPriced ? { acEnabled: true } : {}) };
   const [plain, withHelper] = await Promise.all([
     quoteTrip(base),
-    atHospital || isBody ? null : quoteTrip({ ...base, helperEnabled: true }),
+    helperAllowed ? quoteTrip({ ...base, helperEnabled: true }) : null,
   ]);
   if (!plain) return { ok: false, reason: 'no_route', say: 'Could not find a road route. Ask the caller to check the places, or hand off.' };
   if (!plain.fare) return { ok: false, reason: 'no_price', say: 'No price for this service right now. Offer a callback from the team (end_call follow_up).' };
@@ -407,6 +449,14 @@ async function getQuote(args, ctx) {
     quotes: { plain, helper: helperOption },
     helper, waitHours: roundTrip ? waitHours : 0, waitCharge, longTrip, twoDrivers,
     freezer, verified, vehicle: verified ? f.vehicle : null, isBody,
+    ac: args.ac_needed === true ? (acPriced ? 'addon' : 'confirm') : null,
+    access: {
+      ...(['ground', 'upstairs'].includes(args.floor) ? { floor: args.floor } : {}),
+      ...(typeof args.lift === 'boolean' ? { lift: args.lift } : {}),
+      ...(clean(args.access_note, 200) ? { note: clean(args.access_note, 200) } : {}),
+    },
+    wheelchair: args.wheelchair_needed === true,
+    equipment: wanted,
   };
   const waitRule = wait
     ? `first ${wait.freeMinutes} minutes of waiting free, then ₹${wait.ratePerMin}/min${wait.tier2RatePerMin != null ? ` for ${wait.tier1Minutes} minutes, then ₹${wait.tier2RatePerMin}/min` : ''}`
@@ -427,6 +477,15 @@ async function getQuote(args, ctx) {
     atHospital ? 'The patient is at a hospital: do NOT ask about a helper.' : '',
     twoDrivers ? 'Over 1000 km: tell the caller two drivers are assigned for this trip.' : '',
     longTrip && !isBody ? 'Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care — only what you do not know yet.' : '',
+    !isBody && svcFacts && !svcFacts.helper ? `${service.label}: NEVER ask about a helper — the driver and nurse help shift the patient. If there are stairs, no lift or heavy lifting, note it (access_note) — the team confirms the arrangement.` : '',
+    helperAllowed && args.patient_at === 'home' && !args.floor ? 'BLS home pickup: ask ONE short question — "ಪೇಷಂಟ್ ಗ್ರೌಂಡ್ ಫ್ಲೋರ್‌ನಲ್ಲಿದ್ದಾರಾ, ಅಥವಾ ಮೇಲಿನ ಮಹಡಿಯಲ್ಲಿದ್ದಾರಾ?" (in the caller\'s language), unless they already said.' : '',
+    helperAllowed && args.floor === 'upstairs' && typeof args.lift !== 'boolean' ? 'Upstairs: ask once if there is a lift, then whether they need a helper to shift the patient.' : '',
+    helperAllowed && args.floor === 'upstairs' && args.lift === false ? 'Upstairs with no lift: a helper is recommended for shifting — offer it with its price.' : '',
+    args.wheelchair_needed === true && svcFacts?.wheelchair === 'on_request' ? 'Wheelchair: noted — say the team will check availability (not promised).' : '',
+    args.wheelchair_needed === true && svcFacts?.equipment.includes('wheelchair') ? 'Wheelchair: included in this package.' : '',
+    acPriced ? 'AC: the AC add-on is included in this price (from our price list); the team confirms an AC vehicle is available.' : '',
+    args.ac_needed === true && !acPriced ? `AC: we cannot confirm AC for ${service.label} from our records — say the team will confirm it; never promise AC.` : '',
+    svcFacts?.nurseMandatory ? 'A nurse is mandatory and included in this package.' : '',
     isBody ? 'Body transport: NEVER ask about a nurse, oxygen, a helper or what happened medically. Only what is needed — pickup, drop, pickup time; the name of the deceased once if not given (optional). Then ask to book.' : '',
     nurse && nurseIncluded ? 'Nurse: a nurse is INCLUDED in this service — say so; no extra charge.' : '',
     nurse && !nurseIncluded ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
@@ -538,6 +597,8 @@ async function readBackBooking(args, ctx) {
     `Vehicle: ${q.service.label}${q.tripType === 'round_trip' ? `, up and down${q.waitHours ? ` with about ${q.waitHours} h waiting` : ''}` : ''}${helper ? ', with helper' : ''}.`,
     `Fare: ₹${fare} (estimate).`,
     q.freezer === 'included' ? 'Freezer: included in this fare.' : '',
+    q.ac === 'addon' ? 'AC: included in this fare (the team confirms the vehicle).' : '',
+    q.ac === 'confirm' ? 'AC: the team will confirm.' : '',
     q.freezer === 'not_included' ? 'Freezer: not included.' : '',
   ].filter(Boolean).join(' ');
   ctx.state.approvalFails = 0;
@@ -610,15 +671,37 @@ async function createBooking(args, ctx) {
       }
       return { ok: false, reason: `approval_${verdict.status}`, say: (NOT_APPROVED[verdict.status] || NOT_APPROVED.unclear).replace(/"ಬುಕ್ ಮಾಡಲಾ\?"/g, `"${askToBook(ctx)}"`) };
     }
-    // Belt and braces for a retry after the in-memory state was lost.
+    // Belt and braces for a retry after the in-memory state was lost, or an
+    // attempt whose outcome is unknown: look for a booking first.
     const existing = await AiCall.findById(ctx.callId).select('trip').lean();
     if (existing?.trip) { state.booked = String(existing.trip); return alreadyBooked(); }
+    const made = await existingTrip(ctx);
+    if (made) {
+      state.booked = made.tripNumber || String(made._id);
+      await AiCall.updateOne({ _id: ctx.callId }, { $set: { trip: made._id, outcome: 'booked' } }).catch(() => {});
+      return alreadyBooked();
+    }
     return book(args, ctx, p.details);
   })();
   try {
     return await state.bookingInFlight;
   } finally {
     state.bookingInFlight = null;
+  }
+}
+
+// A Trip this call already created (ai_telecaller, this number, since the
+// call started) — e.g. a create that timed out after the Trip was saved.
+async function existingTrip(ctx) {
+  if (!ctx.callStartedAt) return null;
+  try {
+    const { Trip } = require('../../models');
+    const q = Trip?.findOne?.({ patientPhone: ctx.phone, bookingSource: 'ai_telecaller', createdAt: { $gte: new Date(ctx.callStartedAt) } });
+    if (!q) return null;
+    const found = await (typeof q.select === 'function' ? q.select('_id tripNumber') : q);
+    return found && found._id ? found : null;
+  } catch {
+    return null;
   }
 }
 
@@ -643,6 +726,8 @@ async function book(args, ctx, d) {
     // Same as the CRM form: a round trip returns to the pickup.
     ...(tripType === 'round_trip' ? { returnAddress: pickupLabel } : {}),
     ...(helper ? { helperEnabled: true } : {}),
+    // Same as the quote: the AC add-on (BLS) is in the fare the caller heard.
+    ...(ctx.state.quote.ac === 'addon' ? { acEnabled: true } : {}),
     scheduleType : d.when === 'later' ? 'later' : 'now',
     scheduleDate : d.when === 'later' ? d.scheduled_time.replace(' ', 'T') : undefined,
   }, { bookingSource: 'ai_telecaller' });
@@ -668,6 +753,11 @@ async function book(args, ctx, d) {
     ...(typeof args.freezer_box_needed === 'boolean' && ctx.state.quote.freezer !== 'included' ? { freezerBox: args.freezer_box_needed } : {}),
     // Body Shifting — Tempo: the freezer comes with the package.
     ...(ctx.state.quote.freezer === 'included' ? { freezerIncluded: true } : {}),
+    // For the team: shifting access, equipment asked for, wheelchair / AC to confirm.
+    ...(living && Object.keys(ctx.state.quote.access || {}).length ? { access: ctx.state.quote.access } : {}),
+    ...(living && ctx.state.quote.equipment?.length ? { equipment: ctx.state.quote.equipment } : {}),
+    ...(living && ctx.state.quote.wheelchair ? { wheelchair: true } : {}),
+    ...(ctx.state.quote.ac ? { ac: ctx.state.quote.ac } : {}),
   };
   await AiCall.updateOne({ _id: ctx.callId }, { $set: { trip: trip._id, outcome: 'booked', needs } });
   bookingPush.notifyIncomingBooking(trip._id); // rings the CRM — a person dispatches it
@@ -676,6 +766,9 @@ async function book(args, ctx, d) {
     needs.nurse && !nurseIncluded ? 'the nurse and its charge' : '',
     needs.freezerBox ? 'the freezer box and its charge' : '',
     ctx.state.quote.freezer === 'unverified' ? 'the freezer' : '',
+    ctx.state.quote.wheelchair && serviceFacts.facts(service.code)?.wheelchair === 'on_request' ? 'the wheelchair' : '',
+    ctx.state.quote.ac === 'confirm' ? 'AC' : '',
+    ctx.state.quote.access?.note ? 'the shifting arrangement' : '',
   ].filter(Boolean);
   return {
     ok: true,

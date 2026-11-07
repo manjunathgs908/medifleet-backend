@@ -18,43 +18,77 @@
 
 const COMMON = ['driver batta and fuel included', 'no toll charges'];
 
+// Medical equipment, by key. ALS / ACLS lists are SaveLife's own (given by
+// the owner); BLS is oxygen + stretcher; NICU is its booking-page entry.
+const EQUIPMENT_NAMES = {
+  oxygen: 'oxygen', stretcher: 'stretcher', monitor: 'patient monitor', ventilator: 'ventilator',
+  suction: 'suction machine', airway_kit: 'airway kit', ambu_bag: 'Ambu bag', iv_supplies: 'IV supplies',
+  emergency_kit: 'emergency kit', safety_straps: 'safety straps', wheelchair: 'wheelchair',
+  syringe_pump: '2 syringe pumps', defibrillator: 'defibrillator', bipap: 'BiPAP machine', incubator: 'infant transport incubator',
+};
+const ALS_EQUIPMENT = ['monitor', 'ventilator', 'suction', 'airway_kit', 'ambu_bag', 'iv_supplies', 'emergency_kit', 'stretcher', 'safety_straps', 'wheelchair', 'syringe_pump', 'oxygen'];
+const BLS_EQUIPMENT = ['oxygen', 'stretcher'];
+// Which package to recommend for equipment a service lacks: the first one
+// (in this order) that has all of it.
+const UPGRADE_ORDER = ['als_tempo', 'acls_tempo'];
+
+// ac: 'addon'  = an add-on priced from Pricing.acPerKm (quoteTrip acEnabled);
+//               the team still confirms an AC vehicle is free
+//     'confirm' = not verifiable from our records — record it, the team confirms
+// helper: a paid helper may be offered (BLS only, home pickups).
 const FACTS = {
   bls: {
     kind: 'patient', care: 'BLS (basic life support)', vehicle: 'eeco',
     purpose: 'basic life support for patients who are stable — oxygen on board, in a Maruti Eeco',
-    includes: ['oxygen on board', ...COMMON],
+    equipment: BLS_EQUIPMENT, ac: 'addon', helper: true, wheelchair: 'on_request',
+    includes: ['oxygen (the basic medical equipment)', 'a stretcher and the standard transport setup', ...COMMON],
   },
   bls_tempo: {
     kind: 'patient', care: 'BLS (basic life support)', vehicle: 'tempo',
     purpose: 'basic life support for patients who are stable — oxygen on board, in a bigger Tempo Traveller',
-    includes: ['oxygen on board', ...COMMON],
+    equipment: BLS_EQUIPMENT, ac: 'addon', helper: true, wheelchair: 'on_request',
+    includes: ['oxygen (the basic medical equipment)', 'a stretcher and the standard transport setup', ...COMMON],
   },
   als_tempo: {
     kind: 'patient', care: 'ALS (advanced life support)', vehicle: 'tempo',
-    purpose: 'advanced life support — a nurse, AC and oxygen on board',
-    includes: ['a nurse for the journey (no separate helper needed)', 'AC', 'oxygen on board', ...COMMON], nurseIncluded: true,
+    purpose: 'advanced life support — a mandatory nurse, ventilator, monitor and suction on board',
+    equipment: ALS_EQUIPMENT, ac: 'confirm', helper: false, nurseIncluded: true, nurseMandatory: true,
+    includes: ['a nurse (mandatory, included)', 'patient monitor, ventilator, suction machine, airway kit, Ambu bag, IV supplies, emergency kit', 'stretcher, safety straps, wheelchair, 2 syringe pumps', 'the driver and nurse help shift the patient', ...COMMON],
   },
   acls_tempo: {
     kind: 'patient', care: 'ACLS (advanced cardiac life support)', vehicle: 'tempo',
-    purpose: 'advanced cardiac life support — a nurse, AC and oxygen on board, for critical patients',
-    includes: ['a nurse for the journey (no separate helper needed)', 'AC', 'oxygen on board', ...COMMON], nurseIncluded: true,
+    purpose: 'advanced cardiac life support — everything in ALS plus a defibrillator and BiPAP, mandatory nurse',
+    equipment: [...ALS_EQUIPMENT, 'defibrillator', 'bipap'], ac: 'confirm', helper: false, nurseIncluded: true, nurseMandatory: true,
+    includes: ['a nurse (mandatory, included)', 'all ALS equipment (monitor, ventilator, suction, airway kit, Ambu bag, IV supplies, emergency kit, stretcher, safety straps, wheelchair, 2 syringe pumps)', 'plus a defibrillator and a BiPAP machine', 'the driver and nurse help shift the patient', ...COMMON],
   },
   nicu_tempo: {
     kind: 'patient', care: 'NICU (newborn intensive care)', vehicle: 'tempo',
-    purpose: 'newborn intensive care transport — a nurse, AC and an infant incubator',
-    includes: ['a nurse for the journey', 'AC', 'an infant transport incubator', ...COMMON], nurseIncluded: true,
+    purpose: 'newborn intensive care transport — a nurse and an infant incubator',
+    equipment: ['incubator'], ac: 'confirm', helper: false, nurseIncluded: true,
+    includes: ['a nurse for the journey', 'an infant transport incubator', ...COMMON],
   },
   body_tempo: {
-    kind: 'body', care: null, vehicle: 'tempo', oneWayOnly: true, freezerIncluded: true,
+    kind: 'body', care: null, vehicle: 'tempo', oneWayOnly: true, freezerIncluded: true, equipment: [], ac: 'confirm', helper: false,
     purpose: 'dead body transport by road in a Tempo Traveller, freezer included',
     includes: ['the freezer for the body (included in the fare)', ...COMMON],
   },
   body_mini: {
-    kind: 'body', care: null, vehicle: 'eeco', oneWayOnly: true, freezerIncluded: false,
+    kind: 'body', care: null, vehicle: 'eeco', oneWayOnly: true, freezerIncluded: false, equipment: [], ac: 'confirm', helper: false,
     purpose: 'dead body transport by road in a Maruti Eeco, no freezer',
     includes: [...COMMON],
   },
 };
+
+// Equipment the service does not carry, and the package to recommend.
+// wheelchair on BLS is "on request" (recorded, availability checked) — not missing.
+function equipmentGap(code, wanted = []) {
+  const f = FACTS[code];
+  if (!f) return null;
+  const missing = wanted.filter((k) => !f.equipment.includes(k) && !(k === 'wheelchair' && f.wheelchair === 'on_request'));
+  if (!missing.length) return null;
+  const upgrade = f.kind === 'patient' && code !== 'nicu_tempo' ? UPGRADE_ORDER.find((c) => wanted.every((k) => FACTS[c].equipment.includes(k))) : null;
+  return { missing, upgrade: upgrade || null };
+}
 
 // The services that are not booked on the call: the team arranges them and
 // calls back with the price. Descriptions are the website's own words
@@ -122,4 +156,4 @@ function describe(code, label) {
   };
 }
 
-module.exports = { OTHER_SERVICES, FUNERAL_DETAILS, CARGO_PROCESS, FACTS, facts, describe, checkAgainstQuote, vehicleFamily, EECO_MAX_KM, TEMPO_FOR, VEHICLE_NAMES };
+module.exports = { EQUIPMENT_NAMES, equipmentGap, OTHER_SERVICES, FUNERAL_DETAILS, CARGO_PROCESS, FACTS, facts, describe, checkAgainstQuote, vehicleFamily, EECO_MAX_KM, TEMPO_FOR, VEHICLE_NAMES };

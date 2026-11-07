@@ -57,6 +57,12 @@ const AiCallSchema = new mongoose.Schema(
       appointmentAt: { type: Date },           // hospital appointment — NOT the pickup time (Trip.scheduleDate)
       freezerBox   : { type: Boolean },        // body transport: a freezer box too (team confirms the charge)
       freezerIncluded: { type: Boolean },      // Body Shifting — Tempo: the freezer comes with the package
+      // Shifting access (BLS home pickups: floor, lift; any: a note), equipment
+      // asked for, a wheelchair to check, AC ('addon' priced / 'confirm').
+      access    : { floor: { type: String, enum: ['ground', 'upstairs'] }, lift: Boolean, note: { type: String, maxlength: 200 } },
+      equipment : [{ type: String }],
+      wheelchair: { type: Boolean },
+      ac        : { type: String, enum: ['addon', 'confirm'] },
     },
     // A request the team prices and calls back about (not bookable here).
     request: {

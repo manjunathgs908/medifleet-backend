@@ -87,6 +87,9 @@ const STRETCH_BREAK_VOICE_MS = 200; // any real caller speech ends Sahana's curr
 const TAIL_GRACE_MS = 1800;    // cut within the last 1.8 s ("ಬುಕ್ ಮಾಡಲಾ?", "ಧನ್ಯವಾದ"): the read-back still counts as heard
 const ANSWER_OVERLAP_MS = 1500; // a "yes" over the closing question counts as the answer
 const HANDOFF_AFTER_LINE_MS = 6000;
+const WRAP_UP_BEFORE_MS = 30000;   // this long before the deadline: "finish now"
+const DEADLINE_WAIT_MS = 5000;     // a booking being created at the deadline: wait this long, a few times
+const DEADLINE_WAITS = 3;
 // Words that are only an acknowledgement — they never cut Sahana off.
 // Includes the dialect forms real callers use ("ಆವದು" for ಹೌದು, "ಮೇಡ"),
 // "ಹಲೋ" (checking the line), and Kannada heard in Telugu letters.
@@ -156,6 +159,7 @@ const LINES = {
     price: PRICE_HOLD_LINE, hold: HOLD_LINE, waFailed: WHATSAPP_FAILED_LINE, notBooked: NOT_BOOKED_LINE, resume: RESUME_LINE, timeUp: TIME_UP_BOOKED_LINE,
     booked: 'ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು. ಟ್ರಿಪ್ ನಂಬರ್ {trip}. ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡಿ ವಾಹನವನ್ನು ಖಚಿತಪಡಿಸ್ತಾರೆ.',
     stuck: 'ಕ್ಷಮಿಸಿ, ನಮ್ಮ ತಂಡದವರು ಈಗಲೇ ನಿಮ್ಮ ಬುಕ್ಕಿಂಗ್ ಖಚಿತಪಡಿಸ್ತಾರೆ.',
+    deadline: 'ಕ್ಷಮಿಸಿ, ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಆಗಿಲ್ಲ. ನೀವು ಹೇಳಿದ ವಿವರಗಳೊಂದಿಗೆ ನಮ್ಮ ತಂಡದವರು ಈಗಲೇ ಮುಂದುವರಿಸ್ತಾರೆ — ಮತ್ತೆ ಎಲ್ಲಾ ಹೇಳಬೇಕಾಗಿಲ್ಲ.',
   },
   hi: {
     price: 'एक मिनट, सही किराया बताती हूँ।',
@@ -166,6 +170,7 @@ const LINES = {
     timeUp: 'आपकी बुकिंग हो गई है, हमारी टीम थोड़ी देर में कॉल करेगी। धन्यवाद!',
     booked: 'बुकिंग हो गई। ट्रिप नंबर {trip}। हमारी टीम थोड़ी देर में कॉल करके गाड़ी पक्की करेगी।',
     stuck: 'माफ़ कीजिए, हमारी टीम अभी आपकी बुकिंग पक्की करेगी।',
+    deadline: 'माफ़ कीजिए, बुकिंग अभी नहीं हुई है। आपने जो बताया है उसके साथ हमारी टीम अभी आगे बढ़ाएगी — आपको सब दोबारा नहीं बताना पड़ेगा।',
   },
   en: {
     price: "One moment, I'll tell you the exact fare.",
@@ -176,6 +181,7 @@ const LINES = {
     timeUp: 'Your booking is done; our team will call you shortly. Thank you!',
     booked: 'Your booking is done. Trip number {trip}. Our team will call shortly to confirm the vehicle.',
     stuck: 'Sorry — a team member will confirm your booking with you right now.',
+    deadline: 'Sorry, the booking is not done yet. Our team will continue right now with the details you gave — you will not need to repeat everything.',
   },
 };
 const linesFor = (lang) => LINES[lang] || (lang ? LINES.en : LINES.kn);
@@ -235,6 +241,7 @@ Round trip / up and down / the ambulance must wait: get_quote with round_trip tr
 Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
 BOOKING — never stall: when the caller says to book, call read_back_booking at once (if not done), and after their yes call create_booking at once. Never answer with text like "please wait / processing" instead of calling the tool. patient_name is optional: never hold a booking for it, never ask it again after the read-back.
 BODY TRANSPORT (body_mini / body_tempo) and freezer box: never ask about a nurse, oxygen, a helper or the medical condition — those are only for living patients.
+Ventilator / ICU / cardiac requests: the package comes from on_device / equipment_requested in get_quote, never from the words. Helper: BLS home pickups only (ask floor and lift first); never for ALS / ACLS / NICU. A BLS caller wanting a monitor or suction: recommend ALS, requote only after they agree. AC: ac_needed.
 Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it) — ALS/ACLS/NICU include a nurse. Over 1000 km: two drivers are assigned.
 Vehicles and inclusions only from service_info / get_quote: Body Shifting — Tempo includes the freezer (never a separate charge); Body Mini — Eeco has none (offer the Tempo; new get_quote only if chosen). Eeco over 800 km: recommend a Tempo Traveller, never switch it yourself. A vague place (a whole state) is refused: ask the town and exact place. Discount / advance / settlement / conditional yes: record_question, never promise, never book on a condition. A clear no: no booking, a polite close, end_call not_needed.
 Dates: take them from the DATE AND TIME list in the instructions; never ask the caller for a month or year.
@@ -312,6 +319,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     vad: { voiced: 0, silence: 0, talking: false, holdMs: 0, capped: false },
     callerFrags: [], // { at, text } — what the caller said and when (approval)
     bookWatch: null, lastToolAt: 0, // the booking watchdog
+    startedAt: new Date(), // server time: bookings this call made are searched from here
   };
   active.set(callId, s);
   // This call's instructions: today's IST date (server time) and the real
@@ -632,7 +640,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   //   - "ಬುಕ್ ಮಾಡಿ" with a quote but no read-back yet -> the model is told
   //     to read back now; if no booking step happens for BOOK_STUCK_MS, a
   //     person takes over WITH the details — never minutes of "processing".
-  const toolCtx = () => ({ callId, phone: s.phone, state: s.state, approval, now, language: s.language });
+  const toolCtx = () => ({ callId, phone: s.phone, state: s.state, approval, now, language: s.language, callStartedAt: s.startedAt });
   const watchActive = (w) => s.bookWatch === w && !s.state.booked && !s.ended && !s.ending;
   function watchBooking(turn) {
     if (s.state.booked || s.ending || s.ended || s.bookWatch) return;
@@ -684,11 +692,27 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
       bookingStuck();
     }
   }
+  // Everything collected so far, for the person who takes over — so the
+  // caller never has to repeat it.
+  function collectedDetails() {
+    const q = s.state.quote;
+    const p = s.state.pending;
+    const lines = [];
+    if (p?.summary) lines.push(`Read back: ${p.summary}`);
+    else if (q) lines.push(`Pickup: ${q.pickup.address}. Drop: ${q.drop.address}. Vehicle: ${q.service.label}. Quoted: ₹${q.quotes.plain.fare.grandTotal + (q.waitCharge || 0)}. Pickup time: ask the caller.`);
+    else lines.push('No quote yet.');
+    if (q?.access && Object.keys(q.access).length) lines.push(`Access: ${[q.access.floor, typeof q.access.lift === 'boolean' ? (q.access.lift ? 'lift' : 'no lift') : '', q.access.note].filter(Boolean).join(', ')}.`);
+    if (q?.equipment?.length) lines.push(`Equipment asked: ${q.equipment.join(', ')}.`);
+    if (q?.wheelchair) lines.push('Wheelchair requested.');
+    if (q?.ac) lines.push(`AC requested (${q.ac === 'addon' ? 'priced add-on' : 'to confirm'}).`);
+    if (s.language) lines.push(`Language: ${s.language}.`);
+    const said = s.recent.filter((t) => t.role === 'caller').slice(-3).map((t) => t.text).join(' / ');
+    if (said) lines.push(`Caller last said: ${said}`);
+    return lines.join(' ').slice(0, 1000);
+  }
   async function bookingStuck() {
     if (s.state.booked || s.ended || s.ending) return;
-    const q = s.state.quote;
-    const summary = s.state.pending?.summary
-      || (q ? `Pickup: ${q.pickup.address}. Drop: ${q.drop.address}. Vehicle: ${q.service.label}. Quoted: ₹${q.quotes.plain.fare.grandTotal + (q.waitCharge || 0)}. Pickup time: ask the caller.` : 'No quote yet.');
+    const summary = collectedDetails();
     note('system', 'Booking did not complete — handing to a person with the details');
     await AiCall.updateOne({ _id: callId }, { $set: { pendingBooking: { summary: summary.slice(0, 1000), reason: 'booking_stuck', at: new Date() } } }).catch(() => {});
     sendAI({ type: 'session.commentary.append', event_id: `event_stuck_${Date.now()}`, delegation_id: null, content: linesFor(s.language).stuck });
@@ -895,6 +919,36 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     handOff('time_limit');
   };
   s.timers.push(setTimeout(timeUp, config.maxCallSeconds() * 1000));
+
+  // The AI's own deadline (AI_CALL_TARGET_SECONDS, default 3 minutes). Not
+  // booked by then: she says the real status in one line and the team takes
+  // over with every detail collected (pendingBooking + summary). A booking
+  // being created right then is waited for, never interrupted.
+  const deadlineMs = config.targetSeconds() * 1000;
+  if (deadlineMs - WRAP_UP_BEFORE_MS > 0) {
+    s.timers.push(setTimeout(() => {
+      if (s.ended || s.ending || s.state.booked) return;
+      sendAI({
+        type: 'session.instructions.append', event_id: 'event_wrap_up', delegation_id: null,
+        content: 'TIME: about 30 seconds left. Finish now: if the caller has approved, book at once; otherwise collect only what is missing in one short question. No long explanations.',
+      });
+    }, deadlineMs - WRAP_UP_BEFORE_MS));
+  }
+  let deadlineWaits = 0;
+  const deadline = async () => {
+    if (s.ended || s.ending || s.state.booked) return;
+    if (s.state.bookingInFlight && deadlineWaits < DEADLINE_WAITS) {
+      deadlineWaits += 1;
+      s.timers.push(setTimeout(deadline, DEADLINE_WAIT_MS));
+      return;
+    }
+    const summary = collectedDetails();
+    note('system', `3-minute deadline — not booked; handing to the team with the details: ${summary.slice(0, 300)}`);
+    await AiCall.updateOne({ _id: callId }, { $set: { pendingBooking: { summary, reason: 'deadline', at: new Date() }, summary: `Not booked by the AI in time. ${summary}`.slice(0, 1000) } }).catch(() => {});
+    sendAI({ type: 'session.commentary.append', event_id: 'event_deadline', delegation_id: null, content: linesFor(s.language).deadline });
+    s.timers.push(setTimeout(() => handOff('deadline'), HANDOFF_AFTER_LINE_MS));
+  };
+  s.timers.push(setTimeout(deadline, deadlineMs));
 
   connectAI();
 

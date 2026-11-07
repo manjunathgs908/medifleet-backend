@@ -1426,6 +1426,72 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(call().handoff).toBeFalsy();
   });
 
+  // ── The 3-minute deadline ──
+  test('3-minute deadline, not booked: wrap-up at 2:30, then the real status and a handoff WITH the details', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    try {
+      await begin();
+      pastOpening();
+      await satara();
+      callerSays('ಮೇಡಮ್ ಮೊದಲನೇ ಮಹಡಿ, ಲಿಫ್ಟ್ ಇಲ್ಲ');
+      await jest.advanceTimersByTimeAsync(150 * 1000 + 100);
+      expect(ai.of('session.instructions.append').map((m) => m.content)).toEqual(expect.arrayContaining([expect.stringMatching(/^TIME: about 30 seconds left\. Finish now/)]));
+      expect(call().handoff).toBeFalsy();
+      await jest.advanceTimersByTimeAsync(30 * 1000);
+      await flush();
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.LINES.kn.deadline);
+      expect(call().pendingBooking).toMatchObject({ reason: 'deadline', summary: expect.stringMatching(/Pickup: Nagarabhavi, India\. Drop: Satara, India\. Vehicle: Dead Body Transport - Body Shifting \(Tempo\)\. Quoted: ₹31945\. Pickup time: ask the caller\..*Caller last said: ಮೇಡಮ್ ಮೊದಲನೇ ಮಹಡಿ, ಲಿಫ್ಟ್ ಇಲ್ಲ/) });
+      expect(call().summary).toMatch(/^Not booked by the AI in time\./);
+      await jest.advanceTimersByTimeAsync(6100);
+      await flush();
+      expect(call().handoffReason).toBe('deadline');
+      expect(createBookedTrip).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a booking being created right at the deadline is waited for — it completes, no handoff', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    try {
+      await begin();
+      pastOpening();
+      await satara();
+      createBookedTrip.mockImplementation(() => new Promise((resolve) => { setTimeout(() => resolve({ _id: 'tripD', tripNumber: 'TRP-D', estimatedFare: 31945 }), 7000); }));
+      await jest.advanceTimersByTimeAsync(170 * 1000);
+      ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+      await flush();
+      clock.t += 20;
+      sahanaSays(3000);
+      clock.t += 3100;
+      callerSays('ಹೌದು, ಬುಕ್ ಮಾಡಿ');
+      await jest.advanceTimersByTimeAsync(7000);  // 177 s
+      ai.push(fnCall('create_booking', { customer_confirmed: true }, 'b1'));
+      await flush();
+      await jest.advanceTimersByTimeAsync(4000);  // 181 s: deadline passes while the booking is in flight
+      expect(call().handoff).toBeFalsy();
+      await jest.advanceTimersByTimeAsync(5000);  // the booking finishes
+      await flush(10);
+      await jest.advanceTimersByTimeAsync(10000);
+      await flush();
+      expect(createBookedTrip).toHaveBeenCalledTimes(1);
+      expect(call()).toMatchObject({ trip: 'tripD', outcome: 'booked' });
+      expect(call().handoffReason).toBeUndefined();
+      expect(ai.of('session.commentary.append').map((m) => m.content)).not.toContain(session.LINES.kn.deadline);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('ventilator enquiry in a live session: a BLS quote is refused and ALS recommended', async () => {
+    await begin();
+    resolvePlaceFromText.mockResolvedValue({ status: 'single', place: { name: 'X', address: 'Bengaluru', lat: 1, lng: 1 } });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'NIMHANS', on_device: 'ventilator' }, 'q1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'equipment_not_in_package', recommend_service_code: 'als_tempo' });
+    expect(call().transcript.map((t) => t.text)).toContain('get_quote -> equipment_not_in_package');
+  });
+
   test('the tool model\'s own words are logged, so a stalled booking explains itself', async () => {
     await begin();
     ai.push({ type: 'response.event', event: { type: 'response.completed', response: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'Please ask the caller for the patient name first.' }] }], usage: { input_tokens: 10, output_tokens: 5 } } } });
@@ -1450,7 +1516,8 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     }
   });
 
-  test('time limit → handed to a person', async () => {
+  test('the hard time limit still hands off when the 3-minute target is set to it', async () => {
+    process.env.AI_CALL_TARGET_SECONDS = '300';
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     try {
       await begin();
@@ -1459,6 +1526,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       expect(call().handoffReason).toBe('time_limit');
     } finally {
       jest.useRealTimers();
+      delete process.env.AI_CALL_TARGET_SECONDS;
     }
   });
 

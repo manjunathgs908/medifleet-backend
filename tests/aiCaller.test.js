@@ -326,7 +326,7 @@ describe('STEP 2B. Plivo answer webhook', () => {
     const res = await http('POST', `/api/ai-caller/plivo/answer?call=${id}`, { form: { To: `91${TEST_NO}`, CallUUID: 'uuid-1' } });
     expect(res.status).toBe(200);
     expect(res.text).toContain('<Record recordSession="true"');
-    expect(res.text).toMatch(/<Stream bidirectional="true" keepCallAlive="true" contentType="audio\/x-mulaw;rate=8000" streamTimeout="300">wss:\/\/api\.savelife\.health\/api\/ai-caller\/stream\?call=/);
+    expect(res.text).toMatch(/<Stream bidirectional="true" keepCallAlive="true" contentType="audio\/x-mulaw;rate=8000" streamTimeout="390">wss:\/\/api\.savelife\.health\/api\/ai-caller\/stream\?call=/);
     // After the stream, ALWAYS: Plivo itself asks /next what to do (no REST transfer to race the call).
     expect(res.text).toContain(`</Stream><Redirect method="POST">https://api.savelife.health/api/ai-caller/plivo/next?call=${id}</Redirect>`);
     const url = res.text.match(/>(wss:[^<]+)</)[1].replace(/&amp;/g, '&');
@@ -567,8 +567,8 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(session.isDistress('I need an emergency ambulance to Victoria hospital')).toBe(false);
   });
 
-  test('OpenAI closes the socket: code + reason logged and stored, handed to a person', async () => {
-    await begin();
+  test('OpenAI closes the socket BEFORE the session started: code + reason logged and stored, handed to a person', async () => {
+    await begin({ started: false });
     const info = jest.spyOn(console, 'info').mockImplementation(() => {});
     ai.readyState = 3;
     ai.emit('close', 1008, Buffer.from('Unknown model gpt-6-luna'));
@@ -666,6 +666,143 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       await jest.advanceTimersByTimeAsync(10100);
       await flush();
       expect(call()).toMatchObject({ status: 'handing_off', handoffReason: 'AI session did not start in time' });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  // ── GPT-Live dropping mid-call: reconnect and carry on ──
+  const beginMany = async () => {
+    const sockets = [];
+    const created = await AiCall.create({ phone: TEST_NO, status: 'in_progress', plivoCallUuid: 'uuid-1' });
+    callId = String(created._id);
+    plivoWs = new FakeSocket(1);
+    const connectOpenAI = jest.fn(() => { const s = new FakeSocket(0); sockets.push(s); return s; });
+    await session.createSession({ callId, plivoWs, connectOpenAI });
+    plivoWs.push({ event: 'start', start: { streamId: 'st-1' } });
+    [ai] = sockets;
+    ai.open();
+    ai.push({ type: 'session.started', session: { id: 'sess_1' } });
+    await flush();
+    return { sockets, connectOpenAI };
+  };
+  const quietLogs = () => ['info', 'warn', 'error'].map((m) => jest.spyOn(console, m).mockImplementation(() => {}));
+
+  test('OpenAI drops mid-call: reconnected with the conversation so far, a short sorry, and the call carries on', async () => {
+    const spies = quietLogs();
+    try {
+      const { sockets, connectOpenAI } = await beginMany();
+      ai.push({ type: 'session.input_transcript.delta', delta: 'Jayanagar to NIMHANS please' });
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಸರಿ' }); // the caller's turn is written
+      await flush();
+      ai.readyState = 3;
+      ai.emit('close', 1011, Buffer.from('internal error'));
+      await flush();
+      expect(call()).toMatchObject({ status: 'in_progress', openaiClose: { code: 1011, reason: 'internal error' }, aiReconnects: 1 });
+      expect(call().error).toBeUndefined();
+      expect(call().handoff).toBeFalsy();
+
+      await new Promise((r) => setTimeout(r, 400));
+      expect(connectOpenAI).toHaveBeenCalledTimes(2);
+      const ai2 = sockets[1];
+      ai2.open();
+      const [start] = ai2.of('session.start');
+      expect(start.session.instructions).toMatch(/THE LINE DROPPED FOR A MOMENT/);
+      expect(start.session.instructions).toMatch(/Do NOT say the opening again/);
+      expect(start.session.instructions).toMatch(/Caller: Jayanagar to NIMHANS please/);
+      // Nothing goes to the new session before it has started.
+      plivoWs.push({ event: 'media', media: { payload: 'AAAA' } });
+      expect(ai2.of('session.input_audio.append')).toHaveLength(0);
+      ai2.push({ type: 'session.started', session: { id: 'sess_2' } });
+      await flush();
+      expect(ai2.of('session.commentary.append').map((m) => m.content)).toEqual([session.RESUME_LINE]);
+      plivoWs.push({ event: 'media', media: { payload: 'BBBB' } });
+      expect(ai2.of('session.input_audio.append')).toEqual([expect.objectContaining({ audio: 'BBBB' })]);
+      // The dead socket can no longer act on the call.
+      ai.push(fnCall('handoff_to_human', { reason: 'other' }));
+      await flush();
+      expect(call().handoff).toBeFalsy();
+      expect(call().transcript.map((t) => t.text)).toEqual(expect.arrayContaining([expect.stringMatching(/AI line dropped/), expect.stringMatching(/AI reconnected \(1\/2\)/)]));
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  test('a booking made before the drop is not repeated after reconnecting', async () => {
+    const spies = quietLogs();
+    try {
+      const { sockets } = await beginMany();
+      session._active.get(callId).state.booked = 'TRP-42';
+      session._active.get(callId).state.quote = { any: 1 };
+      ai.readyState = 3;
+      ai.emit('error', new Error('ECONNRESET'));
+      await new Promise((r) => setTimeout(r, 400));
+      sockets[1].open();
+      expect(sockets[1].of('session.start')[0].session.instructions).toMatch(/The booking is ALREADY made \(TRP-42\) — do not book again/);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  test(`after ${2} reconnects a further drop hands to a person, with the reason`, async () => {
+    const spies = quietLogs();
+    try {
+      const { sockets } = await beginMany();
+      for (let i = 0; i < session.MAX_AI_RECONNECTS; i += 1) {
+        const cur = sockets[i];
+        cur.readyState = 3;
+        cur.emit('close', 1006, Buffer.from(''));
+        await new Promise((r) => setTimeout(r, 300 * (i + 1) + 100));
+        sockets[i + 1].open();
+        sockets[i + 1].push({ type: 'session.started', session: { id: `s${i + 2}` } });
+        await flush();
+      }
+      expect(call()).toMatchObject({ status: 'in_progress', aiReconnects: 2 });
+      const last = sockets[session.MAX_AI_RECONNECTS];
+      last.readyState = 3;
+      last.emit('close', 1006, Buffer.from(''));
+      await flush();
+      expect(call()).toMatchObject({ status: 'handing_off', error: 'AI connection closed (code 1006) (after 2 reconnects)' });
+      expect(sockets).toHaveLength(3);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  test('a reconnect that cannot start in time hands off (counts as an attempt)', async () => {
+    const spies = quietLogs();
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      const { sockets } = await beginMany();
+      ai.readyState = 3;
+      ai.emit('close', 1006, Buffer.from(''));
+      await jest.advanceTimersByTimeAsync(400);
+      expect(sockets).toHaveLength(2); // reconnecting...
+      await jest.advanceTimersByTimeAsync(10 * 1000 + 100); // ...but it never starts
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(sockets).toHaveLength(3); // second and last attempt
+      await jest.advanceTimersByTimeAsync(10 * 1000 + 100);
+      await flush();
+      expect(call().status).toBe('handing_off');
+      expect(call().error).toMatch(/AI did not connect in time \(after 2 reconnects\)/);
+    } finally {
+      jest.useRealTimers();
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  test('time limit after a booking: a goodbye and hang up — not a handoff', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      await begin();
+      session._active.get(callId).state.booked = 'TRP-7';
+      await jest.advanceTimersByTimeAsync(300 * 1000 + 100);
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.TIME_UP_BOOKED_LINE);
+      await jest.advanceTimersByTimeAsync(7 * 1000 + 100);
+      await flush();
+      expect(call()).toMatchObject({ endRequested: true });
+      expect(call().handoffReason).toBeUndefined();
+      expect(plivoWs.of('checkpoint')[0]).toMatchObject({ name: 'goodbye' });
     } finally {
       jest.useRealTimers();
     }

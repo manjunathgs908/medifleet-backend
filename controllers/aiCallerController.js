@@ -22,6 +22,8 @@ const config = require('../services/aiCaller/config');
 const calls = require('../services/aiCaller/calls');
 const streamServer = require('../services/aiCaller/streamServer');
 const locationRequests = require('../services/locationRequests');
+
+const STREAM_GRACE_SECONDS = 90;
 const { maskPhone } = require('../utils/customerPhone');
 const { normalisePhone } = require('../utils/phone');
 
@@ -126,7 +128,12 @@ exports.answer = async (req, res, next) => {
       streamUrl : streamServer.streamUrl(id),
       recordUrl : plivo.apiUrl(`/api/ai-caller/plivo/recording?call=${id}`),
       nextUrl   : plivo.apiUrl(`/api/ai-caller/plivo/next?call=${id}`),
-      maxSeconds: config.maxCallSeconds(),
+      // Plivo's stream timeout is a backstop only: STREAM_GRACE_SECONDS
+      // after the session's own time limit, so the session always ends the
+      // call itself (goodbye after a booking, or a 'time_limit' handoff).
+      // Equal to it, Plivo won the race and the call ended mid-sentence as
+      // "stream ended unexpectedly".
+      maxSeconds: config.maxCallSeconds() + STREAM_GRACE_SECONDS,
     }));
   } catch (err) {
     // Never leave a caller in silence: apologise and hang up.

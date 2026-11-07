@@ -33,7 +33,10 @@
  *   - no medical advice (instructions) — and words of a real medical
  *     emergency from the caller (DISTRESS: unconscious, not breathing...)
  *     hand the call to a person at once. "Urgent" alone never does;
- *   - a hard time limit (config.maxCallSeconds) hands off to a person;
+ *   - a hard time limit (config.maxCallSeconds): booked already -> a
+ *     goodbye and hang up; otherwise a person ('time_limit');
+ *   - GPT-Live dropping mid-call reconnects (MAX_AI_RECONNECTS) with the
+ *     conversation so far, and the call carries on;
  *   - ANY failure hands off to a person. The session never transfers or
  *     hangs up through Plivo's REST API: it records the next step on the
  *     AiCall and closes the stream, and Plivo's <Redirect> after <Stream>
@@ -52,6 +55,9 @@ const OPENAI_CONNECT_TIMEOUT_MS = 10000; // socket open + session.started
 const HANGUP_AFTER_GOODBYE_MS = 8000;    // if Plivo never confirms the goodbye finished playing
 const SESSION_CLOSE_WAIT_MS = 3000;      // for session.closed (final usage) after session.close
 const TURN_IDLE_MS = 1500;               // a speaker's transcript fragments -> one turn after this quiet
+const MAX_AI_RECONNECTS = 2;             // a GPT-Live drop mid-call: reconnect and carry on, up to this many times
+const RECENT_TURNS = 40;                 // conversation kept in memory, handed to a reconnected session
+const TIME_UP_GOODBYE_MS = 7000;         // time limit after a booking: the goodbye plays, then the call ends
 const MAX_TRANSCRIPT = 200;
 
 // The opening, said as soon as the call connects: hello, the disclosure
@@ -63,6 +69,10 @@ const DISCLOSURE_KN = 'ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife �
 const DISCLOSURE_EN = "I'm Sahana, SaveLife's automated assistant. This call is recorded.";
 const OPENING_QUESTION = 'Ambulance ಬೇಕಾ?';
 const OPENING = `${DISCLOSURE_KN} ${DISCLOSURE_EN} ${OPENING_QUESTION}`;
+// After GPT-Live reconnected mid-call, and when the time limit ends a call
+// that is already booked.
+const RESUME_LINE = 'ಕ್ಷಮಿಸಿ, ಲೈನ್ ಸ್ವಲ್ಪ ಕಟ್ ಆಯ್ತು.';
+const TIME_UP_BOOKED_LINE = 'ನಿಮ್ಮ ಬುಕ್ಕಿಂಗ್ ಆಗಿದೆ, ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡುತ್ತಾರೆ. ಧನ್ಯವಾದಗಳು!';
 
 // The base rules (prompt.BASE_INSTRUCTIONS); each call's instructions add
 // today's IST date with every relative day resolved, and the style
@@ -74,6 +84,8 @@ const DELEGATE_INSTRUCTIONS = `
 You run the tools for SaveLife's phone assistant. Use only these tools; never answer medical questions — use handoff_to_human for those, for a real medical emergency, or when the caller asks for a person. Never hand off just because the caller says "urgent".
 get_quote is the only source of prices. create_booking only after the caller clearly confirmed the read-back details (customer_confirmed true). A freezer box kept at home is never priced: freezer_box_request, then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
+Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
+Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it). Over 1000 km: two drivers are assigned.
 Dates: take them from the DATE AND TIME list in the instructions; never ask the caller for a month or year.
 Reply briefly in plain words the phone assistant can say aloud.
 `.trim();
@@ -127,6 +139,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     callId, phone: call.phone, plivoWs, openai: null,
     streamId: null, socketOpen: false, ready: false, ended: false, ending: false,
     state: {}, timers: [], languageSet: false,
+    recent: [], everReady: false, reconnects: 0,
     turns: { caller: '', assistant: '' }, turnTimer: { caller: null, assistant: null },
   };
   active.set(callId, s);
@@ -142,6 +155,10 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
   const note = (role, text) => {
     if (!text || !String(text).trim()) return;
+    if (role !== 'system') {
+      s.recent.push({ role, text: String(text).trim().slice(0, 500) });
+      if (s.recent.length > RECENT_TURNS) s.recent.shift();
+    }
     AiCall.updateOne({ _id: callId }, { $push: { transcript: { $each: [{ role, text: String(text).trim().slice(0, 2000), at: new Date() }], $slice: -MAX_TRANSCRIPT } } })
       .catch((err) => console.error('[aiCaller] transcript write failed:', err.message));
   };
@@ -223,55 +240,112 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   };
 
   // ── OpenAI ────────────────────────────────────────────────
-  try {
-    s.openai = connectOpenAI();
-  } catch (err) {
-    await fallback(`AI could not start (${err.message})`);
-    return s;
+  // GPT-Live dropping AFTER the session started (OpenAI closed the socket,
+  // a network error) does not end the call: a fresh session is opened —
+  // up to MAX_AI_RECONNECTS times — with the same instructions plus the
+  // conversation so far, and the call's tool state (quote, booking) stays
+  // in s.state. Only a session that never started, or a drop after the
+  // reconnects are used up, hands off to a person.
+  const resumeInstructions = () => [
+    s.instructions,
+    'THE LINE DROPPED FOR A MOMENT AND YOU ARE BACK ON THE SAME CALL. Do NOT say the opening again. '
+      + 'You have just said a short sorry; continue exactly where the conversation stopped and never ask again for anything already answered.'
+      + (s.state.quote ? ' A quote was already given (get_quote ok) — read it back again if needed.' : '')
+      + (s.state.booked ? ` The booking is ALREADY made (${s.state.booked}) — do not book again; just say goodbye if nothing else is needed.` : ''),
+    `CONVERSATION SO FAR:\n${s.recent.map((t) => `${t.role === 'caller' ? 'Caller' : 'You'}: ${t.text}`).join('\n') || '(nothing yet)'}`,
+  ].join('\n\n');
+
+  // The AI side is gone (this socket). Mid-call: reconnect; else a person.
+  function aiLost(ws, why) {
+    if (s.ended || s.ending || ws?.lost) return;
+    if (ws) {
+      ws.lost = true;
+      try { ws.terminate ? ws.terminate() : ws.close(); } catch { /* gone */ }
+    }
+    if (!s.everReady || s.reconnects >= MAX_AI_RECONNECTS) {
+      fallback(s.reconnects ? `${why} (after ${s.reconnects} reconnect${s.reconnects === 1 ? '' : 's'})` : why);
+      return;
+    }
+    s.reconnects += 1;
+    s.ready = false;
+    console.warn(`[aiCaller] OpenAI dropped on ${callId}: ${why} — reconnecting (${s.reconnects}/${MAX_AI_RECONNECTS})`);
+    note('system', `AI line dropped (${why}) — reconnecting`);
+    AiCall.updateOne({ _id: callId }, { $inc: { aiReconnects: 1 } }).catch(() => {});
+    s.timers.push(setTimeout(() => { if (!s.ended && !s.ending) connectAI({ resume: true }); }, 300 * s.reconnects));
   }
-  s.timers.push(setTimeout(() => { if (!s.ready) fallback(s.socketOpen ? 'AI session did not start in time' : 'AI did not connect in time'); }, OPENAI_CONNECT_TIMEOUT_MS));
-  s.timers.push(setTimeout(() => handOff('time_limit'), config.maxCallSeconds() * 1000));
 
-  // A refused handshake (wrong URL -> 404, bad key -> 401, no access -> 403):
-  // log OpenAI's own answer — this is the line to look for in the logs.
-  s.openai.on('unexpected-response', (req, res) => {
-    let body = '';
-    res.on('data', (c) => { if (body.length < 1000) body += c; });
-    res.on('end', () => {
-      const why = `AI handshake rejected: HTTP ${res.statusCode} ${body.slice(0, 300)}`;
-      console.error(`[aiCaller] OpenAI handshake rejected on ${callId}: HTTP ${res.statusCode} ${body}`);
-      AiCall.updateOne({ _id: callId }, { $set: { openaiClose: { code: res.statusCode, reason: body.slice(0, 500), at: new Date() } } }).catch(() => {});
-      fallback(why);
+  function connectAI({ resume = false } = {}) {
+    let ws;
+    try {
+      ws = connectOpenAI();
+    } catch (err) {
+      aiLost(null, `AI could not ${resume ? 'reconnect' : 'start'} (${err.message})`);
+      return;
+    }
+    s.openai = ws;
+    s.socketOpen = false;
+    const mine = () => s.openai === ws && !ws.lost; // a replaced socket's events are ignored
+
+    s.timers.push(setTimeout(() => {
+      if (mine() && !s.ready) aiLost(ws, s.socketOpen ? 'AI session did not start in time' : 'AI did not connect in time');
+    }, OPENAI_CONNECT_TIMEOUT_MS));
+
+    // A refused handshake (wrong URL -> 404, bad key -> 401, no access -> 403):
+    // log OpenAI's own answer — this is the line to look for in the logs.
+    ws.on('unexpected-response', (req, res) => {
+      let body = '';
+      res.on('data', (c) => { if (body.length < 1000) body += c; });
+      res.on('end', () => {
+        if (!mine()) return;
+        console.error(`[aiCaller] OpenAI handshake rejected on ${callId}: HTTP ${res.statusCode} ${body}`);
+        AiCall.updateOne({ _id: callId }, { $set: { openaiClose: { code: res.statusCode, reason: body.slice(0, 500), at: new Date() } } }).catch(() => {});
+        aiLost(ws, `AI handshake rejected: HTTP ${res.statusCode} ${body.slice(0, 300)}`);
+      });
     });
-  });
 
-  s.openai.on('open', () => {
-    s.socketOpen = true;
-    sendAI({
-      type: 'session.start',
-      event_id: 'event_start',
-      session: {
-        model: config.realtimeModel(),
-        instructions: s.instructions,
-        audio: {
-          format: { type: 'audio/pcmu', rate: 8000 },
-          output: { voice: config.realtimeVoice() },
-        },
-        delegation: {
-          type: 'responses',
-          responses: {
-            model: config.delegateModel(),
-            instructions: DELEGATE_INSTRUCTIONS,
-            tools: tools.definitions(),
-            tool_choice: 'auto',
-            parallel_tool_calls: false,
+    ws.on('open', () => {
+      if (!mine()) return;
+      s.socketOpen = true;
+      sendAI({
+        type: 'session.start',
+        event_id: resume ? `event_start_${s.reconnects}` : 'event_start',
+        session: {
+          model: config.realtimeModel(),
+          instructions: resume ? resumeInstructions() : s.instructions,
+          audio: {
+            format: { type: 'audio/pcmu', rate: 8000 },
+            output: { voice: config.realtimeVoice() },
+          },
+          delegation: {
+            type: 'responses',
+            responses: {
+              model: config.delegateModel(),
+              instructions: DELEGATE_INSTRUCTIONS,
+              tools: tools.definitions(),
+              tool_choice: 'auto',
+              parallel_tool_calls: false,
+            },
           },
         },
-      },
+      });
     });
-  });
 
-  s.openai.on('message', async (raw) => {
+    ws.on('message', (raw) => { if (mine()) onAIMessage(ws, raw, { resume }); });
+    ws.on('error', (err) => {
+      if (!mine()) return;
+      console.error(`[aiCaller] OpenAI socket error on ${callId}:`, err.message);
+      aiLost(ws, `AI connection error (${err.message})`);
+    });
+    ws.on('close', (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString() : '';
+      console.info(`[aiCaller] OpenAI socket closed on ${callId}: code=${code} reason=${reason || '(none)'}`);
+      if (!mine() || s.ended || s.ending) return;
+      AiCall.updateOne({ _id: callId }, { $set: { openaiClose: { code, reason: reason.slice(0, 500), at: new Date() } } }).catch(() => {});
+      aiLost(ws, `AI connection closed (code ${code}${reason ? `: ${reason}` : ''})`);
+    });
+  }
+
+  async function onAIMessage(ws, raw, { resume }) {
     let ev;
     try { ev = JSON.parse(raw.toString()); } catch { return; }
     const type = ev.type || '';
@@ -279,9 +353,16 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
       switch (type) {
         case 'session.started':
           s.ready = true;
-          note('system', `AI session started (${config.realtimeModel()} + ${config.delegateModel()}, ${s.styleExamples} style example${s.styleExamples === 1 ? '' : 's'})`);
-          // The opening — disclosure, then "ambulance ಬೇಕಾ?": the first thing it says.
-          sendAI({ type: 'session.commentary.append', event_id: 'event_disclosure', delegation_id: null, content: OPENING });
+          s.everReady = true;
+          if (resume) {
+            note('system', `AI reconnected (${s.reconnects}/${MAX_AI_RECONNECTS}) — call continues`);
+            // A short sorry, then it carries on from the conversation so far.
+            sendAI({ type: 'session.commentary.append', event_id: `event_resume_${s.reconnects}`, delegation_id: null, content: RESUME_LINE });
+          } else {
+            note('system', `AI session started (${config.realtimeModel()} + ${config.delegateModel()}, ${s.styleExamples} style example${s.styleExamples === 1 ? '' : 's'})`);
+            // The opening — disclosure, then "ambulance ಬೇಕಾ?": the first thing it says.
+            sendAI({ type: 'session.commentary.append', event_id: 'event_disclosure', delegation_id: null, content: OPENING });
+          }
           break;
         case 'session.output_audio.delta':
           if (ev.delta) sendPlivo({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: ev.delta } });
@@ -315,7 +396,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
         }
         case 'error':
           recordOpenAIError(ev.error?.code || ev.code, ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 300));
-          if (!s.ready) await fallback(`AI refused the session: ${ev.error?.code || ''} ${ev.error?.message || ''}`.trim());
+          if (!s.ready) aiLost(ws, `AI refused the session: ${ev.error?.code || ''} ${ev.error?.message || ''}`.trim());
           break;
         default:
           break;
@@ -323,19 +404,25 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     } catch (err) {
       await fallback(`assistant error (${err.message})`);
     }
-  });
+  }
 
-  s.openai.on('error', (err) => {
-    console.error(`[aiCaller] OpenAI socket error on ${callId}:`, err.message);
-    fallback(`AI connection error (${err.message})`);
-  });
-  s.openai.on('close', (code, reasonBuf) => {
-    const reason = reasonBuf ? reasonBuf.toString() : '';
-    console.info(`[aiCaller] OpenAI socket closed on ${callId}: code=${code} reason=${reason || '(none)'}`);
+  // The time limit (AI_CALL_MAX_SECONDS). Plivo's own stream timeout is set
+  // later than this (aiCallerController), so the call always ends HERE,
+  // cleanly: booked already -> a short goodbye and hang up; otherwise a
+  // person takes over ('time_limit').
+  const timeUp = () => {
     if (s.ended || s.ending) return;
-    AiCall.updateOne({ _id: callId }, { $set: { openaiClose: { code, reason: reason.slice(0, 500), at: new Date() } } }).catch(() => {});
-    fallback(`AI connection closed (code ${code}${reason ? `: ${reason}` : ''})`);
-  });
+    if (s.state.booked) {
+      note('system', 'Time limit reached after booking — goodbye');
+      sendAI({ type: 'session.commentary.append', event_id: 'event_time_up', delegation_id: null, content: TIME_UP_BOOKED_LINE });
+      s.timers.push(setTimeout(() => endCall({ outcome: 'booked', summary: `Booked ${s.state.booked}; call reached the time limit.` }), TIME_UP_GOODBYE_MS));
+      return;
+    }
+    handOff('time_limit');
+  };
+  s.timers.push(setTimeout(timeUp, config.maxCallSeconds() * 1000));
+
+  connectAI();
 
   // Delegated work: function calls from the Responses model, usage.
   async function onResponseEvent(ev) {
@@ -390,5 +477,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 }
 
 module.exports = {
-  createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, isDistress, scriptLanguage, _active: active,
+  createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
+  MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

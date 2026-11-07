@@ -70,6 +70,8 @@ function definitions() {
           helper_needed        : { type: 'boolean', description: 'true if the caller wants a helper to lift or carry the patient.' },
           round_trip           : { type: 'boolean', description: 'true for a return / round trip ("up and down", "ಅಪ್ ಅಂಡ್ ಡೌನ್", "ಹೋಗಿ-ಬರೋದು"), or whenever the ambulance must wait and bring them back.' },
           wait_hours           : { type: 'number', description: 'Round trip only: how long the ambulance waits at the drop before coming back, in hours (e.g. 1.5). 0 if no wait or not known.' },
+          patient_at           : { type: 'string', enum: ['home', 'hospital', 'other'], description: 'Where the patient is picked up from, if known. hospital = discharge / hospital pickup: no helper is offered.' },
+          nurse_needed         : { type: 'boolean', description: 'true if the caller asked for a nurse.' },
         },
         required: ['service_code'],
       },
@@ -87,6 +89,8 @@ function definitions() {
           patient_condition : { type: 'string', description: 'What happened / the condition, in a few English words, as the caller said it.' },
           oxygen_needed     : { type: 'boolean' },
           helper_needed     : { type: 'boolean' },
+          nurse_needed      : { type: 'boolean' },
+          special_care      : { type: 'string', description: 'Any special care needed on the way, in a few English words (long trips).' },
           patient_at        : { type: 'string', enum: ['home', 'hospital', 'other'] },
           customer_confirmed: { type: 'boolean', description: 'true only if the caller explicitly confirmed these details.' },
         },
@@ -154,6 +158,11 @@ async function sharedPickup(callId) {
 }
 
 const MAX_WAIT_HOURS = 24;
+// One-way road km. Above LONG_TRIP_KM (where Pricing's own after-300 km
+// rate starts) Sahana asks more about the patient; above TWO_DRIVER_KM two
+// drivers are assigned (said to the caller — no Pricing field charges it).
+const LONG_TRIP_KM = 300;
+const TWO_DRIVER_KM = 1000;
 
 const placeAddress = (place) => [place.name, place.address].filter(Boolean).join(', ');
 
@@ -213,19 +222,25 @@ async function getQuote(args, ctx) {
     return { ok: false, reason: 'clarify_places', pickup: describe(p), drop: describe(d), say: 'Ask the caller to clarify, then call get_quote again.' };
   }
 
-  const helper = args.helper_needed === true;
   const pickup = { address: placeAddress(p.place), lat: p.place.lat, lng: p.place.lng };
   const drop = { address: placeAddress(d.place), lat: d.place.lat, lng: d.place.lng };
   // The app's own quote: round trip = the Pricing round-trip slabs (or
   // one-way slabs at twice the distance), helper charged per leg —
   // quoteTrip / fareCalculator.compute, exactly as the booking apps.
+  // Helper: never offered for a pickup AT A HOSPITAL (the hospital loads the
+  // patient). Otherwise both prices are worked out in one go, so the caller
+  // hears "without helper ₹X; with helper ₹Y" and either can be booked
+  // without asking again.
   const tripType = roundTrip ? 'round_trip' : 'one_way';
-  const quote = await quoteTrip({
-    pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng,
-    selectedType: service.code, tripType, ...(helper ? { helperEnabled: true } : {}),
-  });
-  if (!quote) return { ok: false, reason: 'no_route', say: 'Could not find a road route. Ask the caller to check the places, or hand off.' };
-  if (!quote.fare) return { ok: false, reason: 'no_price', say: 'No price for this service right now. Offer a callback from the team (end_call follow_up).' };
+  const atHospital = args.patient_at === 'hospital';
+  const base = { pickupLat: pickup.lat, pickupLng: pickup.lng, dropLat: drop.lat, dropLng: drop.lng, selectedType: service.code, tripType };
+  const [plain, withHelper] = await Promise.all([
+    quoteTrip(base),
+    atHospital ? null : quoteTrip({ ...base, helperEnabled: true }),
+  ]);
+  if (!plain) return { ok: false, reason: 'no_route', say: 'Could not find a road route. Ask the caller to check the places, or hand off.' };
+  if (!plain.fare) return { ok: false, reason: 'no_price', say: 'No price for this service right now. Offer a callback from the team (end_call follow_up).' };
+  const helperOption = withHelper?.fare ? withHelper : null;
 
   // Waiting at the drop, from the Pricing wait fields (quoteWaitCharge).
   let wait = null;
@@ -233,14 +248,52 @@ async function getQuote(args, ctx) {
     wait = await quoteWaitCharge({ selectedType: service.code, tripType, waitMinutes: waitHours * 60 });
     if (!wait) return { ok: false, reason: 'no_price', say: 'No waiting price for this service right now. Offer a callback from the team (end_call follow_up).' };
   }
-  const tripFare = quote.fare.grandTotal;
   const waitCharge = wait ? wait.amount : 0;
-  const total = tripFare + waitCharge;
+  const plainTotal = plain.fare.grandTotal + waitCharge;
+  const helperTotal = helperOption ? helperOption.fare.grandTotal + waitCharge : null;
+  const helperExtra = helperOption ? helperTotal - plainTotal : null;
+  const helperDecided = atHospital || typeof args.helper_needed === 'boolean';
+  const helper = !atHospital && args.helper_needed === true && !!helperOption;
+  const total = helper ? helperTotal : plainTotal;
+  const tripFare = (helper ? helperOption : plain).fare.grandTotal;
 
-  ctx.state.quote = { service, pickup, drop, quote, helper, tripType, waitHours: roundTrip ? waitHours : 0 };
+  // Long distance (one-way road km): more patient questions, and over
+  // TWO_DRIVER_KM two drivers go. No Pricing field charges for either, so
+  // nothing is added to the fare for it.
+  const oneWayKm = plain.oneWayKm ?? (roundTrip ? plain.distanceKm / 2 : plain.distanceKm);
+  const longTrip = oneWayKm > LONG_TRIP_KM;
+  const twoDrivers = oneWayKm > TWO_DRIVER_KM;
+  const nurse = args.nurse_needed === true;
+
+  ctx.state.quote = {
+    service, pickup, drop, tripType, atHospital,
+    quotes: { plain, helper: helperOption },
+    helper, waitHours: roundTrip ? waitHours : 0, waitCharge, longTrip, twoDrivers,
+  };
   const waitRule = wait
     ? `first ${wait.freeMinutes} minutes of waiting free, then ₹${wait.ratePerMin}/min${wait.tier2RatePerMin != null ? ` for ${wait.tier1Minutes} minutes, then ₹${wait.tier2RatePerMin}/min` : ''}`
     : '';
+
+  // What to say: the price straight away, then ask to book.
+  const price = (n) => `₹${n}`;
+  let priceLine;
+  if (atHospital || !helperOption) priceLine = `Quote ${price(plainTotal)}.`;
+  else if (helper) priceLine = `Quote ${price(helperTotal)} including the helper.`;
+  else if (helperDecided) priceLine = `Quote ${price(plainTotal)} (no helper); just mention it is +${price(helperExtra)} if they want a helper.`;
+  else priceLine = `Quote both in one go: without helper ${price(plainTotal)}; with helper ${price(helperTotal)}.`;
+  const say = [
+    roundTrip
+      ? `Up-and-down fare ${price(tripFare)}${waitHours ? ` + about ${waitHours} hour${waitHours === 1 ? '' : 's'} waiting ${price(waitCharge)}` : ''} — read the TOTAL back clearly. Waiting is billed by the actual minutes (${waitRule}).`
+      : '',
+    priceLine,
+    atHospital ? 'The patient is at a hospital: do NOT ask about a helper.' : '',
+    twoDrivers ? 'Over 1000 km: tell the caller two drivers are assigned for this trip.' : '',
+    longTrip ? 'Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care — only what you do not know yet.' : '',
+    nurse ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
+    nearest ? 'Say this is the nearest hospital found, by name; the team can change it.' : '',
+    'It is an estimate. Then ask if they want to book.',
+  ].filter(Boolean).join(' ');
+
   return {
     ok: true,
     service    : service.label,
@@ -249,17 +302,23 @@ async function getQuote(args, ctx) {
     ...(nearest ? { drop_is_nearest_hospital: true } : {}),
     helper,
     trip_type  : tripType,
-    distance_km: Math.round(quote.distanceKm * 10) / 10,
+    distance_km: Math.round(plain.distanceKm * 10) / 10,
+    one_way_km : Math.round(oneWayKm * 10) / 10,
     ...(roundTrip ? {
       trip_fare_rupees      : tripFare,
       wait_hours            : waitHours,
       waiting_charge_rupees : waitCharge,
       waiting_rule          : waitRule,
     } : {}),
+    ...(atHospital ? { helper_offered: false } : helperOption ? {
+      fare_without_helper_rupees: plainTotal,
+      fare_with_helper_rupees   : helperTotal,
+      helper_extra_rupees       : helperExtra,
+    } : {}),
+    ...(longTrip ? { long_trip: true } : {}),
+    ...(twoDrivers ? { two_drivers: true } : {}),
     estimated_fare_rupees: total,
-    say: roundTrip
-      ? `Read back clearly: up-and-down fare ₹${tripFare}${waitHours ? ` + about ${waitHours} hour${waitHours === 1 ? '' : 's'} waiting ₹${waitCharge}` : ''} = total about ₹${total}. Waiting is billed by the actual minutes (${waitRule}). It is an estimate.${nearest ? ' Say this is the nearest hospital found, by name; the team can change it.' : ''}`
-      : `This is an estimate; the final bill can differ (waiting time, extra distance).${nearest ? ' Tell the caller this is the nearest hospital found, by name; the team can change it.' : ''}`,
+    say,
   };
 }
 
@@ -275,12 +334,12 @@ async function createBooking(args, ctx) {
   if (args.when === 'later' && isPastIst(args.scheduled_time)) {
     return { ok: false, reason: 'past_time', say: 'That date and time has already passed. Check it with the caller using the DATE AND TIME list.' };
   }
-  const { service, pickup, drop, quote, helper, tripType = 'one_way', waitHours = 0 } = ctx.state.quote;
-  // The fare read back was for this helper choice; a different one is a
-  // different price.
-  if (typeof args.helper_needed === 'boolean' && args.helper_needed !== helper) {
-    return { ok: false, reason: 'requote_helper', say: 'The helper choice changed: call get_quote again with helper_needed, and read back the new fare.' };
-  }
+  const { service, pickup, drop, quotes, atHospital, tripType = 'one_way', waitHours = 0, twoDrivers } = ctx.state.quote;
+  // Both helper prices were quoted (home pickups), so either choice books at
+  // the price the caller heard. A hospital pickup never gets a helper.
+  const helper = !atHospital && (typeof args.helper_needed === 'boolean' ? args.helper_needed : ctx.state.quote.helper);
+  if (helper && !quotes.helper) return { ok: false, reason: 'requote_helper', say: 'Call get_quote again with helper_needed true, and read back the new fare.' };
+  const quote = helper ? quotes.helper : quotes.plain;
 
   const trip = await createBookedTrip({
     patientName  : clean(args.patient_name, 80) || 'AI call customer',
@@ -304,13 +363,22 @@ async function createBooking(args, ctx) {
     ...(clean(args.patient_condition, 300) ? { condition: clean(args.patient_condition, 300) } : {}),
     ...(typeof args.oxygen_needed === 'boolean' ? { oxygen: args.oxygen_needed } : {}),
     helper,
-    ...(['home', 'hospital', 'other'].includes(args.patient_at) ? { patientAt: args.patient_at } : {}),
-    // So dispatch knows the ambulance waits and comes back.
+    ...(typeof args.nurse_needed === 'boolean' ? { nurse: args.nurse_needed } : {}),
+    ...(clean(args.special_care, 300) ? { specialCare: clean(args.special_care, 300) } : {}),
+    ...(['home', 'hospital', 'other'].includes(args.patient_at) ? { patientAt: args.patient_at } : atHospital ? { patientAt: 'hospital' } : {}),
+    // So dispatch knows the ambulance waits and comes back, and that a
+    // trip this long needs two drivers.
     ...(tripType === 'round_trip' ? { roundTrip: true, waitHours } : {}),
+    ...(twoDrivers ? { twoDrivers: true } : {}),
   };
   await AiCall.updateOne({ _id: ctx.callId }, { $set: { trip: trip._id, outcome: 'booked', needs } });
   bookingPush.notifyIncomingBooking(trip._id); // rings the CRM — a person dispatches it
-  return { ok: true, trip_number: ctx.state.booked, estimated_fare_rupees: trip.estimatedFare, say: 'Booked. Tell the caller the team will confirm the ambulance shortly.' };
+  return {
+    ok: true,
+    trip_number: ctx.state.booked,
+    estimated_fare_rupees: trip.estimatedFare,
+    say: `Booked. Tell the caller the team will confirm the ambulance shortly.${needs.nurse ? ' Also that the team will confirm the nurse and its charge.' : ''}`,
+  };
 }
 
 async function sendLocationRequest(args, ctx) {

@@ -50,6 +50,9 @@ const AiCallSchema = new mongoose.Schema(
       // Round trip: the ambulance waits (about waitHours) and brings them back.
       roundTrip: { type: Boolean },
       waitHours: { type: Number },
+      nurse      : { type: Boolean },          // asked for a nurse (charge confirmed by the team)
+      specialCare: { type: String, maxlength: 300 },
+      twoDrivers : { type: Boolean },          // over 1000 km one way
     },
     // A request the team prices and calls back about (not bookable here).
     request: {
@@ -97,6 +100,8 @@ const AiCallSchema = new mongoose.Schema(
     // The assistant ended the call (end_call): when the stream closes,
     // /plivo/next hangs up instead of handing off.
     endRequested: { type: Boolean, default: false },
+    // GPT-Live dropped mid-call and was reconnected this many times (session.js).
+    aiReconnects: { type: Number, default: 0 },
 
     error: { type: String, maxlength: 500 },
     // Why the OpenAI side ended, as OpenAI said it — handshake HTTP status,

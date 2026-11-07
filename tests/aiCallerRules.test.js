@@ -287,22 +287,84 @@ describe('C. tools', () => {
     expect(await run('get_quote', { service_code: 'bls', pickup: 'x' }, c)).toMatchObject({ reason: 'need_drop' });
   });
 
-  test('helper is priced (Pricing via quoteTrip) and booked; a changed helper choice needs a new quote', async () => {
+  test('home pickup: both prices in one go (Pricing helperCharge via quoteTrip); either books without asking again', async () => {
+    quoteTrip.mockImplementation(async (q) => ({ fare: { grandTotal: q.helperEnabled ? 1750 : 1450 }, distanceKm: 4.2, oneWayKm: 4.2 }));
     const call = AiCall.add({});
     const c = ctx(call);
     resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('B', 3, 4));
-    await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', helper_needed: true }, c);
+    const q = await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', patient_at: 'home' }, c);
+    expect(quoteTrip).toHaveBeenCalledTimes(2);
     expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ helperEnabled: true }));
-    expect(await run('create_booking', { when: 'now', customer_confirmed: true, helper_needed: false }, c)).toMatchObject({ ok: false, reason: 'requote_helper' });
-    expect(createBookedTrip).not.toHaveBeenCalled();
+    expect(q).toMatchObject({ fare_without_helper_rupees: 1450, fare_with_helper_rupees: 1750, helper_extra_rupees: 300, estimated_fare_rupees: 1450 });
+    expect(q.say).toMatch(/Quote both in one go: without helper ₹1450; with helper ₹1750\./);
+    expect(q.say).toMatch(/Then ask if they want to book/);
     const r = await run('create_booking', {
       patient_name: 'Lakshmi', when: 'now', customer_confirmed: true, helper_needed: true,
       patient_condition: 'fell at home, hip pain', oxygen_needed: false, patient_at: 'home',
     }, c);
     expect(r.ok).toBe(true);
+    expect(quoteTrip).toHaveBeenCalledTimes(2); // no re-quote
     expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ helperEnabled: true });
     expect(createBookedTrip.mock.calls[0][1]).toEqual({ bookingSource: 'ai_telecaller' });
     expect(call.needs).toEqual({ condition: 'fell at home, hip pain', oxygen: false, helper: true, patientAt: 'home' });
+  });
+
+  test('the caller already said no helper: quoted without, "+₹X if you want a helper"', async () => {
+    quoteTrip.mockImplementation(async (q) => ({ fare: { grandTotal: q.helperEnabled ? 1750 : 1450 }, distanceKm: 4.2, oneWayKm: 4.2 }));
+    const c = ctx(AiCall.add({}));
+    resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('B', 3, 4));
+    const q = await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', helper_needed: false }, c);
+    expect(q.say).toMatch(/Quote ₹1450 \(no helper\); just mention it is \+₹300 if they want a helper\./);
+    expect(q).toMatchObject({ helper: false, estimated_fare_rupees: 1450 });
+  });
+
+  test('hospital pickup (discharge): no helper asked, offered or charged', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    resolvePlaceFromText.mockResolvedValueOnce(single('Baptist Hospital', 1, 2)).mockResolvedValueOnce(single('Home', 3, 4));
+    const q = await run('get_quote', { service_code: 'bls', pickup: 'Baptist Hospital', drop: 'Home', patient_at: 'hospital', helper_needed: true }, c);
+    expect(quoteTrip).toHaveBeenCalledTimes(1);
+    expect(quoteTrip.mock.calls[0][0].helperEnabled).toBeUndefined();
+    expect(q).toMatchObject({ helper: false, helper_offered: false, estimated_fare_rupees: 1450 });
+    expect(q).not.toHaveProperty('fare_with_helper_rupees');
+    expect(q.say).toMatch(/The patient is at a hospital: do NOT ask about a helper/);
+    await run('create_booking', { when: 'now', customer_confirmed: true, helper_needed: true }, c);
+    expect(createBookedTrip.mock.calls[0][0].helperEnabled).toBeUndefined();
+    expect(call.needs).toMatchObject({ helper: false, patientAt: 'hospital' });
+  });
+
+  test('long trip (over 300 km one way): ask more about the patient before booking; fare unchanged', async () => {
+    quoteTrip.mockResolvedValue({ fare: { grandTotal: 18000 }, distanceKm: 450, oneWayKm: 450 });
+    const c = ctx(AiCall.add({}));
+    resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('Chennai', 3, 4));
+    const q = await run('get_quote', { service_code: 'als_tempo', pickup: 'A', drop: 'Chennai', patient_at: 'hospital' }, c);
+    expect(q).toMatchObject({ long_trip: true, estimated_fare_rupees: 18000 });
+    expect(q).not.toHaveProperty('two_drivers');
+    expect(q.say).toMatch(/Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care/);
+  });
+
+  test('over 1000 km: two drivers said and recorded — no charge invented (no Pricing field)', async () => {
+    quoteTrip.mockResolvedValue({ fare: { grandTotal: 52000 }, distanceKm: 1200, oneWayKm: 1200 });
+    const call = AiCall.add({});
+    const c = ctx(call);
+    resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('Delhi', 3, 4));
+    const q = await run('get_quote', { service_code: 'als_tempo', pickup: 'A', drop: 'Delhi', patient_at: 'hospital' }, c);
+    expect(q).toMatchObject({ two_drivers: true, long_trip: true, estimated_fare_rupees: 52000 });
+    expect(q.say).toMatch(/Over 1000 km: tell the caller two drivers are assigned/);
+    await run('create_booking', { when: 'now', customer_confirmed: true, nurse_needed: true, special_care: 'ventilator, suction' }, c);
+    expect(call.needs).toMatchObject({ twoDrivers: true, nurse: true, specialCare: 'ventilator, suction' });
+  });
+
+  test('nurse: asked for, recorded, never priced (no nurse charge in Pricing)', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('B', 3, 4));
+    const q = await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', patient_at: 'hospital', nurse_needed: true }, c);
+    expect(q.estimated_fare_rupees).toBe(1450);
+    expect(q.say).toMatch(/no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one/);
+    const r = await run('create_booking', { when: 'now', customer_confirmed: true, nurse_needed: true }, c);
+    expect(r.say).toMatch(/the team will confirm the nurse and its charge/);
+    expect(call.needs.nurse).toBe(true);
   });
 
   test('a scheduled time already in the past is refused', async () => {
@@ -343,7 +405,7 @@ describe('C. tools', () => {
     };
 
     test('round trip: quoteTrip with tripType round_trip + the Pricing waiting charge; the total read back', async () => {
-      quoteTrip.mockResolvedValueOnce({ fare: { grandTotal: 2400 }, distanceKm: 16, oneWayKm: 8 });
+      quoteTrip.mockImplementation(async (q) => ({ fare: { grandTotal: q.helperEnabled ? 2700 : 2400 }, distanceKm: 16, oneWayKm: 8 }));
       quoteWaitCharge.mockResolvedValueOnce({ waitMinutes: 120, freeMinutes: 10, billableMinutes: 110, amount: 550, ratePerMin: 5, tier1Minutes: 120, tier2RatePerMin: 10 });
       const c = ctx(AiCall.add({}));
       const r = await quoteRT(c, { round_trip: true, wait_hours: 2 });
@@ -353,7 +415,8 @@ describe('C. tools', () => {
         ok: true, trip_type: 'round_trip', trip_fare_rupees: 2400, wait_hours: 2, waiting_charge_rupees: 550, estimated_fare_rupees: 2950,
         waiting_rule: 'first 10 minutes of waiting free, then ₹5/min for 120 minutes, then ₹10/min',
       });
-      expect(r.say).toMatch(/up-and-down fare ₹2400 \+ about 2 hours waiting ₹550 = total about ₹2950/);
+      expect(r.say).toMatch(/Up-and-down fare ₹2400 \+ about 2 hours waiting ₹550 — read the TOTAL back clearly/);
+      expect(r.say).toMatch(/Quote both in one go: without helper ₹2950; with helper ₹3250\./);
     });
 
     test('round trip with no wait: the round-trip fare, waiting rule still explained', async () => {
@@ -397,6 +460,19 @@ describe('C. tools', () => {
       expect(quoteWaitCharge).not.toHaveBeenCalled();
       expect(r).toMatchObject({ ok: true, trip_type: 'one_way', estimated_fare_rupees: 1450 });
       expect(r).not.toHaveProperty('waiting_charge_rupees');
+    });
+
+    test('the instructions: quote promptly, never re-ask, helper only at home, nurse, long trips, 2 drivers', () => {
+      const I = prompt.BASE_INSTRUCTIONS;
+      expect(I).toMatch(/QUOTE PROMPTLY — as soon as you know the service, pickup and drop, call get_quote straight away/);
+      expect(I).toMatch(/Do not ask more questions first/);
+      expect(I).toMatch(/NEVER ask the same question twice/);
+      expect(I).toMatch(/If they already said no helper, quote without one and just mention "\+₹X if you want a helper"/);
+      expect(I).toMatch(/If the patient is AT A HOSPITAL, never ask about a helper/);
+      expect(I).toMatch(/NURSE: ask once, briefly/);
+      expect(I).toMatch(/LONG TRIPS \(get_quote says long_trip\)/);
+      expect(I).toMatch(/OVER 1000 km \(get_quote says two_drivers\): tell the caller two drivers are assigned/);
+      expect(session.DELEGATE_INSTRUCTIONS).toMatch(/never quote a nurse charge/);
     });
 
     test('the instructions: ask the waiting time, quote it, never hand off for it', () => {

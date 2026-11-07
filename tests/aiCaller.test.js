@@ -441,7 +441,10 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(disclosure).toMatchObject({ delegation_id: null, content: session.OPENING });
     expect(session.OPENING.startsWith(`${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN}`)).toBe(true);
     expect(session.OPENING).toMatch(/ಬೇಕಾ\?$/);
-    expect(session.DISCLOSURE_KN).toMatch(/^ಹಲೋ ಸರ್/);
+    expect(session.DISCLOSURE_KN).toMatch(/^ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife ನ automated assistant\. ಈ ಕರೆ ದಾಖಲಾಗ್ತಿದೆ\.$/);
+    expect(session.DISCLOSURE_EN).toMatch(/^I'm Sahana/);
+    expect(session.INSTRUCTIONS).toMatch(/You are Sahana \(ಸಹನ\)/);
+    expect(session.INSTRUCTIONS).toMatch(/never claim to be a person/);
     expect(session.DISCLOSURE_EN).toMatch(/automated assistant.*recorded/);
     expect(session.INSTRUCTIONS).toMatch(/FIRST WORDS/);
     expect(session.INSTRUCTIONS).toMatch(/NEVER give medical advice/);

@@ -58,8 +58,9 @@ const MAX_TRANSCRIPT = 200;
 // (automated assistant, call recorded) in Kannada then English, then the
 // question — quick and natural. (Kannada wording to be checked by a native
 // speaker before widening the pilot.)
-const DISCLOSURE_KN = 'ಹಲೋ ಸರ್, ನಾನು ಸೇವ್‌ಲೈಫ್‌ನ ಸ್ವಯಂಚಾಲಿತ ಸಹಾಯಕ. ಈ ಕರೆ ರೆಕಾರ್ಡ್ ಆಗುತ್ತಿದೆ.';
-const DISCLOSURE_EN = "This is SaveLife's automated assistant. This call is recorded.";
+// She is Sahana (ಸಹನ).
+const DISCLOSURE_KN = 'ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife ನ automated assistant. ಈ ಕರೆ ದಾಖಲಾಗ್ತಿದೆ.';
+const DISCLOSURE_EN = "I'm Sahana, SaveLife's automated assistant. This call is recorded.";
 const OPENING_QUESTION = 'Ambulance ಬೇಕಾ?';
 const OPENING = `${DISCLOSURE_KN} ${DISCLOSURE_EN} ${OPENING_QUESTION}`;
 

@@ -114,6 +114,9 @@ const bounded = (v, def, min, max) => { const n = Number(v); return Number.isFin
 const bargeInRms = () => bounded(process.env.AI_BARGE_IN_RMS, 900, 100, 8000);
 const bargeInMs = () => bounded(process.env.AI_BARGE_IN_MS, 600, 200, 2000);
 const callerDoneMs = () => bounded(process.env.AI_CALLER_DONE_MS, 700, 300, 3000);
+// A pending barge-in becomes real after this much caller speech (unless
+// their words already show it is more than an acknowledgement).
+const bargeInConfirmMs = () => Math.max(bounded(process.env.AI_BARGE_IN_CONFIRM_MS, 1200, 400, 4000), bargeInMs() + 100);
 
 // ── Rough cost — rates from env only, never hardcoded ───────
 // AI_COST_*_USD_PER_1M: OpenAI Realtime price per 1M tokens of each kind.
@@ -151,6 +154,6 @@ function estimateCostPaise(usage = {}, durationSec = 0) {
 module.exports = {
   envEnabled, allowlist, isAllowlisted, toggleEnabled, missingConfig, contactedUsVia,
   activeCall, checkCanCall, maxCallSeconds, realtimeModel, delegateModel, realtimeVoice, liveUrl,
-  bargeInRms, bargeInMs, callerDoneMs,
+  bargeInRms, bargeInMs, callerDoneMs, bargeInConfirmMs,
   costRates, estimateCostPaise, ACTIVE_STATES,
 };

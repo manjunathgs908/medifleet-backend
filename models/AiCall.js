@@ -56,6 +56,7 @@ const AiCallSchema = new mongoose.Schema(
       pickupDetails: { type: String, maxlength: 200 }, // home pickup: house / street / landmark
       appointmentAt: { type: Date },           // hospital appointment — NOT the pickup time (Trip.scheduleDate)
       freezerBox   : { type: Boolean },        // body transport: a freezer box too (team confirms the charge)
+      freezerIncluded: { type: Boolean },      // Body Shifting — Tempo: the freezer comes with the package
     },
     // A request the team prices and calls back about (not bookable here).
     request: {
@@ -119,6 +120,21 @@ const AiCallSchema = new mongoose.Schema(
     claimGuardStops: { type: Number, default: 0 },
     // Times the caller spoke over the assistant and her audio was stopped (session.js).
     bargeIns: { type: Number, default: 0 },
+    // Questions for a team member to call back about (discount, advance,
+    // settlement...) and conditional yeses — never answered or booked by the AI.
+    staffQuestions: [{
+      _id: false,
+      topic: { type: String, enum: ['discount', 'advance', 'settlement', 'payment', 'duty', 'other'] },
+      question: { type: String, maxlength: 300 },
+      conditionalBooking: { type: Boolean },
+      at: Date,
+    }],
+    // A read-back the caller's approval could not be verified for — handed
+    // to a person with the details (tools: create_booking).
+    pendingBooking: { summary: { type: String, maxlength: 1000 }, reason: String, at: Date },
+    // The service catalog (serviceFacts.js) and the quote's Pricing doc
+    // disagreed — no inclusion was promised; staff should check.
+    catalogMismatches: [{ _id: false, code: String, problem: String, expected: String, pricing: String, at: Date }],
 
     error: { type: String, maxlength: 500 },
     // Why the OpenAI side ended, as OpenAI said it — handshake HTTP status,

@@ -42,6 +42,18 @@ const { quoteTrip, quoteWaitCharge, createBookedTrip } = require('../../controll
 const bookingPush = require('../bookingPush');
 const AiCall = require('../../models/AiCall');
 const { isPastIst, parseIst, sayIst } = require('./prompt');
+const serviceFacts = require('./serviceFacts');
+
+// "ಬುಕ್ ಮಾಡಲಾ?" in the language the caller chose (session ctx.language).
+const ASK_TO_BOOK = { kn: 'ಬುಕ್ ಮಾಡಲಾ?', hi: 'बुक कर दूँ?', en: 'Shall I book it?', te: 'బుక్ చేయమంటారా?', ta: 'புக் பண்ணட்டுமா?', ml: 'ബുക്ക് ചെയ്യട്ടെ?' };
+const askToBook = (ctx) => ASK_TO_BOOK[ctx.language] || ASK_TO_BOOK.kn;
+const EECO_OVER_800_KN = 'ಈ ಪ್ರಯಾಣ 800 ಕಿಲೋಮೀಟರ್‌ಗಿಂತ ಹೆಚ್ಚು ಇದೆ. ಇಷ್ಟು ದೂರಕ್ಕೆ ಟೆಂಪೋ ಟ್ರಾವೆಲರ್ ತೆಗೆದುಕೊಳ್ಳಲು ಸಲಹೆ ಕೊಡುತ್ತೇವೆ. ಅದರ ದರ ಹೇಳಲಾ?';
+// A whole country / state / district is not a place an ambulance can go to.
+const VAGUE_TYPES = ['country', 'administrative_area_level_1', 'administrative_area_level_2', 'political', 'colloquial_area'];
+const tooVague = (r) => {
+  const types = r?.place?.types || [];
+  return types.length > 0 && types.every((t) => VAGUE_TYPES.includes(t));
+};
 
 // Bookable service codes (the Pricing serviceType values), English labels.
 function bookableServices() {
@@ -79,6 +91,7 @@ function definitions() {
           wait_hours           : { type: 'number', description: 'Round trip only: how long the ambulance waits at the drop before coming back, in hours (e.g. 1.5). 0 if no wait or not known.' },
           patient_at           : { type: 'string', enum: ['home', 'hospital', 'other'], description: 'Where the patient is picked up from, if known. hospital = discharge / hospital pickup: no helper is offered.' },
           nurse_needed         : { type: 'boolean', description: 'true if the caller asked for a nurse.' },
+          freezer_needed       : { type: 'boolean', description: 'Body transport: true if they need a freezer during the transport.' },
         },
         required: ['service_code'],
       },
@@ -96,6 +109,7 @@ function definitions() {
           helper_needed   : { type: 'boolean' },
           patient_at      : { type: 'string', enum: ['home', 'hospital', 'other'] },
           pickup_details  : { type: 'string', description: 'Home pickup: house / flat / street and a landmark, in English letters, as the caller said it.' },
+          freezer_needed  : { type: 'boolean', description: 'Body transport: true if they need a freezer during the transport.' },
           patient_name    : { type: 'string' },
         },
         required: ['when'],
@@ -143,6 +157,33 @@ function definitions() {
           hours     : { type: 'number', description: 'Or for how many hours, if less than a day.' },
         },
         required: ['start_time'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'service_info',
+      description: 'Verified facts about a SaveLife service — which vehicle it is, what is included (freezer, nurse, oxygen, AC), one way only. Use for "Eeco ಅಂದ್ರೆ ಯಾವ ಗಾಡಿ?", "freezer ಇದೆಯಾ?", "what is included". Answer in one or two plain sentences.',
+      parameters: {
+        type: 'object',
+        properties: {
+          service_code: { type: 'string', enum: services.map((s) => s.code), description: 'The service asked about, if clear.' },
+          question    : { type: 'string', description: 'The caller\'s question, in a few English words.' },
+        },
+        required: ['question'],
+      },
+    },
+    {
+      type: 'function',
+      name: 'record_question',
+      description: 'A question you cannot answer from verified data — discount, advance, settlement / payment terms, or anything else — or a conditional yes ("book only if you give a discount"). Recorded for a team member to call back. Never promise a discount or terms yourself.',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic              : { type: 'string', enum: ['discount', 'advance', 'settlement', 'payment', 'duty', 'other'] },
+          question           : { type: 'string', description: 'What they asked, in a few English words.' },
+          conditional_booking: { type: 'boolean', description: 'true if they will book only if the condition is met.' },
+        },
+        required: ['topic', 'question'],
       },
     },
     {
@@ -212,6 +253,9 @@ async function getQuote(args, ctx) {
   if (!Number.isFinite(waitHours) || waitHours < 0 || waitHours > MAX_WAIT_HOURS) {
     return { ok: false, reason: 'bad_wait', say: `Ask how many hours the ambulance should wait (0 to ${MAX_WAIT_HOURS}).` };
   }
+  if (roundTrip && serviceFacts.facts(service.code)?.oneWayOnly) {
+    return { ok: false, reason: 'one_way_only', say: `${service.label} is one way only (the booking pages do not offer a return). Quote it one way.` };
+  }
   if (waitHours > 0 && !roundTrip) {
     return { ok: false, reason: 'wait_needs_round_trip', say: 'Waiting means the ambulance waits and brings them back: confirm it is a round trip, then get_quote with round_trip true and wait_hours.' };
   }
@@ -254,6 +298,15 @@ async function getQuote(args, ctx) {
   }
   if (p.status !== 'single' || d.status !== 'single') {
     return { ok: false, reason: 'clarify_places', pickup: describe(p), drop: describe(d), say: 'Ask the caller to clarify, then call get_quote again.' };
+  }
+  // "Assam" resolves to a whole state: never quote to the middle of a state.
+  for (const [which, r] of [['pickup', p], ['drop', d]]) {
+    if (tooVague(r)) {
+      return {
+        ok: false, reason: 'place_too_vague', which, place: r.place.name,
+        say: `"${r.place.name}" is a whole state or district, not a place to ${which === 'drop' ? 'drop at' : 'pick up from'}. Ask the town or district (or the PIN code) and the exact ${which} — hospital, address or landmark — then get_quote again.`,
+      };
+    }
   }
 
   const pickup = { address: placeAddress(p.place), lat: p.place.lat, lng: p.place.lng };
@@ -299,6 +352,25 @@ async function getQuote(args, ctx) {
   const twoDrivers = oneWayKm > TWO_DRIVER_KM;
   const nurse = args.nurse_needed === true;
 
+  // What this service is and includes (serviceFacts — the booking pages),
+  // checked against the vehicle the quote's Pricing doc names. A mismatch
+  // means no inclusion is promised and staff get told.
+  const f = serviceFacts.facts(service.code);
+  const mismatch = serviceFacts.checkAgainstQuote(service.code, plain.fare);
+  if (mismatch) {
+    console.warn(`[aiCaller] catalog mismatch on ${ctx.callId}: ${mismatch.problem}`);
+    AiCall.updateOne({ _id: ctx.callId }, { $push: { catalogMismatches: { $each: [{ ...mismatch, at: new Date() }], $slice: -10 } } }).catch(() => {});
+  }
+  const verified = f && !mismatch;
+  // Eeco over 800 km one way (strictly): recommend the same service in a
+  // Tempo Traveller — never switch it silently.
+  const tempoCode = verified && f.vehicle === 'eeco' && oneWayKm > serviceFacts.EECO_MAX_KM ? serviceFacts.TEMPO_FOR[service.code] : null;
+  const tempoService = tempoCode ? services.find((s) => s.code === tempoCode) : null;
+  // Freezer on body transport: in the Tempo package's fare; not on the Eeco.
+  let freezer = null;
+  if (f?.kind === 'body') freezer = !verified ? 'unverified' : f.freezerIncluded ? 'included' : 'not_included';
+  const nurseIncluded = verified && f.nurseIncluded;
+
   ctx.state.quoteSeq = (ctx.state.quoteSeq || 0) + 1;
   ctx.state.quote = {
     seq: ctx.state.quoteSeq,
@@ -307,6 +379,7 @@ async function getQuote(args, ctx) {
     usedShared: usesShared,
     quotes: { plain, helper: helperOption },
     helper, waitHours: roundTrip ? waitHours : 0, waitCharge, longTrip, twoDrivers,
+    freezer, verified, vehicle: verified ? f.vehicle : null,
   };
   const waitRule = wait
     ? `first ${wait.freeMinutes} minutes of waiting free, then ₹${wait.ratePerMin}/min${wait.tier2RatePerMin != null ? ` for ${wait.tier1Minutes} minutes, then ₹${wait.tier2RatePerMin}/min` : ''}`
@@ -327,7 +400,13 @@ async function getQuote(args, ctx) {
     atHospital ? 'The patient is at a hospital: do NOT ask about a helper.' : '',
     twoDrivers ? 'Over 1000 km: tell the caller two drivers are assigned for this trip.' : '',
     longTrip ? 'Long trip: before booking, ask briefly what happened, whether oxygen or a nurse is needed, and any special care — only what you do not know yet.' : '',
-    nurse ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
+    nurse && nurseIncluded ? 'Nurse: a nurse is INCLUDED in this service — say so; no extra charge.' : '',
+    nurse && !nurseIncluded ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
+    freezer === 'included' ? 'Freezer: INCLUDED in this Body Shifting — Tempo fare. Say so with the price. Do not offer it as an add-on and never say the team will quote a separate freezer charge.' : '',
+    freezer === 'not_included' ? `Freezer: this ${service.label} does NOT include a freezer — say so clearly.${args.freezer_needed ? ` They need one: offer Body Shifting — Tempo (freezer included) and ask if they want its price; only if they choose it, get_quote again with service_code ${serviceFacts.TEMPO_FOR[service.code]}.` : ''}` : '',
+    freezer === 'unverified' ? 'Freezer: the package details could not be verified — do not promise a freezer; say the team will confirm it.' : '',
+    tempoService ? `Over 800 km by Eeco: give this fare, then recommend a Tempo Traveller in the caller's language (Kannada: "${EECO_OVER_800_KN}"). Do NOT change the vehicle yourself; only if they agree, get_quote again with service_code ${tempoService.code} (${tempoService.label})${f.kind === 'patient' ? ' — the same care level in a bigger vehicle; it is NOT an ICU ambulance' : ''}.` : '',
+    mismatch ? 'The service details do not match our records: do not describe what is included; say the team will confirm the details.' : '',
     nearest ? 'Say this is the nearest hospital found, by name; the team can change it.' : '',
     'It is an estimate. Then ask if they want to book; when they do, read_back_booking first.',
   ].filter(Boolean).join(' ');
@@ -355,6 +434,10 @@ async function getQuote(args, ctx) {
     } : {}),
     ...(longTrip ? { long_trip: true } : {}),
     ...(twoDrivers ? { two_drivers: true } : {}),
+    ...(verified ? { vehicle: serviceFacts.VEHICLE_NAMES[f.vehicle], includes: f.includes } : {}),
+    ...(freezer ? { freezer } : {}),
+    ...(tempoService ? { recommend_tempo_traveller: { service_code: tempoService.code, service: tempoService.label, over_km: serviceFacts.EECO_MAX_KM } } : {}),
+    ...(mismatch ? { catalog_mismatch: mismatch.problem } : {}),
     estimated_fare_rupees: total,
     say,
   };
@@ -401,6 +484,9 @@ async function readBackBooking(args, ctx) {
 
   const helper = !q.atHospital && (typeof args.helper_needed === 'boolean' ? args.helper_needed : q.helper);
   if (helper && !q.quotes.helper) return { ok: false, reason: 'requote_helper', say: 'Call get_quote again with helper_needed true, and read back the new fare.' };
+  if (args.freezer_needed === true && q.freezer === 'not_included') {
+    return { ok: false, reason: 'freezer_not_on_eeco', say: `${q.service.label} has no freezer. Offer Body Shifting — Tempo (freezer included); only if they choose it, get_quote with service_code ${serviceFacts.TEMPO_FOR[q.service.code]}.` };
+  }
   const fare = (helper ? q.quotes.helper : q.quotes.plain).fare.grandTotal + (q.waitCharge || 0);
 
   const details = {
@@ -417,15 +503,18 @@ async function readBackBooking(args, ctx) {
     `Drop: ${q.drop.address}.`,
     `Pickup time: ${when === 'now' ? 'now' : sayIst(args.scheduled_time)}.`,
     appointment ? `Hospital appointment: ${sayIst(args.appointment_time)} (separate from the pickup time).` : '',
-    `Service: ${q.service.label}${q.tripType === 'round_trip' ? `, up and down${q.waitHours ? ` with about ${q.waitHours} h waiting` : ''}` : ''}${helper ? ', with helper' : ''}.`,
+    `Vehicle: ${q.service.label}${q.tripType === 'round_trip' ? `, up and down${q.waitHours ? ` with about ${q.waitHours} h waiting` : ''}` : ''}${helper ? ', with helper' : ''}.`,
     `Fare: ₹${fare} (estimate).`,
+    q.freezer === 'included' ? 'Freezer: included in this fare.' : '',
+    q.freezer === 'not_included' ? 'Freezer: not included.' : '',
   ].filter(Boolean).join(' ');
+  ctx.state.approvalFails = 0;
   ctx.state.pending = { at: typeof ctx.now === 'function' ? ctx.now() : Date.now(), quoteSeq: q.seq, details, summary };
   return {
     ok: true,
     summary,
-    say: 'Read this back in ONE short sentence in the caller\'s language — pickup, drop, pickup time'
-      + `${appointment ? ' and, separately, the appointment time' : ''}, service and fare — then ask "ಬುಕ್ ಮಾಡಲಾ?" and wait for their answer. `
+    say: 'Read this back ONCE, briefly, in the caller\'s language — pickup, exact drop, pickup time'
+      + `${appointment ? ' and, separately, the appointment time' : ''}, vehicle, fare${q.freezer ? ' and the freezer line' : ''} — then ask "${askToBook(ctx)}" once and wait. `
       + 'It is NOT booked yet: never say it is booked. Book only after a clear yes to this read-back.',
   };
 }
@@ -442,7 +531,8 @@ function changedFromReadBack(args, d) {
 const NOT_APPROVED = {
   not_read_back        : 'Read the details back first (read_back_booking), say them, ask "ಬುಕ್ ಮಾಡಲಾ?" and wait for the answer.',
   read_back_interrupted: 'The caller spoke over the read-back, so they did not hear all of it. Read it back again briefly and ask "ಬುಕ್ ಮಾಡಲಾ?".',
-  no                   : 'The caller did NOT approve (no / not yet / wait). Do NOT book and do NOT say it is booked. Ask what they want to change or when to book; read back again before booking.',
+  no                   : 'The caller said no. Do NOT book, do NOT ask again. Say in one sentence what the service includes (service_info if needed), that they can call SaveLife any time, a polite goodbye — then end_call not_needed.',
+  conditional          : 'The caller made it conditional (for example a discount). Do NOT book. record_question with conditional_booking true, tell them a team member will call back about it, and do not ask to book again.',
   unclear              : 'The caller\'s answer was not a clear yes. Ask once, simply: "ಬುಕ್ ಮಾಡಲಾ?" and wait. Do not say it is booked.',
   unavailable          : 'The caller\'s answer could not be checked. Ask "ಬುಕ್ ಮಾಡಲಾ?" again and wait.',
 };
@@ -466,10 +556,27 @@ async function createBooking(args, ctx) {
       state.pending = null;
       return { ok: false, reason: 'details_changed', changed, say: 'These details differ from what was read back. Call read_back_booking with the new details and read them back.' };
     }
+    if (args.freezer_box_needed === true && state.quote.freezer === 'not_included') {
+      return { ok: false, reason: 'freezer_not_on_eeco', say: `${state.quote.service.label} has no freezer. Offer Body Shifting — Tempo (freezer included) and get_quote for it only if they choose it.` };
+    }
     const verdict = typeof ctx.approval === 'function' ? await ctx.approval() : { status: 'unavailable' };
     if (verdict.status !== 'yes') {
-      if (verdict.status === 'no') state.pending = null; // "not yet": a fresh read-back is needed before any booking
-      return { ok: false, reason: verdict.status === 'no' ? 'caller_said_no' : `approval_${verdict.status}`, say: NOT_APPROVED[verdict.status] || NOT_APPROVED.unclear };
+      if (verdict.status === 'no' || verdict.status === 'conditional') {
+        state.pending = null; // nothing more to confirm: a fresh read-back is needed before any booking
+        return { ok: false, reason: verdict.status === 'no' ? 'caller_said_no' : 'caller_conditional', say: NOT_APPROVED[verdict.status] };
+      }
+      // Could not verify the yes. Once: repeat only what was cut off (or
+      // ask once more). Twice: a person confirms it — never a read-back loop.
+      // (The model calling too early — not_read_back — is not the caller's fault and does not count.)
+      if (verdict.status !== 'not_read_back') state.approvalFails = (state.approvalFails || 0) + 1;
+      if (state.approvalFails >= 2) {
+        await AiCall.updateOne({ _id: ctx.callId }, { $set: { pendingBooking: { summary: p.summary, reason: `approval_${verdict.status}`, at: new Date() } } }).catch(() => {});
+        return { ok: false, reason: 'approval_unverified', handoff: 'approval_unverified', say: 'Tell the caller in one short sentence that a team member will confirm the booking with them now. Do not read anything back again. Do not say it is booked.' };
+      }
+      if (verdict.status === 'read_back_interrupted' && verdict.unheard) {
+        return { ok: false, reason: 'approval_read_back_interrupted', unheard: verdict.unheard, say: `The caller spoke over part of the read-back. Repeat ONLY this part: "${verdict.unheard}", then ask "${askToBook(ctx)}" once.` };
+      }
+      return { ok: false, reason: `approval_${verdict.status}`, say: (NOT_APPROVED[verdict.status] || NOT_APPROVED.unclear).replace(/"ಬುಕ್ ಮಾಡಲಾ\?"/g, `"${askToBook(ctx)}"`) };
     }
     // Belt and braces for a retry after the in-memory state was lost.
     const existing = await AiCall.findById(ctx.callId).select('trip').lean();
@@ -525,19 +632,23 @@ async function book(args, ctx, d) {
     ...(d.pickupDetails ? { pickupDetails: d.pickupDetails } : {}),
     // The appointment is NOT the pickup time (scheduleDate): kept apart.
     ...(d.appointment_time ? { appointmentAt: parseIst(d.appointment_time) } : {}),
-    ...(typeof args.freezer_box_needed === 'boolean' ? { freezerBox: args.freezer_box_needed } : {}),
+    ...(typeof args.freezer_box_needed === 'boolean' && ctx.state.quote.freezer !== 'included' ? { freezerBox: args.freezer_box_needed } : {}),
+    // Body Shifting — Tempo: the freezer comes with the package.
+    ...(ctx.state.quote.freezer === 'included' ? { freezerIncluded: true } : {}),
   };
   await AiCall.updateOne({ _id: ctx.callId }, { $set: { trip: trip._id, outcome: 'booked', needs } });
   bookingPush.notifyIncomingBooking(trip._id); // rings the CRM — a person dispatches it
+  const nurseIncluded = serviceFacts.facts(service.code)?.nurseIncluded && ctx.state.quote.verified;
   const pendingWithTeam = [
-    needs.nurse ? 'the nurse and its charge' : '',
+    needs.nurse && !nurseIncluded ? 'the nurse and its charge' : '',
     needs.freezerBox ? 'the freezer box and its charge' : '',
+    ctx.state.quote.freezer === 'unverified' ? 'the freezer' : '',
   ].filter(Boolean);
   return {
     ok: true,
     trip_number: ctx.state.booked,
     estimated_fare_rupees: trip.estimatedFare,
-    say: `Booked. Now say "ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು" and the trip number. Then, separately: the team will call shortly to confirm the ambulance (it is not assigned yet)${pendingWithTeam.length ? ` and ${pendingWithTeam.join(' and ')}` : ''}.`,
+    say: `Booked. Now say "ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು" (in the caller's language) and the trip number. Then, separately: the team will call shortly to confirm the ambulance (it is not assigned yet)${pendingWithTeam.length ? ` and ${pendingWithTeam.join(' and ')}` : ''}.${ctx.state.quote.freezer === 'included' ? ' The freezer is included — no separate freezer charge.' : ''}`,
   };
 }
 
@@ -595,8 +706,44 @@ async function freezerBoxRequest(args, ctx) {
   return { ok: true, say: 'Noted. Tell the caller the team will call back shortly with the price, then end_call follow_up with a one-line summary.' };
 }
 
+// Verified service facts (serviceFacts.js). Nothing to verify -> a person.
+async function serviceInfo(args, ctx) {
+  const services = bookableServices();
+  const service = services.find((s) => s.code === args.service_code);
+  if (!service) {
+    return {
+      ok: true,
+      services: services.map((s) => ({ code: s.code, ...serviceFacts.describe(s.code, s.label) })),
+      say: 'Answer from these in one or two plain sentences. If you do not know which service they mean ("duty"?), ask once which service or arrangement. If none of this answers it, record_question for a team member.',
+    };
+  }
+  const facts = serviceFacts.describe(service.code, service.label);
+  if (!facts) return { ok: false, reason: 'not_verified', say: 'There are no verified details for this — record_question and say a team member will call back.' };
+  const q = ctx.state.quote;
+  if (q && q.service.code === service.code && !q.verified) {
+    return { ok: false, reason: 'catalog_mismatch', say: 'The details for this service do not match our records right now — say the team will confirm what is included.' };
+  }
+  return { ok: true, ...facts, say: 'Answer in one or two plain sentences in the caller\'s language (Eeco: "ಅದು ಮಾರುತಿ ಸುಜುಕಿ ಈಕೋ ವಾಹನವನ್ನು ಆಂಬುಲೆನ್ಸ್ ಆಗಿ ಬಳಸುವ ಸೇವೆ."). Do not list everything — just what they asked.' };
+}
+
+// Discount / advance / settlement and conditional yeses: for staff.
+async function recordQuestion(args, ctx) {
+  const topic = ['discount', 'advance', 'settlement', 'payment', 'duty', 'other'].includes(args.topic) ? args.topic : 'other';
+  const question = clean(args.question, 300);
+  if (!question) return { ok: false, reason: 'need_question', say: 'Note what they asked in a few words.' };
+  const conditional = args.conditional_booking === true;
+  await AiCall.updateOne({ _id: ctx.callId }, { $push: { staffQuestions: { $each: [{ topic, question, conditionalBooking: conditional, at: new Date() }], $slice: -20 } } });
+  if (conditional) ctx.state.pending = null; // a conditional yes never books
+  return {
+    ok: true,
+    say: `Noted for the team. Tell the caller a team member will call back about the ${topic === 'other' ? 'question' : topic}. Do not promise anything${conditional ? ', nothing is booked' : ''}, and do not ask to book again while they are deciding.`,
+  };
+}
+
 const HANDLERS = {
   get_quote: getQuote,
+  service_info: serviceInfo,
+  record_question: recordQuestion,
   read_back_booking: readBackBooking,
   create_booking: createBooking,
   send_location_request: sendLocationRequest,

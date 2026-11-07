@@ -79,7 +79,15 @@ const VOICE_GAP_MS = 250;      // a gap this short inside caller speech does not
 const MAX_HOLD_MS = 8000;      // noise that never stops (traffic, a siren) cannot mute Sahana for longer
 const STRETCH_GAP_MS = 800;    // Sahana's audio closer together than this is one stretch of speech
 const OPENING_PROTECT_MAX_MS = 20000;
-const APPROVAL_WAIT_MS = 1500; // the caller's "yes" transcript may land just after the tool call
+const APPROVAL_WAIT_MS = 2500; // the caller's "yes" transcript may land just after the tool call
+const ACK_SILENCE_MS = 350;    // a short sound followed by this much quiet was an acknowledgement ("ಹೂಂ", "हाँ")
+const STRETCH_BREAK_VOICE_MS = 200; // any real caller speech ends Sahana's current stretch of speech
+const TAIL_GRACE_MS = 1800;    // cut within the last 1.8 s ("ಬುಕ್ ಮಾಡಲಾ?", "ಧನ್ಯವಾದ"): the read-back still counts as heard
+const ANSWER_OVERLAP_MS = 1500; // a "yes" over the closing question counts as the answer
+const HANDOFF_AFTER_LINE_MS = 6000;
+// Words that are only an acknowledgement — they never cut Sahana off.
+const ACK_WORDS = /^(?:ಹೂಂ|ಹೂ|ಹಾ|ಹಾಂ|ಆ|ಆಂ|ಜಿ|ಜೀ|ಹೌದು|ಸರಿ|ಓಕೆ|ಮೇಡಮ್|ಮೇಡಂ|ಸರ್|ಆಯ್ತು|ok|okay|haan|han|ha|hmm|hm|ji|yes|yeah|madam|sir|हाँ|हां|हम्म|जी|ठीक|अच्छा|అవును|సరే|ఆ|హా|మేడమ్|ம்ம்|சரி|ஆமா|ശരി|അതെ|ഉം)$/i;
+const isOnlyAck = (text) => String(text || '').toLowerCase().replace(/[.,!?।\-–—]/g, ' ').split(/\s+/).filter(Boolean).every((w) => ACK_WORDS.test(w));
 const MAX_CALLER_FRAGMENTS = 400;
 
 // The opening, said as soon as the call connects: hello, the disclosure
@@ -120,9 +128,32 @@ const WA_SENT_CLAIM = near(WA_WORD, WA_SENT);
 const WA_PROMISE = near(WA_WORD, WA_WILL);
 // "Booked" only after create_booking returned ok.
 const BOOKED_CLAIM = /ಬುಕ್ಕಿಂಗ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಮಾಡಿದ್ದ(?:ೀನಿ|ೇನೆ)|ಬುಕ್ಕಿಂಗ್ ಕನ್ಫರ್ಮ್ ಆ|booking (?:is )?(?:done|confirmed|complete)|(?:is|been|have) booked|booked (?:it|your|the)|बुकिंग हो गई|बुक हो गया|बुक हो गई|बुक कर दिया|బుక్ అయ్యింది|బుక్ చేశాను|బుకింగ్ అయింది|புக் ஆயிடுச்சு|புக் பண்ணிட்டேன்|ബുക്ക് ചെയ്തു|ബുക്കിംഗ് ആയി/i;
-const HOLD_LINE = 'ಒಂದು ನಿಮಿಷ.';
+const HOLD_LINE = 'ಕ್ಷಮಿಸಿ, ಲಿಂಕ್ ಇನ್ನೂ ಕಳಿಸಿಲ್ಲ.';
 const WHATSAPP_FAILED_LINE = 'ಕ್ಷಮಿಸಿ, WhatsApp ಕಳಿಸೋಕೆ ಆಗ್ಲಿಲ್ಲ. ನಿಮ್ಮ address ಅಥವಾ ಹತ್ತಿರದ landmark ಹೇಳಿ.';
-const NOT_BOOKED_LINE = 'ಒಂದು ನಿಮಿಷ, ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಖಚಿತ ಆಗಿಲ್ಲ.';
+const NOT_BOOKED_LINE = 'ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಖಚಿತ ಆಗಿಲ್ಲ.';
+// The fixed lines, in the language the caller asked for (Kannada default;
+// Telugu / Tamil / Malayalam get the English text, which the voice model
+// says in the locked language).
+const LINES = {
+  kn: { price: PRICE_HOLD_LINE, hold: HOLD_LINE, waFailed: WHATSAPP_FAILED_LINE, notBooked: NOT_BOOKED_LINE, resume: RESUME_LINE, timeUp: TIME_UP_BOOKED_LINE },
+  hi: {
+    price: 'एक मिनट, सही किराया बताती हूँ।',
+    hold: 'माफ़ कीजिए, लिंक अभी भेजा नहीं गया है।',
+    waFailed: 'माफ़ कीजिए, WhatsApp नहीं जा पाया। अपना पता या पास का कोई landmark बता दीजिए।',
+    notBooked: 'बुकिंग अभी पक्की नहीं हुई है।',
+    resume: 'माफ़ कीजिए, लाइन थोड़ी कट गई थी।',
+    timeUp: 'आपकी बुकिंग हो गई है, हमारी टीम थोड़ी देर में कॉल करेगी। धन्यवाद!',
+  },
+  en: {
+    price: "One moment, I'll tell you the exact fare.",
+    hold: 'Sorry, the link has not been sent yet.',
+    waFailed: 'Sorry, the WhatsApp could not be sent. Please tell me your address or a nearby landmark.',
+    notBooked: 'The booking is not confirmed yet.',
+    resume: 'Sorry, the line dropped for a moment.',
+    timeUp: 'Your booking is done; our team will call you shortly. Thank you!',
+  },
+};
+const linesFor = (lang) => LINES[lang] || (lang ? LINES.en : LINES.kn);
 const waFailed = (st) => st.whatsapp === 'off' || st.whatsapp === 'failed';
 
 // Things Sahana must never say before they are true. Checked on her own
@@ -131,18 +162,18 @@ const waFailed = (st) => st.whatsapp === 'off' || st.whatsapp === 'failed';
 const GUARDS = [
   {
     id: 'price', what: 'a price said before get_quote', counter: 'priceGuardStops',
-    active: (st) => !st.quote, test: (t) => saysPrice(t), line: () => PRICE_HOLD_LINE,
+    active: (st) => !st.quote, test: (t) => saysPrice(t), line: (st, L) => L.price,
   },
   {
     id: 'whatsapp', what: 'a WhatsApp link claimed without a successful send', counter: 'claimGuardStops',
     active: (st) => st.whatsapp !== 'sent' && st.whatsapp !== 'received',
     test: (t, st) => WA_SENT_CLAIM.test(t) || (waFailed(st) && WA_PROMISE.test(t)),
-    line: (st) => (waFailed(st) ? WHATSAPP_FAILED_LINE : HOLD_LINE),
+    line: (st, L) => (waFailed(st) ? L.waFailed : L.hold),
     hint: 'No WhatsApp has been sent: send_location_request has not succeeded. Never say a link was sent. Ask for the address and a landmark on the call.',
   },
   {
     id: 'booked', what: 'a booking claimed before create_booking succeeded', counter: 'claimGuardStops',
-    active: (st) => !st.booked, test: (t) => BOOKED_CLAIM.test(t), line: () => NOT_BOOKED_LINE,
+    active: (st) => !st.booked, test: (t) => BOOKED_CLAIM.test(t), line: (st, L) => L.notBooked,
     hint: 'Nothing is booked: create_booking has not returned ok. Never say it is booked until it does.',
   },
 ];
@@ -177,7 +208,8 @@ You run the tools for SaveLife's phone assistant. Use only these tools; never an
 get_quote is the only source of prices; any change to the route (pickup, hospital or branch, service, round trip, wait) needs a new get_quote. To book: read_back_booking, the assistant reads it back and asks; create_booking ONLY after the caller's clear yes to that read-back (the server checks the caller's words) — never after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", never twice. Never say it is booked unless create_booking returned ok. Never say a WhatsApp link was sent unless send_location_request returned status sent. A freezer box kept at home is never priced: freezer_box_request (address, start time, how long), then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
 Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
-Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it). Over 1000 km: two drivers are assigned.
+Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it) — ALS/ACLS/NICU include a nurse. Over 1000 km: two drivers are assigned.
+Vehicles and inclusions only from service_info / get_quote: Body Shifting — Tempo includes the freezer (never a separate charge); Body Mini — Eeco has none (offer the Tempo; new get_quote only if chosen). Eeco over 800 km: recommend a Tempo Traveller, never switch it yourself. A vague place (a whole state) is refused: ask the town and exact place. Discount / advance / settlement / conditional yes: record_question, never promise, never book on a condition. A clear no: no booking, a polite close, end_call not_needed.
 Dates: take them from the DATE AND TIME list in the instructions; never ask the caller for a month or year.
 Reply briefly in plain words the phone assistant can say aloud.
 `.trim();
@@ -244,7 +276,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     language: null, cannotNoted: null, langFrom: 0,
     // Playback clock: when Sahana's audio already sent to Plivo finishes
     // playing, and her stretches of speech (for the read-back check).
-    playUntil: 0, stretches: [], stretchBreak: false, bargeIns: 0,
+    playUntil: 0, stretches: [], stretchBreak: false, bargeIns: 0, pendingBarge: null,
     // The opening (recording notice) is never cut by barge-in.
     protect: false, openingHeard: false, protectSince: 0,
     // Caller speech detector (in audio time, from the frames themselves).
@@ -354,50 +386,15 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
   // ── Barge-in ──────────────────────────────────────────────
   // Sahana's audio is "audible" until the playback clock runs out (each
-  // delta is bytes/8 ms of 8 kHz mu-law). The caller talking over her for
-  // AI_BARGE_IN_MS clears Plivo's buffer; her audio is then held back
-  // until the caller has finished (AI_CALLER_DONE_MS of quiet).
+  // delta is bytes/8 ms of 8 kHz mu-law). Caller speech over her for
+  // AI_BARGE_IN_MS makes a barge-in PENDING: her new audio is queued, not
+  // dropped. It becomes real — Plivo clearAudio, queue discarded, her audio
+  // held until the caller finishes — when they keep talking for
+  // AI_BARGE_IN_CONFIRM_MS or their words are more than an acknowledgement.
+  // A "ಹೂಂ" / "हाँ" / "ಜಿ" followed by quiet cancels it and the queue plays
+  // on: brief acknowledgements never cut her off.
   const audible = () => now() < s.playUntil;
-  const bargeIn = () => {
-    const t = now();
-    sendPlivo({ event: 'clearAudio', streamId: s.streamId });
-    const last = s.stretches[s.stretches.length - 1];
-    if (last && last.end > t) { last.end = t; last.interrupted = true; }
-    s.playUntil = t;
-    s.bargeIns += 1;
-    AiCall.updateOne({ _id: callId }, { $inc: { bargeIns: 1 } }).catch(() => {});
-    note('system', 'Caller interrupted — assistant audio stopped');
-    sendAI({ type: 'session.thinking.append', event_id: `event_barge_${s.bargeIns}`, delegation_id: null, content: BARGE_IN_NOTE });
-  };
-  const onCallerAudio = (payload) => {
-    const { rms, ms } = frameLevel(payload);
-    if (!ms) return;
-    const v = s.vad;
-    if (s.protect && ((s.openingHeard && !audible()) || now() - s.protectSince > OPENING_PROTECT_MAX_MS)) s.protect = false;
-    if (rms >= config.bargeInRms()) {
-      v.voiced += ms;
-      v.silence = 0;
-    } else {
-      v.silence += ms;
-      if (v.silence > VOICE_GAP_MS) v.voiced = 0;
-    }
-    const done = v.silence >= config.callerDoneMs();
-    if (v.talking) {
-      v.holdMs += ms;
-      if (done) v.talking = false;
-      else if (v.holdMs >= MAX_HOLD_MS) { v.talking = false; v.capped = true; }
-      return;
-    }
-    if (v.capped) { if (done) v.capped = false; return; }
-    if (v.voiced >= config.bargeInMs()) {
-      v.talking = true;
-      v.holdMs = 0;
-      if (!s.protect && audible()) bargeIn();
-    }
-  };
-  // Sahana's audio -> Plivo, unless the caller is mid-sentence.
-  const onAssistantAudio = (delta) => {
-    if (s.vad.talking && !s.protect) return; // let the caller finish
+  const forward = (delta) => {
     const t = now();
     const ms = audioMs(delta);
     const last = s.stretches[s.stretches.length - 1];
@@ -412,6 +409,81 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     if (s.protect) s.openingHeard = true;
     sendPlivo({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: delta } });
   };
+  const bargeIn = () => {
+    const t = now();
+    sendPlivo({ event: 'clearAudio', streamId: s.streamId });
+    const last = s.stretches[s.stretches.length - 1];
+    // Remember how much was still to play: a cut in the last moment (the
+    // closing question) does not void a read-back (judgeApproval).
+    if (last && last.end > t) { last.plannedEnd = last.end; last.end = t; last.interrupted = true; }
+    s.playUntil = t;
+    s.bargeIns += 1;
+    AiCall.updateOne({ _id: callId }, { $inc: { bargeIns: 1 } }).catch(() => {});
+    note('system', 'Caller interrupted — assistant audio stopped');
+    sendAI({ type: 'session.thinking.append', event_id: `event_barge_${s.bargeIns}`, delegation_id: null, content: BARGE_IN_NOTE });
+  };
+  const startHold = () => {
+    s.vad.talking = true;
+    s.vad.holdMs = 0;
+    s.stretchBreak = true;
+  };
+  const confirmBarge = () => {
+    s.pendingBarge = null;
+    bargeIn();
+    startHold();
+  };
+  const cancelBarge = () => {
+    const { queue } = s.pendingBarge;
+    s.pendingBarge = null;
+    queue.forEach(forward);
+  };
+  const onCallerAudio = (payload) => {
+    const { rms, ms } = frameLevel(payload);
+    if (!ms) return;
+    const v = s.vad;
+    if (s.protect && ((s.openingHeard && !audible()) || now() - s.protectSince > OPENING_PROTECT_MAX_MS)) s.protect = false;
+    if (rms >= config.bargeInRms()) {
+      v.voiced += ms;
+      v.silence = 0;
+      // The caller spoke in a gap: her next words are a new stretch. (Over
+      // her, only a confirmed barge-in splits it — a "ಹೂಂ" does not.)
+      if (v.voiced >= STRETCH_BREAK_VOICE_MS && !audible() && !s.pendingBarge) s.stretchBreak = true;
+    } else {
+      v.silence += ms;
+      if (v.silence > VOICE_GAP_MS) v.voiced = 0;
+    }
+    const done = v.silence >= config.callerDoneMs();
+    if (v.talking) {
+      v.holdMs += ms;
+      if (done) v.talking = false;
+      else if (v.holdMs >= MAX_HOLD_MS) { v.talking = false; v.capped = true; }
+      return;
+    }
+    if (v.capped) { if (done) v.capped = false; return; }
+    if (s.pendingBarge) {
+      s.pendingBarge.voiced += rms >= config.bargeInRms() ? ms : 0;
+      if (s.pendingBarge.voiced >= config.bargeInConfirmMs()) confirmBarge();
+      else if (v.silence >= ACK_SILENCE_MS) cancelBarge(); // just an acknowledgement
+      return;
+    }
+    if (v.voiced >= config.bargeInMs()) {
+      if (!s.protect && audible()) s.pendingBarge = { at: now(), voiced: v.voiced, queue: [], text: '' };
+      else startHold();
+    }
+  };
+  // Caller words while a barge-in is pending: more than "ಹೂಂ / हाँ" = real.
+  const onCallerWordsDuringBarge = (delta) => {
+    const pb = s.pendingBarge;
+    if (!pb) return;
+    pb.text += delta;
+    if (!isOnlyAck(pb.text)) confirmBarge();
+  };
+  // Sahana's audio -> Plivo, unless the caller is mid-sentence.
+  const onAssistantAudio = (delta) => {
+    if (s.vad.talking && !s.protect) return; // let the caller finish
+    if (s.pendingBarge) { s.pendingBarge.queue.push(delta); return; } // maybe just a "ಹೂಂ": keep it
+    forward(delta);
+  };
 
   // ── Claim guards (GUARDS) on Sahana's own words ───────────
   const checkClaims = (said) => {
@@ -424,7 +496,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
       console.warn(`[aiCaller] ${g.what} on ${callId} — audio cleared`);
       AiCall.updateOne({ _id: callId }, { $inc: { [g.counter]: 1 } }).catch(() => {});
       if (g.hint) sendAI({ type: 'session.thinking.append', event_id: `event_${g.id}_hint_${Date.now()}`, delegation_id: null, content: g.hint });
-      sendAI({ type: 'session.commentary.append', event_id: `event_${g.id}_hold_${Date.now()}`, delegation_id: null, content: g.line(s.state) });
+      sendAI({ type: 'session.commentary.append', event_id: `event_${g.id}_hold_${Date.now()}`, delegation_id: null, content: g.line(s.state, linesFor(s.language)) });
       return;
     }
   };
@@ -448,26 +520,39 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   };
 
   // ── Was the read-back answered with a clear yes? (tools: create_booking)
-  // The read-back is Sahana's first uninterrupted stretch of speech after
-  // read_back_booking returned. Approval = the caller's words AFTER it
-  // finished playing are a clear yes, and nothing the caller said since
-  // the read-back was prepared is a no / not yet.
+  // The read-back is Sahana's first COMPLETE stretch of speech after
+  // read_back_booking returned: played to the end, or cut only in its last
+  // TAIL_GRACE_MS (the closing "ಬುಕ್ ಮಾಡಲಾ?" or a courtesy word — the
+  // material details were heard). Approval = the caller's words from just
+  // before it ended (ANSWER_OVERLAP_MS — a yes over the closing question)
+  // are a clear yes, and nothing said since it was prepared is a no or a
+  // condition. A stretch cut earlier reports which details went unheard,
+  // so only those are repeated.
+  const complete = (st) => !st.interrupted || (st.plannedEnd - st.end) <= TAIL_GRACE_MS;
+  const unheardPart = (p, st) => {
+    const parts = String(p.summary || '').split(/(?<=\.)\s+/).filter(Boolean);
+    const played = st.plannedEnd > st.start ? (st.end - st.start) / (st.plannedEnd - st.start) : 0;
+    const heard = Math.max(0, Math.min(parts.length - 1, Math.floor(played * parts.length)));
+    return parts.slice(heard).join(' ');
+  };
   const judgeApproval = () => {
     const p = s.state.pending;
     if (!p) return { status: 'not_read_back' };
     const after = s.stretches.filter((st) => st.start >= p.at);
-    const rb = after.find((st) => !st.interrupted);
-    if (!rb) return { status: after.length ? 'read_back_interrupted' : 'not_read_back' };
-    if (now() < rb.end) return { status: 'not_read_back' }; // still being read out
-    const since = s.callerFrags.filter((f) => f.at >= p.at).map((f) => f.text).join('');
+    if (!after.length) return { status: 'not_read_back' };
+    const rb = after.find(complete);
+    if (!rb) return { status: 'read_back_interrupted', unheard: unheardPart(p, after[after.length - 1]) };
+    if (now() < rb.end - ANSWER_OVERLAP_MS) return { status: 'not_read_back' }; // the details are still being read out
+    const since = s.callerFrags.filter((f) => f.at >= p.at).map((f) => f.text).join(' ');
     if (approvalWords.saysNo(since)) return { status: 'no', heard: since };
-    const answer = s.callerFrags.filter((f) => f.at >= rb.end).map((f) => f.text).join('');
+    if (approvalWords.saysConditional(since)) return { status: 'conditional', heard: since };
+    const answer = s.callerFrags.filter((f) => f.at >= rb.end - ANSWER_OVERLAP_MS).map((f) => f.text).join(' ');
     return { status: approvalWords.classify(answer), heard: answer };
   };
   const approval = async () => {
     const until = Date.now() + approvalWaitMs;
     let v = judgeApproval();
-    while (!['yes', 'no', 'read_back_interrupted'].includes(v.status) && Date.now() < until) {
+    while (!['yes', 'no', 'conditional', 'read_back_interrupted'].includes(v.status) && Date.now() < until) {
       await new Promise((r) => { setTimeout(r, 100); });
       if (s.ended) break;
       v = judgeApproval();
@@ -596,7 +681,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
           if (resume) {
             note('system', `AI reconnected (${s.reconnects}/${MAX_AI_RECONNECTS}) — call continues`);
             // A short sorry, then it carries on from the conversation so far.
-            sendAI({ type: 'session.commentary.append', event_id: `event_resume_${s.reconnects}`, delegation_id: null, content: RESUME_LINE });
+            sendAI({ type: 'session.commentary.append', event_id: `event_resume_${s.reconnects}`, delegation_id: null, content: linesFor(s.language).resume });
           } else {
             note('system', `AI session started (${config.realtimeModel()} + ${config.delegateModel()}, ${s.styleExamples} style example${s.styleExamples === 1 ? '' : 's'})`);
             // The opening — disclosure, then "ambulance ಬೇಕಾ?": the first thing it
@@ -618,6 +703,8 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
           const turn = addFragment('caller', ev.delta);
           if (ev.delta) {
             s.callerFrags.push({ at: now(), text: ev.delta });
+            if (!audible() && !s.pendingBarge) s.stretchBreak = true;
+            onCallerWordsDuringBarge(ev.delta);
             if (s.callerFrags.length > MAX_CALLER_FRAGMENTS) s.callerFrags.shift();
           }
           // Which letters the transcript used — kept for diagnosis only; the
@@ -665,7 +752,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     if (s.ended || s.ending) return;
     if (s.state.booked) {
       note('system', 'Time limit reached after booking — goodbye');
-      sendAI({ type: 'session.commentary.append', event_id: 'event_time_up', delegation_id: null, content: TIME_UP_BOOKED_LINE });
+      sendAI({ type: 'session.commentary.append', event_id: 'event_time_up', delegation_id: null, content: linesFor(s.language).timeUp });
       s.timers.push(setTimeout(() => endCall({ outcome: 'booked', summary: `Booked ${s.state.booked}; call reached the time limit.` }), TIME_UP_GOODBYE_MS));
       return;
     }
@@ -699,13 +786,16 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
     const handler = tools.HANDLERS[item.name];
     const output = handler
-      ? await handler(args, { callId, phone: s.phone, state: s.state, approval, now })
+      ? await handler(args, { callId, phone: s.phone, state: s.state, approval, now, language: s.language })
       : { ok: false, reason: 'unknown_tool' };
     // The read-back is the NEXT thing she says: start a fresh stretch of speech.
     if (item.name === 'read_back_booking' && output.ok) s.stretchBreak = true;
     note('system', `${item.name} -> ${output.ok ? 'ok' : output.reason}`);
     sendAI({ type: 'response.item.create', event_id: `event_out_${item.call_id}`, item: { type: 'function_call_output', call_id: item.call_id, output: JSON.stringify(output) } });
     sendAI({ type: 'response.create', event_id: `event_continue_${item.call_id}` });
+    // The tool asked for a person (approval could not be verified twice):
+    // she says one line, then the call goes to the team with the details.
+    if (output.handoff) s.timers.push(setTimeout(() => handOff(output.handoff), HANDOFF_AFTER_LINE_MS));
     return undefined;
   }
 
@@ -732,6 +822,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
 module.exports = {
   createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
-  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
+  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, LINES, isOnlyAck, TAIL_GRACE_MS, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
   MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

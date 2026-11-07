@@ -42,22 +42,32 @@ const NO = [
 const YES = [
   /\b(yes|yeah|yep|ok|okay|sure|go ahead|confirm(ed)?|book it|please book|do it|fine|correct|done)\b/i,
   /ಹೌದು|ಹೌದ|ಓಕೆ|ಸರಿ|ಮಾಡಿ|ಆಗ್ಲಿ|ಆಗಲಿ|ಆಯ್ತು|ಕನ್ಫರ್ಮ್|ಬುಕ್ ಮಾಡಿ/,
-  /हाँ|हां|ठीक|कर दो|कर दीजिए|करो|बुक करो|जी हाँ|\b(haan|han|ha|theek|thik|kar do|karo)\b/i,
+  /हाँ|हां|ठीक|कर दो|कर दीजिए|कर लीजिए|बुक कर|करो|बुक करो|जी हाँ|\b(haan|han|ha|theek|thik|kar do|karo)\b/i,
   /అవును|సరే|చేయండి|ఓకే|హౌదు|హావుద|మాడి|సరి/,
   /ஆமா|ஆமாம்|சரி|பண்ணுங்க|ஓகே/,
   /അതെ|ശരി|ചെയ്യൂ|ചെയ്തോ|ഓക്കെ/,
 ];
 
+// "Book only if you give a discount" — a yes with a condition is NOT a yes.
+// Recorded for staff; nothing is booked.
+const CONDITIONAL = [
+  /(only if|if you (give|can)|provided|on condition|as long as)/i,
+  /discount|ಡಿಸ್ಕೌಂಟ್|ರಿಯಾಯಿತಿ|कम करो|कम कर|डिस्काउंट|छूट|తగ్గింపు|డిస్కౌంట్|தள்ளுபடி|ഡിസ്കൗണ്ട്/i,
+  /ಕೊಟ್ರೆ ಮಾತ್ರ|ಆದ್ರೆ ಮಾತ್ರ|ಮಾಡಿದ್ರೆ ಮಾತ್ರ|ಕಡಿಮೆ ಮಾಡಿದ್ರೆ|ಕಡಿಮೆ ಮಾಡಿ|अगर .* तो|तभी|तो ही/,
+];
+
 const saysNo = (text) => NO.some((re) => re.test(String(text || '')));
+const saysConditional = (text) => CONDITIONAL.some((re) => re.test(String(text || '')));
 const saysYes = (text) => YES.some((re) => re.test(String(text || '')));
 
-// 'yes' | 'no' | 'unclear'
+// 'yes' | 'no' | 'conditional' | 'unclear'
 function classify(text) {
   const t = String(text || '').trim();
   if (!t) return 'unclear';
   if (saysNo(t)) return 'no';
+  if (saysConditional(t)) return 'conditional';
   if (saysYes(t)) return 'yes';
   return 'unclear';
 }
 
-module.exports = { classify, saysNo, saysYes };
+module.exports = { classify, saysNo, saysYes, saysConditional };

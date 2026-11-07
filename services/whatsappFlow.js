@@ -359,6 +359,9 @@ async function resolvePlaceFromText(query) {
         address: r.formatted_address,
         lat    : r.geometry?.location?.lat,
         lng    : r.geometry?.location?.lng,
+        // Google's place types (additive; the AI telecaller uses them to
+        // tell "Assam" — a whole state — from a usable address).
+        types  : Array.isArray(r.types) ? r.types : [],
       }))
       // A result missing real coordinates is useless here and must never
       // be offered -- filtered out rather than passed through as-is.

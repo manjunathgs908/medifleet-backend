@@ -60,7 +60,10 @@ function mockMemoryModel() {
     keys.slice(0, -1).forEach((k) => { o[k] = o[k] || {}; o = o[k]; });
     o[keys.at(-1)] = value;
   };
-  const apply = (doc, update) => Object.entries(update.$set || {}).forEach(([k, v]) => setPath(doc, k, v));
+  const apply = (doc, update) => {
+    Object.entries(update.$set || {}).forEach(([k, v]) => setPath(doc, k, v));
+    Object.entries(update.$push || {}).forEach(([k, v]) => setPath(doc, k, [...(doc[k] || []), ...(v && v.$each ? v.$each : [v])]));
+  };
   return {
     store,
     reset() { store.length = 0; seq = 0; },
@@ -212,7 +215,7 @@ describe('B. conversation rules', () => {
     expect(I).toMatch(/nearest hospital \("ಹತ್ತಿರದ ಆಸ್ಪತ್ರೆ"\), say OK and do NOT insist on a name/);
     expect(I).toMatch(/FREEZER BOX: when the caller says freezer box, ice box or ಶವ ಪೆಟ್ಟಿಗೆ, FIRST ask this one question: "ಫ್ರೀಜರ್ ಬಾಕ್ಸ್ ಮನೆಯಲ್ಲಿ ಇಡಲು ಬೇಕಾ, ಅಥವಾ ಪಾರ್ಥಿವ ಶರೀರವನ್ನು ವಾಹನದಲ್ಲಿ ಸಾಗಿಸಲು ಬೇಕಾ\?"/);
     expect(I).toMatch(/Box at home: ask the delivery ADDRESS \(with a landmark\), from WHEN it is needed \(start time\), and for HOW LONG/);
-    expect(I).toMatch(/Body transport by vehicle: ask the pickup, the destination and the date and time, and whether they ALSO need a freezer box/);
+    expect(I).toMatch(/Body transport by vehicle: ask the pickup, the destination and the date and time\. The freezer depends on the package: Body Shifting — Tempo includes it; Body Mini — Eeco does not/);
     expect(I).toMatch(/oxygen/);
     expect(I).toMatch(/helper/);
     expect(I).toMatch(/Prioritise Kannada, English, Hindi, Telugu, Tamil and Malayalam/);
@@ -869,5 +872,155 @@ describe('F. read-back, approval, schedule, freezer flows, language', () => {
     expect(I).toMatch(/Say "ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು" ONLY after create_booking returned ok/);
     expect(I).toMatch(/If ANYTHING in the route changes .* call get_quote again and say the NEW fare/);
     expect(session.DELEGATE_INSTRUCTIONS).toMatch(/create_booking ONLY after the caller's clear yes to that read-back/);
+  });
+});
+
+// ============================================================
+describe('G. vehicles, freezer packages, Eeco over 800 km, places, staff questions', () => {
+  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes', heard: 'ಹೌದು' }) });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const single = (name, lat, lng, types) => ({ status: 'single', place: { name, address: 'India', lat, lng, ...(types ? { types } : {}) } });
+  const VEHICLE = { bls: 'Maruti Eeco', body_mini: 'Maruti Eeco', bls_tempo: 'Tempo Traveller', body_tempo: 'Tempo Traveller', als_tempo: 'Tempo Traveller' };
+  // quoteTrip as the real one answers: the Pricing doc's vehicleType on the fare.
+  const priced = (km, vehicleFor = VEHICLE) => quoteTrip.mockImplementation(async (q) => ({ distanceKm: km, oneWayKm: km, fare: { grandTotal: 1000 + Math.round(km), vehicleType: vehicleFor[q.selectedType] } }));
+  const quote = (c, args) => {
+    resolvePlaceFromText.mockResolvedValueOnce(single('Victoria Hospital', 1, 2)).mockResolvedValueOnce(single('Hubballi', 3, 4));
+    return run('get_quote', { pickup: 'Victoria Hospital', drop: 'Hubballi', patient_at: 'hospital', ...args }, c);
+  };
+  beforeEach(() => {
+    priced(420);
+    createBookedTrip.mockResolvedValue({ _id: 'trip1', tripNumber: 'TRP-1', estimatedFare: 1420 });
+  });
+
+  test('Body Shifting — Tempo: the freezer is included in the quoted fare, in the read-back and on the booking', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    const q = await quote(c, { service_code: 'body_tempo' });
+    expect(q).toMatchObject({ ok: true, freezer: 'included', vehicle: expect.stringMatching(/Tempo Traveller/) });
+    expect(q.say).toMatch(/Freezer: INCLUDED in this Body Shifting — Tempo fare.*never say the team will quote a separate freezer charge/);
+    const rb = await run('read_back_booking', { when: 'now' }, c);
+    expect(rb.summary).toMatch(/Freezer: included in this fare\./);
+    const r = await run('create_booking', { customer_confirmed: true, freezer_box_needed: true }, c);
+    expect(r.say).toMatch(/The freezer is included — no separate freezer charge/);
+    expect(r.say).not.toMatch(/freezer box and its charge/);
+    expect(call.needs).toMatchObject({ freezerIncluded: true });
+    expect(call.needs.freezerBox).toBeUndefined();
+  });
+
+  test('Body Mini — Eeco: no freezer; a freezer request offers the Tempo and re-quotes ONLY when chosen', async () => {
+    const c = ctx(AiCall.add({}));
+    const q = await quote(c, { service_code: 'body_mini', freezer_needed: true });
+    expect(q).toMatchObject({ ok: true, freezer: 'not_included' });
+    expect(q.say).toMatch(/does NOT include a freezer.*offer Body Shifting — Tempo.*only if they choose it, get_quote again with service_code body_tempo/);
+    expect(quoteTrip.mock.calls.every(([a]) => a.selectedType === 'body_mini')).toBe(true); // not switched
+    expect(await run('read_back_booking', { when: 'now', freezer_needed: true }, c)).toMatchObject({ ok: false, reason: 'freezer_not_on_eeco' });
+    // The caller chooses the Tempo: a fresh quote for it.
+    const t = await quote(c, { service_code: 'body_tempo' });
+    expect(t).toMatchObject({ ok: true, freezer: 'included' });
+    expect(quoteTrip.mock.calls.at(-1)[0].selectedType).toBe('body_tempo');
+  });
+
+  test('the quote contradicts the catalog: no freezer promised, the mismatch is recorded for staff', async () => {
+    priced(420, { ...VEHICLE, body_tempo: 'Maruti Eeco' });
+    const call = AiCall.add({});
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const q = await quote(ctx(call), { service_code: 'body_tempo' });
+      expect(q).toMatchObject({ ok: true, freezer: 'unverified', catalog_mismatch: expect.stringMatching(/Pricing says Maruti Eeco, the booking page says Tempo Traveller/) });
+      expect(q.say).toMatch(/do not promise a freezer; say the team will confirm it/);
+      expect(q).not.toHaveProperty('includes');
+      await new Promise((r) => setImmediate(r));
+      expect(call.catalogMismatches[0]).toMatchObject({ code: 'body_tempo', expected: 'tempo', pricing: 'Maruti Eeco' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test.each([
+    ['bls', 800, null],
+    ['bls', 800.4, 'bls_tempo'],
+    ['body_mini', 800, null],
+    ['body_mini', 812, 'body_tempo'],
+    ['bls_tempo', 1200, null], // already a Tempo Traveller
+  ])('%s at %s km: Tempo Traveller recommended -> %s (never switched)', async (code, km, expected) => {
+    priced(km);
+    const q = await quote(ctx(AiCall.add({})), { service_code: code });
+    expect(q.ok).toBe(true);
+    if (expected) {
+      expect(q.recommend_tempo_traveller).toMatchObject({ service_code: expected, over_km: 800 });
+      expect(q.say).toMatch(/ಈ ಪ್ರಯಾಣ 800 ಕಿಲೋಮೀಟರ್‌ಗಿಂತ ಹೆಚ್ಚು ಇದೆ/);
+      expect(q.say).toMatch(/Do NOT change the vehicle yourself/);
+      if (code === 'bls') expect(q.say).toMatch(/the same care level in a bigger vehicle; it is NOT an ICU ambulance/);
+    } else {
+      expect(q).not.toHaveProperty('recommend_tempo_traveller');
+    }
+    expect(quoteTrip.mock.calls.every(([a]) => a.selectedType === code)).toBe(true);
+  });
+
+  test('"Eeco ಅಂದ್ರೆ ಯಾವ ಗಾಡಿ?": a Maruti Suzuki Eeco used as an ambulance', async () => {
+    const r = await run('service_info', { service_code: 'bls', question: 'what vehicle is Eeco' }, ctx(AiCall.add({})));
+    expect(r).toMatchObject({ ok: true, vehicle: 'a Maruti Suzuki Eeco van used as an ambulance', care_level: 'BLS (basic life support)' });
+    expect(r.say).toMatch(/ಅದು ಮಾರುತಿ ಸುಜುಕಿ ಈಕೋ ವಾಹನವನ್ನು ಆಂಬುಲೆನ್ಸ್ ಆಗಿ ಬಳಸುವ ಸೇವೆ/);
+    const all = await run('service_info', { question: 'what is duty' }, ctx(AiCall.add({})));
+    expect(all.say).toMatch(/ask once which service or arrangement/);
+    expect(all.services.find((s) => s.code === 'als_tempo').includes).toEqual(expect.arrayContaining([expect.stringMatching(/nurse/)]));
+  });
+
+  test('"Assam": a whole state is refused — ask the town and the exact drop before any price', async () => {
+    const c = ctx(AiCall.add({}));
+    resolvePlaceFromText.mockResolvedValueOnce(single('Victoria Hospital', 1, 2, ['hospital', 'establishment']))
+      .mockResolvedValueOnce(single('Assam', 26.2, 92.9, ['administrative_area_level_1', 'political']));
+    const r = await run('get_quote', { service_code: 'body_tempo', pickup: 'Victoria Hospital', drop: 'Assam' }, c);
+    expect(r).toMatchObject({ ok: false, reason: 'place_too_vague', which: 'drop', say: expect.stringMatching(/town or district \(or the PIN code\) and the exact drop/) });
+    expect(quoteTrip).not.toHaveBeenCalled();
+    resolvePlaceFromText.mockResolvedValueOnce(single('Victoria Hospital', 1, 2)).mockResolvedValueOnce(single('Guwahati Medical College', 26.1, 91.7, ['hospital', 'establishment']));
+    expect((await run('get_quote', { service_code: 'body_tempo', pickup: 'Victoria Hospital', drop: 'GMCH Guwahati' }, c)).ok).toBe(true);
+  });
+
+  test('a vehicle change invalidates the old quote and approval', async () => {
+    const c = ctx(AiCall.add({}));
+    await quote(c, { service_code: 'body_mini' });
+    expect((await run('read_back_booking', { when: 'now' }, c)).ok).toBe(true);
+    await quote(c, { service_code: 'body_tempo' });
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('body transport is one way only, as on the booking pages', async () => {
+    const r = await quote(ctx(AiCall.add({})), { service_code: 'body_tempo', round_trip: true });
+    expect(r).toMatchObject({ ok: false, reason: 'one_way_only' });
+  });
+
+  test('ALS: the nurse is included — not "the team will confirm a nurse charge"', async () => {
+    const q = await quote(ctx(AiCall.add({})), { service_code: 'als_tempo', nurse_needed: true });
+    expect(q.say).toMatch(/a nurse is INCLUDED in this service/);
+    expect(q.say).not.toMatch(/no nurse charge in our price list/);
+  });
+
+  test('discount / advance / conditional yes: recorded for staff, nothing booked, no pressure to book', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await quote(c, { service_code: 'body_tempo' });
+    await run('read_back_booking', { when: 'now' }, c);
+    const r = await run('record_question', { topic: 'discount', question: 'book only with 10% discount', conditional_booking: true }, c);
+    expect(r.say).toMatch(/team member will call back about the discount.*nothing is booked, and do not ask to book again/);
+    expect(call.staffQuestions).toEqual([expect.objectContaining({ topic: 'discount', conditionalBooking: true })]);
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    await run('record_question', { topic: 'advance', question: 'how much advance' }, c);
+    expect(call.staffQuestions[1]).toMatchObject({ topic: 'advance', conditionalBooking: false });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('instructions carry the vehicle and freezer rules', () => {
+    const I = prompt.BASE_INSTRUCTIONS;
+    expect(I).toMatch(/Body Shifting — Tempo: the freezer is INCLUDED in its fare/);
+    expect(I).toMatch(/Body Mini — Eeco: NO freezer/);
+    expect(I).toMatch(/ಅದು ಮಾರುತಿ ಸುಜುಕಿ ಈಕೋ ವಾಹನವನ್ನು ಆಂಬುಲೆನ್ಸ್ ಆಗಿ ಬಳಸುವ ಸೇವೆ/);
+    expect(I).toMatch(/a Tempo Traveller is not an ICU ambulance/);
+    expect(I).toMatch(/"Book only if you give a discount" is NOT a yes/);
+    expect(I).toMatch(/do not keep repeating "ಜಿ", "ಮೇಡಂ" or "ಒಂದು ನಿಮಿಷ"/);
+    expect(I).toMatch(/Never read the whole summary again: if create_booking says a part was not heard, repeat only that part/);
+    expect(I).toMatch(/A clear no \("ಬೇಡ", "अभी बुक मत कीजिए"\): do not ask again/);
+    expect(I).toMatch(/\("Assam"\), ask the town or district/);
   });
 });

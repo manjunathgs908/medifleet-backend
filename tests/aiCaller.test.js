@@ -418,7 +418,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
       delegation: { type: 'responses', responses: { model: 'gpt-6-luna', instructions: session.DELEGATE_INSTRUCTIONS, tool_choice: 'auto' } },
     });
-    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'read_back_booking', 'create_booking', 'send_location_request', 'freezer_box_request', 'handoff_to_human', 'end_call']);
+    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'read_back_booking', 'create_booking', 'send_location_request', 'freezer_box_request', 'service_info', 'record_question', 'handoff_to_human', 'end_call']);
     // Each call's instructions carry today's date in IST (server time).
     expect(start.session.instructions).toMatch(/DATE AND TIME — right now it is \w+day \d{1,2} \w+ 20\d\d, \d\d:\d\d India time \(IST\)/);
     // Nothing is sent before session.started — not even audio.
@@ -875,7 +875,9 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     sahanaSays(3000);           // "...pickup Jayanagar ಅಲ್ವಾ? ಮತ್ತೆ ಯಾವ ಆಸ್ಪತ್ರೆ..."
     clock.t += 500;             // half a second in, still playing
     const played = plivoWs.of('playAudio').length;
-    callerAudio(700, true);     // "ಇಲ್ಲ ಇಲ್ಲ, JP Nagar..."
+    callerAudio(700, true);     // "ಇಲ್ಲ ಇಲ್ಲ, JP Nagar..." — pending: could still be a "ಹೂಂ"
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+    callerSays('ಇಲ್ಲ ಇಲ್ಲ, JP Nagar');  // more than an acknowledgement: a real interruption
     expect(plivoWs.of('clearAudio')).toEqual([{ event: 'clearAudio', streamId: 'st-1' }]);
     expect(ai.of('session.thinking.append').map((m) => m.content)).toEqual([session.BARGE_IN_NOTE]);
     await flush();
@@ -993,7 +995,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     callerSays('ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ, ನಮ್ಮ ಅಣ್ಣನ ಹತ್ರ ಕೇಳ್ತೀನಿ');
     ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
     await flush();
-    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'caller_said_no', say: expect.stringMatching(/Do NOT book and do NOT say it is booked/) });
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'caller_said_no', say: expect.stringMatching(/Do NOT book, do NOT ask again.*polite goodbye.*end_call not_needed/) });
     // A later "ok" without a fresh read-back still books nothing.
     callerSays(' ಸರಿ ಓಕೆ');
     ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
@@ -1051,13 +1053,16 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     clock.t += 20;
     sahanaSays(3000);
     clock.t += 800;
-    callerAudio(700, true);                    // talks over it
+    callerAudio(1300, true);                   // talks over it, well before the end
     callerAudio(700, false);
     callerSays('ಹೌದು ಹೌದು ಮಾಡಿ');
     clock.t += 3000;
     ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
     await flush();
-    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_read_back_interrupted' });
+    // Only the part not heard is to be repeated — not the whole read-back.
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_read_back_interrupted', unheard: expect.stringMatching(/Fare: ₹1450/) });
+    expect(outputs().at(-1).unheard).not.toMatch(/^Pickup:/);
+    expect(outputs().at(-1).say).toMatch(/Repeat ONLY this part/);
     expect(createBookedTrip).not.toHaveBeenCalled();
   });
 
@@ -1092,6 +1097,157 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       expect(plivoWs.of('clearAudio')).toHaveLength(1);
       expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.NOT_BOOKED_LINE);
       expect(createBookedTrip).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // ── The "ಬುಕ್ ಮಾಡಲಾ?" loop, acknowledgements, Hindi ──
+  test('LOOP REPLAY: a yes spoken over the closing "ಬುಕ್ ಮಾಡಲಾ?" books exactly once — no second read-back', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(4000);
+    clock.t += 3000;                       // material details heard; the closing question is playing
+    callerAudio(700, true);
+    callerSays('ಹೌದು, ಬುಕ್ ಮಾಡಿ');          // more than "ಹೌದು": a real barge-in, 1 s before the end
+    expect(plivoWs.of('clearAudio')).toHaveLength(1);
+    callerAudio(700, false);
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+    expect(outputs().at(-1)).toMatchObject({ ok: true, trip_number: 'TRP-1' });
+  });
+
+  test('LOOP REPLAY: a quick "ಸರಿ, ಬುಕ್ ಮಾಡ್ತೀನಿ" right after the yes no longer hides the yes', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    await readBack();                      // played to the end
+    callerSays('हाँ, बुक कर लीजिए');
+    clock.t += 300;
+    sahanaSays(800);                       // her filler, within 0.8 s of the read-back ending
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+  });
+
+  test('an interrupted material detail: only that part is repeated, then a yes books once', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(4000);
+    clock.t += 1500;
+    callerAudio(700, true);
+    callerSays('ಯಾವ ಆಸ್ಪತ್ರೆ?');            // cut early: drop / fare not heard
+    callerAudio(700, false);
+    clock.t += 500;
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    const cut = outputs().at(-1);
+    expect(cut).toMatchObject({ ok: false, reason: 'approval_read_back_interrupted' });
+    expect(cut.unheard).toMatch(/Fare: ₹1450/);
+    expect(createBookedTrip).not.toHaveBeenCalled();
+    // She repeats just that part, uninterrupted, and the caller says yes.
+    clock.t += 20;
+    sahanaSays(1200);
+    clock.t += 1300;
+    callerSays('ಸರಿ, ಮಾಡಿ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
+    await flush();
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+  });
+
+  test('approval that still cannot be verified: a person confirms it — never a read-back loop', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    await readBack();
+    callerSays('ಅದು ಎಷ್ಟು ಹೊತ್ತು?');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ reason: 'approval_unclear' });
+    callerSays(' ಹ್ಮ್ ಗೊತ್ತಿಲ್ಲ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_unverified', handoff: 'approval_unverified', say: expect.stringMatching(/team member will confirm the booking/) });
+    expect(call().pendingBooking).toMatchObject({ summary: expect.stringMatching(/Pickup: Jayanagar/), reason: 'approval_unclear' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['ಬೇಡ, ಈಗ ಬೇಡ', 'caller_said_no'],
+    ['अभी बुक मत कीजिए', 'caller_said_no'],
+    ['discount ಕೊಟ್ರೆ ಮಾತ್ರ ಬುಕ್ ಮಾಡಿ', 'caller_conditional'],
+    ['ok, book only if you give a discount', 'caller_conditional'],
+  ])('"%s" creates ZERO bookings (%s)', async (said, reason) => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    await readBack();
+    callerSays(said);
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('"हाँ" / "ಹೂಂ" while she speaks never cuts her off — her audio plays on, nothing lost', async () => {
+    await begin();
+    pastOpening();
+    sahanaSays(3000);
+    clock.t += 500;
+    const before = plivoWs.of('playAudio').length;
+    callerAudio(700, true);                // "हाँ जी" — a barge-in is only pending
+    sahanaSays(400);                       // queued, not dropped
+    callerSays('हाँ जी');
+    callerAudio(400, false);               // quiet again: it was an acknowledgement
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+    expect(plivoWs.of('playAudio')).toHaveLength(before + 1); // the queued audio played
+    expect(call().bargeIns || 0).toBe(0);
+  });
+
+  test('Hindi caller: language locked, the fixed lines and the booking question stay in Hindi', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      callerSays('हिंदी में बात कीजिए');
+      await flush();
+      expect(call().language).toBe('hi');
+      ai.push({ type: 'session.output_transcript.delta', delta: 'किराया पाँच हज़ार रुपये' }); // a price before any quote
+      await flush();
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.LINES.hi.price);
+      await quoteRoute();
+      ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+      await flush();
+      expect(outputs().at(-1).say).toMatch(/"बुक कर दूँ\?"/);
+      ai.push({ type: 'session.output_transcript.delta', delta: ' बुकिंग हो गई' });
+      session._active.get(callId).guarded.clear();
+      ai.push({ type: 'session.output_transcript.delta', delta: ' बुकिंग हो गई है' });
+      await flush();
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.LINES.hi.notBooked);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('WhatsApp off with a Hindi caller: the fallback asks for the address in Hindi', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      callerSays('Hindi mein boliye');
+      ai.push(fnCall('send_location_request', {}, 'w1'));
+      await flush();
+      expect(outputs().at(-1)).toMatchObject({ ok: false, status: 'not_sent' });
+      ai.push({ type: 'session.output_transcript.delta', delta: 'मैं WhatsApp पर link भेज रही हूँ' });
+      await flush();
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.LINES.hi.waFailed);
     } finally {
       warn.mockRestore();
     }

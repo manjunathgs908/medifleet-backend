@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const router = express.Router();
 const whatsappFlow = require('../services/whatsappFlow');
+const locationRequests = require('../services/locationRequests');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
@@ -286,6 +287,10 @@ router.post('/webhook', (req, res) => {
       for (const message of messages) {
         if (!message?.id || isDuplicateMessage(message.id)) continue;
         try {
+          // A pickup pin (or template button tap) answering a call's
+          // "share your location" request is handled there, not by the bot
+          // (services/locationRequests.js). Everything else: the bot, as before.
+          if (await locationRequests.onInbound(message)) continue;
           await whatsappFlow.handleMessage(message);
         } catch (err) {
           console.error('[whatsapp webhook] handleMessage failed:', err.message);

@@ -30,6 +30,7 @@
 const { EventEmitter } = require('events');
 const CallCapture = require('../../models/CallCapture');
 const CallLog = require('../../models/CallLog');
+const LocationRequest = require('../../models/LocationRequest');
 const plivo = require('../plivoService');
 const { resolvePlaceFromText } = require('../whatsappFlow');
 const { quoteTrip } = require('../../controllers/tripController');
@@ -163,12 +164,16 @@ async function createSession({ captureId, plivoWs, deps = {} }) {
 
   // ── Extraction ──
   async function applyPlace(which, text) {
+    // A pin the caller shared on WhatsApp is exact: what is heard later
+    // never replaces it.
+    if (which === 'pickup' && doc.pickupSource === 'whatsapp') return;
     const optionsKey = `${which}Options`;
     try {
       const r = await resolvePlaceFromText(String(text).slice(0, 200));
       const label = (p) => [p.name, p.address].filter(Boolean).join(', ');
       if (r?.status === 'single') {
         doc[which] = { label: label(r.place), lat: r.place.lat, lng: r.place.lng };
+        if (which === 'pickup') doc.pickupSource = 'transcript';
         doc[optionsKey] = [];
       } else {
         doc[which] = undefined;
@@ -264,6 +269,24 @@ async function createSession({ captureId, plivoWs, deps = {} }) {
   }
   s.end = end;
 
+  // The caller shared their location on WhatsApp (services/locationRequests).
+  s.applyShared = async (place) => {
+    doc.pickup = { label: place.label, lat: place.lat, lng: place.lng };
+    doc.pickupOptions = [];
+    doc.pickupSource = 'whatsapp';
+    await applyEstimate();
+    await changed();
+  };
+  // ...possibly before the operator answered.
+  try {
+    const shared = await LocationRequest.findOne({ callLog: doc.callLog, status: 'received' }).sort({ receivedAt: -1 });
+    if (shared?.location?.lat != null && doc.pickupSource !== 'whatsapp') {
+      await s.applyShared({ label: shared.location.address, lat: shared.location.lat, lng: shared.location.lng });
+    }
+  } catch (err) {
+    noteProblem(doc, 'shared_location', err.message);
+  }
+
   plivoWs.on('message', (data) => {
     let m;
     try { m = JSON.parse(String(data)); } catch { return; }
@@ -280,4 +303,24 @@ async function createSession({ captureId, plivoWs, deps = {} }) {
   return s;
 }
 
-module.exports = { startForCall, createSession, subscribe, isLive, publish, EXTRACT_GAP_MS, _live: live };
+// A pickup pin shared on WhatsApp for this call: into its draft — through
+// the live session when one is filling it (so its next save keeps it),
+// else straight onto the stored draft. No draft yet: createSession picks
+// the pin up when the capture starts.
+async function applySharedPickup(callLogId, place) {
+  const doc = await CallCapture.findOne({ callLog: callLogId });
+  if (!doc) return false;
+  const s = live.get(String(doc._id));
+  if (s && !s.ended) {
+    await s.applyShared(place);
+    return true;
+  }
+  doc.pickup = { label: place.label, lat: place.lat, lng: place.lng };
+  doc.pickupOptions = [];
+  doc.pickupSource = 'whatsapp';
+  await doc.save();
+  publish(doc._id, doc);
+  return true;
+}
+
+module.exports = { startForCall, createSession, subscribe, isLive, publish, applySharedPickup, EXTRACT_GAP_MS, _live: live };

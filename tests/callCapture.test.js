@@ -89,6 +89,7 @@ jest.mock('../models/CallCapture', () => mockMemoryModel({
     transcript: [], problems: [], pickupOptions: [], dropOptions: [], extractions: 0, summary: '',
   }),
 }));
+jest.mock('../models/LocationRequest', () => mockMemoryModel());
 jest.mock('../services/openaiService', () => ({ extractJson: jest.fn(), askAstra: jest.fn() }));
 jest.mock('../services/aiCaller/tools', () => ({
   bookableServices: () => [{ code: 'bls', label: 'Basic Life Support' }, { code: 'als', label: 'Advanced Life Support' }],
@@ -423,6 +424,44 @@ describe('D. a whole call: live fill, then a DRAFT — never a booking', () => {
     call.plivoWs.emit('close');
     await until(() => call.doc().status === 'ended');
     call.unsubscribe();
+  });
+});
+
+describe('D2. a pickup pin shared on WhatsApp', () => {
+  const FIRST = { patient_name: '', patient_phone: '', pickup: 'Jayanagar', drop: '', service_code: '', when: '', scheduled_time: '', summary: '' };
+  const PIN = { label: '12 Main Rd, JP Nagar', lat: 12.9, lng: 77.6 };
+
+  test('fills the live draft at once, and a place heard later never replaces it', async () => {
+    resolvePlaceFromText.mockResolvedValue({ status: 'single', place: { name: 'Jayanagar', address: 'Bengaluru', lat: 1, lng: 2 } });
+    const call = await runCall({ customer: ['From Jayanagar'], extractions: [FIRST, FIRST] });
+    expect(await session.applySharedPickup(call.log._id, PIN)).toBe(true);
+    expect(call.doc()).toMatchObject({ pickup: PIN, pickupSource: 'whatsapp' });
+    expect(call.updates.some((u) => u.status === 'live')).toBe(true);
+    speak((p) => call.media('inbound', p));
+    await until(() => call.doc().extractions === 1);
+    expect(call.doc().fields.pickupText).toBe('Jayanagar'); // what was heard is still shown
+    expect(call.doc().pickup).toEqual(PIN);                   // the pin stays the pickup
+    expect(resolvePlaceFromText).not.toHaveBeenCalled();
+    call.plivoWs.emit('close');
+    await until(() => call.doc().status === 'ended');
+    call.unsubscribe();
+  });
+
+  test('a pin shared before the operator answered is applied when capture starts', async () => {
+    const LocationRequest = require('../models/LocationRequest');
+    const log = customerCall();
+    LocationRequest.add({ callLog: log._id, status: 'received', receivedAt: new Date(), location: { lat: 12.9, lng: 77.6, address: '12 Main Rd, JP Nagar' } });
+    const id = await session.startForCall(log._id);
+    const plivoWs = new EventEmitter();
+    plivoWs.close = jest.fn();
+    await session.createSession({ captureId: id, plivoWs, deps: { connectOpenAI: () => fakeOpenAI() } });
+    expect(CallCapture.store.find((d) => d._id === id)).toMatchObject({ pickup: PIN, pickupSource: 'whatsapp' });
+    plivoWs.emit('close');
+    await until(() => CallCapture.store.find((d) => d._id === id).status === 'ended');
+  });
+
+  test('no draft yet: nothing to fill (picked up when capture starts)', async () => {
+    expect(await session.applySharedPickup('64d0000000000000000000aa', PIN)).toBe(false);
   });
 });
 

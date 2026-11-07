@@ -40,6 +40,30 @@ const AiCallSchema = new mongoose.Schema(
     plivoCallUuid   : { type: String, index: true },
     recordingUrl    : { type: String, select: false },
 
+    // What the caller told the assistant about the patient (create_booking),
+    // shown to the team with the booking — the Trip has no place for it.
+    needs: {
+      condition: { type: String, maxlength: 300 },
+      oxygen   : { type: Boolean },
+      helper   : { type: Boolean },
+      patientAt: { type: String, enum: ['home', 'hospital', 'other'] },
+    },
+    // A request the team prices and calls back about (not bookable here).
+    request: {
+      type: { type: String, enum: ['freezer_box'] },
+      area: { type: String, maxlength: 200 },
+      days: { type: Number },
+      at  : { type: Date },
+    },
+    // The pickup the caller shared on WhatsApp during the call
+    // (services/locationRequests.js); get_quote can use it.
+    sharedLocation: {
+      lat    : Number,
+      lng    : Number,
+      address: String,
+      at     : Date,
+    },
+
     language  : { type: String },
     transcript: [{
       _id : false,

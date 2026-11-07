@@ -100,6 +100,7 @@ jest.mock('../models/CallbackTask',        () => mockMemoryModel());
 jest.mock('../models/CallLog',             () => mockMemoryModel());
 jest.mock('../models/WhatsAppLead',        () => mockMemoryModel());
 jest.mock('../models/WhatsAppFunnelEvent', () => mockMemoryModel());
+jest.mock('../models/CallStyleExample',    () => mockMemoryModel());
 jest.mock('../services/openaiService', () => ({ askAstra: jest.fn(async () => 'Hello from SaveLife AI') }));
 jest.mock('../controllers/callController', () => ({ loadOnDuty: jest.fn(async () => []), fallbackPhones: jest.fn(() => []) }));
 jest.mock('../controllers/tripController', () => ({ quoteTrip: jest.fn(), createBookedTrip: jest.fn() }));
@@ -408,11 +409,13 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(Object.keys(start.session).sort()).toEqual(['audio', 'delegation', 'instructions', 'model']); // strict config: nothing else
     expect(start.session).toMatchObject({
       model: 'gpt-live-1',
-      instructions: session.INSTRUCTIONS,
+      instructions: expect.stringContaining(session.INSTRUCTIONS),
       audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
       delegation: { type: 'responses', responses: { model: 'gpt-6-luna', instructions: session.DELEGATE_INSTRUCTIONS, tool_choice: 'auto' } },
     });
-    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'create_booking', 'handoff_to_human', 'end_call']);
+    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'create_booking', 'send_location_request', 'freezer_box_request', 'handoff_to_human', 'end_call']);
+    // Each call's instructions carry today's date in IST (server time).
+    expect(start.session.instructions).toMatch(/DATE AND TIME — right now it is \w+day \d{1,2} \w+ 20\d\d, \d\d:\d\d India time \(IST\)/);
     // Nothing is sent before session.started — not even audio.
     plivoWs.push({ event: 'media', media: { payload: 'AAAA' } });
     expect(ai.of('session.input_audio.append')).toHaveLength(0);
@@ -432,10 +435,13 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     }
   });
 
-  test('on session.started the FIRST thing said is the disclosure, Kannada then English; no-medical-advice rule set', async () => {
+  test('on session.started the FIRST thing said is the opening: disclosure Kannada then English, then "ambulance ಬೇಕಾ?"; no-medical-advice rule set', async () => {
     await begin();
     const [disclosure] = ai.of('session.commentary.append');
-    expect(disclosure).toMatchObject({ delegation_id: null, content: `${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN}` });
+    expect(disclosure).toMatchObject({ delegation_id: null, content: session.OPENING });
+    expect(session.OPENING.startsWith(`${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN}`)).toBe(true);
+    expect(session.OPENING).toMatch(/ಬೇಕಾ\?$/);
+    expect(session.DISCLOSURE_KN).toMatch(/^ಹಲೋ ಸರ್/);
     expect(session.DISCLOSURE_EN).toMatch(/automated assistant.*recorded/);
     expect(session.INSTRUCTIONS).toMatch(/FIRST WORDS/);
     expect(session.INSTRUCTIONS).toMatch(/NEVER give medical advice/);

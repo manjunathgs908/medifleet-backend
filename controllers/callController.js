@@ -689,6 +689,10 @@ exports.incoming = async (req, res, next) => {
       callbackEligible: isMobile(from) && !callerWasRingPhone ? true : undefined,
     });
     plivo.logCall(`inbound app=${sipUsers.length} phones=${agentPhones.length} stage=${sipUsers.length ? 'app' : 'phone'}`, log);
+    // A customer's call: ask for their pickup location on WhatsApp
+    // (services/locationRequests — off unless WA_CALL_LOCATION_ENABLED).
+    // Never awaited, so nothing about it can delay or change this call.
+    if (log.callbackEligible) requestPickupLocation(from, log._id);
     serverTrail('server:incoming_routed', {
       logId   : String(log._id),
       decision: routing.decision,
@@ -1344,6 +1348,15 @@ exports.dropAnsweredPhoneLeg = dropAnsweredPhoneLeg;
 //          Nothing here changes what the caller hears.
 // @access  Plivo (signature)
 // ============================================================
+function requestPickupLocation(phone, logId) {
+  try {
+    require('../services/locationRequests').request({ phone, source: 'incoming_call', callLog: logId })
+      .catch((err) => console.error('[locationRequests] request failed:', err.message));
+  } catch (err) {
+    console.error('[locationRequests] request failed:', err.message);
+  }
+}
+
 // LIVE CALL CAPTURE (services/callCapture): fire-and-forget once an
 // operator has the call. It checks for itself that capture is switched on
 // and that this is a customer's call; any failure stays inside it.

@@ -9,8 +9,10 @@ const { revealPhones } = require('./phoneViewer');
 
 const NUMBER = /(?<!\d)(?:\+?91[\s-]?|0)?(?:\d[\s-]?){9}\d(?!\d)/g;
 
-function maskNumbersInText(text) {
-  if (!text || revealPhones()) return text;
+// always: mask whoever is asking — for text that leaves this backend
+// (e.g. style examples in the AI telecaller's instructions).
+function maskNumbersInText(text, { always = false } = {}) {
+  if (!text || (!always && revealPhones())) return text;
   return String(text).replace(NUMBER, (m) => `••••••${m.replace(/\D/g, '').slice(-4)}`);
 }
 

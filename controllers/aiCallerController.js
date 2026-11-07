@@ -21,6 +21,7 @@ const plivo = require('../services/plivoService');
 const config = require('../services/aiCaller/config');
 const calls = require('../services/aiCaller/calls');
 const streamServer = require('../services/aiCaller/streamServer');
+const locationRequests = require('../services/locationRequests');
 const { maskPhone } = require('../utils/customerPhone');
 const { normalisePhone } = require('../utils/phone');
 
@@ -45,6 +46,11 @@ exports.status = async (req, res, next) => {
       limits      : { maxCallSeconds: config.maxCallSeconds() },
       models      : { realtime: config.realtimeModel(), delegate: config.delegateModel(), voice: config.realtimeVoice() },
       costRatesSet: !!config.costRates(),
+      // WhatsApp "share your pickup location" (services/locationRequests).
+      whatsappLocation: {
+        enabled : locationRequests.enabled(),
+        template: process.env.WA_LOCATION_TEMPLATE || null,
+      },
     });
   } catch (err) { next(err); }
 };

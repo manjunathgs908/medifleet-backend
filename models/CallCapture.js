@@ -53,6 +53,9 @@ const CallCaptureSchema = new mongoose.Schema({
   // pickupText / dropText resolved through the same Places search as the
   // WhatsApp bot; several matches -> options for the operator, never a guess.
   pickup       : placeSchema,
+  // 'whatsapp': the caller shared a location pin (services/locationRequests)
+  // — exact, so a place later heard in the transcript never replaces it.
+  pickupSource : { type: String, enum: ['transcript', 'whatsapp'] },
   drop         : placeSchema,
   pickupOptions: [placeSchema],
   dropOptions  : [placeSchema],

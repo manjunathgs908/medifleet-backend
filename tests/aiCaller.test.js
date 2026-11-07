@@ -439,9 +439,11 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     await begin();
     const [disclosure] = ai.of('session.commentary.append');
     expect(disclosure).toMatchObject({ delegation_id: null, content: session.OPENING });
-    expect(session.OPENING.startsWith(`${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN}`)).toBe(true);
-    expect(session.OPENING).toMatch(/ಬೇಕಾ\?$/);
-    expect(session.DISCLOSURE_KN).toMatch(/^ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife ನ automated assistant\. ಈ ಕರೆ ದಾಖಲಾಗ್ತಿದೆ\.$/);
+    // One short line, then the question at once.
+    expect(session.OPENING).toBe(`${session.DISCLOSURE_KN} Ambulance ಬೇಕಾ?`);
+    expect(session.DISCLOSURE_KN).toBe('ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife automated assistant, ಕರೆ ದಾಖಲಾಗ್ತಿದೆ.');
+    expect(session.OPENING.length).toBeLessThan(90);
+    expect(session.INSTRUCTIONS).toMatch(/If the caller answers in another language, say once, in a few words in their language, that you are SaveLife's automated assistant and the call is recorded/);
     expect(session.DISCLOSURE_EN).toMatch(/^I'm Sahana/);
     expect(session.INSTRUCTIONS).toMatch(/You are Sahana \(ಸಹನ\)/);
     expect(session.INSTRUCTIONS).toMatch(/never claim to be a person/);
@@ -789,6 +791,45 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       jest.useRealTimers();
       spies.forEach((s) => s.mockRestore());
     }
+  });
+
+  // ── Never a guessed price ──
+  test('a price said before get_quote is cut off mid-sentence and replaced by "ನಿಖರ ದರ ಹೇಳ್ತೀನಿ"', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಬಾಪ್ಟಿಸ್ಟ್ ನಿಂದ ಜಯದೇವಕ್ಕೆ ಐದು ಸಾವಿರ ' });
+      expect(plivoWs.of('clearAudio')).toHaveLength(0); // no rupee word yet
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ರೂಪಾಯಿ. ಈಗಲೇ' });
+      await flush();
+      expect(plivoWs.of('clearAudio')).toEqual([{ event: 'clearAudio', streamId: 'st-1' }]);
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.PRICE_HOLD_LINE);
+      // Once per spoken turn, not once per fragment.
+      ai.push({ type: 'session.output_transcript.delta', delta: ' ₹5000' });
+      expect(plivoWs.of('clearAudio')).toHaveLength(1);
+      expect(call().priceGuardStops).toBe(1);
+      expect(call().transcript.map((t) => t.text)).toEqual(expect.arrayContaining([expect.stringMatching(/Stopped a price said before get_quote/)]));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('after a real quote, prices are said freely; plain numbers never trigger the guard', async () => {
+    await begin();
+    ai.push({ type: 'session.output_transcript.delta', delta: 'ಸಂಜೆ 5 ಗಂಟೆಗೆ, 10 km, TRP 1794046' });
+    await flush();
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+    session._active.get(callId).state.quote = { from: 'get_quote' };
+    ai.push({ type: 'session.output_transcript.delta', delta: ' ಅಂದಾಜು ದರ ₹5,440 ರೂಪಾಯಿ' });
+    await flush();
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+  });
+
+  test('the instructions forbid any number about money before get_quote', () => {
+    expect(session.INSTRUCTIONS).toMatch(/PRICES — NEVER GUESS: never say any fare, amount or number of rupees until get_quote has returned the real amount/);
+    expect(session.INSTRUCTIONS).toMatch(/"ಒಂದು ನಿಮಿಷ, ನಿಖರ ದರ ಹೇಳ್ತೀನಿ"/);
+    expect(session.DELEGATE_INSTRUCTIONS).toMatch(/NEVER state any price, fare or rupee amount that did not come from get_quote/);
+    expect(session.INSTRUCTIONS).toMatch(/KEEP TRACK — before every question, check what the caller has already told you/);
   });
 
   test('time limit after a booking: a goodbye and hang up — not a handoff', async () => {

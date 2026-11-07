@@ -217,7 +217,7 @@ describe('B. conversation rules', () => {
     expect(I).toMatch(/Prioritise Kannada, English, Hindi, Telugu, Tamil and Malayalam/);
     expect(I).toMatch(/ANY other language, understand it and reply in that same language — never turn a caller away over language/);
     expect(I).toMatch(/NEVER give medical advice/);
-    expect(session.OPENING).toBe(`${session.DISCLOSURE_KN} ${session.DISCLOSURE_EN} Ambulance ಬೇಕಾ?`);
+    expect(session.OPENING).toBe(`${session.DISCLOSURE_KN} Ambulance ಬೇಕಾ?`);
   });
   test.each([
     'please come urgent', 'emergency, very urgent', 'ಅರ್ಜೆಂಟ್ ಬೇಕು', 'ತುಂಬಾ urgent ಸರ್', 'जल्दी भेजो urgent hai', 'emergency ambulance',

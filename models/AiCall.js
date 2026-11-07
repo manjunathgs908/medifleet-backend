@@ -102,6 +102,8 @@ const AiCallSchema = new mongoose.Schema(
     endRequested: { type: Boolean, default: false },
     // GPT-Live dropped mid-call and was reconnected this many times (session.js).
     aiReconnects: { type: Number, default: 0 },
+    // Times the assistant began saying a price before get_quote and was cut off (session.js).
+    priceGuardStops: { type: Number, default: 0 },
 
     error: { type: String, maxlength: 500 },
     // Why the OpenAI side ended, as OpenAI said it — handshake HTTP status,

@@ -65,13 +65,26 @@ const MAX_TRANSCRIPT = 200;
 // question — quick and natural. (Kannada wording to be checked by a native
 // speaker before widening the pilot.)
 // She is Sahana (ಸಹನ).
-const DISCLOSURE_KN = 'ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife ನ automated assistant. ಈ ಕರೆ ದಾಖಲಾಗ್ತಿದೆ.';
-const DISCLOSURE_EN = "I'm Sahana, SaveLife's automated assistant. This call is recorded.";
+// ONE short line (callers are often panicked), then the question at once.
+// A caller who answers in another language hears the disclosure once in
+// theirs (instructions) — DISCLOSURE_EN is that line in English.
+const DISCLOSURE_KN = 'ನಮಸ್ಕಾರ, ನಾನು ಸಹನ, SaveLife automated assistant, ಕರೆ ದಾಖಲಾಗ್ತಿದೆ.';
+const DISCLOSURE_EN = "I'm Sahana, SaveLife's automated assistant; this call is recorded.";
 const OPENING_QUESTION = 'Ambulance ಬೇಕಾ?';
-const OPENING = `${DISCLOSURE_KN} ${DISCLOSURE_EN} ${OPENING_QUESTION}`;
+const OPENING = `${DISCLOSURE_KN} ${OPENING_QUESTION}`;
 // After GPT-Live reconnected mid-call, and when the time limit ends a call
 // that is already booked.
 const RESUME_LINE = 'ಕ್ಷಮಿಸಿ, ಲೈನ್ ಸ್ವಲ್ಪ ಕಟ್ ಆಯ್ತು.';
+
+// NEVER A GUESSED PRICE. A rupee amount may only be said after get_quote
+// returned a real one in this call (s.state.quote). If the assistant starts
+// saying one before that, its audio is cut at once (Plivo clearAudio) and
+// it says PRICE_HOLD_LINE instead — a test call once said "₹5000" with no
+// quote and had to retract it. Rupee words in the call languages; plain
+// numbers (times, km, trip numbers) are not prices and are left alone.
+const PRICE_WORDS = /₹|\brs\.?\s*\d|rupee|rupay|ರೂಪಾಯ|ರೂ\.|रुपय|रुपए|रुपये|రూపాయ|ரூபாய்|രൂപ/i;
+const PRICE_HOLD_LINE = 'ಒಂದು ನಿಮಿಷ, ನಿಖರ ದರ ಹೇಳ್ತೀನಿ.';
+const saysPrice = (text) => PRICE_WORDS.test(String(text || ''));
 const TIME_UP_BOOKED_LINE = 'ನಿಮ್ಮ ಬುಕ್ಕಿಂಗ್ ಆಗಿದೆ, ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡುತ್ತಾರೆ. ಧನ್ಯವಾದಗಳು!';
 
 // The base rules (prompt.BASE_INSTRUCTIONS); each call's instructions add
@@ -81,6 +94,7 @@ const INSTRUCTIONS = prompt.BASE_INSTRUCTIONS;
 
 // For the delegated Responses model, which runs the tools.
 const DELEGATE_INSTRUCTIONS = `
+NEVER state any price, fare or rupee amount that did not come from get_quote in this call — no estimate, no "around", no range.
 You run the tools for SaveLife's phone assistant. Use only these tools; never answer medical questions — use handoff_to_human for those, for a real medical emergency, or when the caller asks for a person. Never hand off just because the caller says "urgent".
 get_quote is the only source of prices. create_booking only after the caller clearly confirmed the read-back details (customer_confirmed true). A freezer box kept at home is never priced: freezer_box_request, then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
@@ -138,7 +152,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   const s = {
     callId, phone: call.phone, plivoWs, openai: null,
     streamId: null, socketOpen: false, ready: false, ended: false, ending: false,
-    state: {}, timers: [], languageSet: false,
+    state: {}, timers: [], languageSet: false, priceStopped: false,
     recent: [], everReady: false, reconnects: 0,
     turns: { caller: '', assistant: '' }, turnTimer: { caller: null, assistant: null },
   };
@@ -174,6 +188,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     s.turnTimer[who] = null;
     const text = s.turns[who];
     s.turns[who] = '';
+    if (who === 'assistant') s.priceStopped = false; // the guard is per spoken turn
     note(who, text);
   };
   const addFragment = (who, delta) => {
@@ -367,9 +382,19 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
         case 'session.output_audio.delta':
           if (ev.delta) sendPlivo({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: ev.delta } });
           break;
-        case 'session.output_transcript.delta':
-          addFragment('assistant', ev.delta);
+        case 'session.output_transcript.delta': {
+          const said = addFragment('assistant', ev.delta);
+          // A price before any real quote: stop it mid-sentence.
+          if (!s.state.quote && !s.priceStopped && saysPrice(said)) {
+            s.priceStopped = true;
+            sendPlivo({ event: 'clearAudio', streamId: s.streamId });
+            note('system', `Stopped a price said before get_quote: "${said.trim().slice(0, 200)}"`);
+            console.warn(`[aiCaller] price said before get_quote on ${callId} — audio cleared`);
+            AiCall.updateOne({ _id: callId }, { $inc: { priceGuardStops: 1 } }).catch(() => {});
+            sendAI({ type: 'session.commentary.append', event_id: `event_price_hold_${Date.now()}`, delegation_id: null, content: PRICE_HOLD_LINE });
+          }
           break;
+        }
         case 'session.input_transcript.delta': {
           const turn = addFragment('caller', ev.delta);
           if (!s.languageSet && turn.trim()) {
@@ -478,5 +503,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
 module.exports = {
   createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
+  PRICE_HOLD_LINE, saysPrice,
   MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

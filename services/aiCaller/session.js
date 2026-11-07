@@ -107,6 +107,9 @@ const BOOK_STUCK_MS = 25000;  // asked to book, no booking step at all: a person
 // Signs a booking is stuck: she stalls, or the caller asks again / asks if it is done.
 const STALL_WORDS = /ಮುಂದುವರಿಸ್ತ|ಮುಂದುವರಿಸುತ್ತ|ಪ್ರಕ್ರಿಯೆ|ಲೈನ್‌?ನಲ್ಲಿ ಇರಿ|ಸ್ವಲ್ಪ ಸಮಯ ಕೊಡಿ|ಮುಗಿಸುತ್ತಿದ್ದೀನಿ|ದೃಢಪಡಿಸ್ತಿದ್ದ|processing|please wait|hold on|stay on the line|प्रोसेस|रुकिए|लाइन पर रहिए/i;
 const ASKED_AGAIN = /ಆಯ್ತಾ|ಆಗಿಲ್ಲ|ಎಷ್ಟೊತ್ತ|ಜಾಸ್ತಿ ಟೈಮ್|ಮಾಡಿ ಮೇಡಮ್|ಬೇಗ|is it done|how long|हो गया क्या|कितना टाइम/i;
+// The caller is fed up with questions: acknowledge, accept what they gave,
+// go to the quote / booking (state.relaxed — tools stop asking for detail).
+const FRUSTRATED = /asking too much|too many questions|wast(e|ing) (of )?(my )?time|already told you|i told you|ಎಷ್ಟು ಪ್ರಶ್ನೆ|ತುಂಬಾ ಕೇಳ್ತ|ಎಷ್ಟು ಕೇಳ್ತ|ಟೈಮ್ ವೇಸ್ಟ್|ಟೈಂ ವೇಸ್ಟ್|ಸಮಯ ವ್ಯರ್ಥ|ಆಗ್ಲೇ ಹೇಳಿದ್ನಲ್ಲ|ಆಗಲೇ ಹೇಳಿದ್ದೀನಿ|ಎಷ್ಟು ಸಲ ಹೇಳ್ಬೇಕು|ಎಷ್ಟು ಸಾರಿ ಹೇಳ್ಬೇಕು|ಹೇಳಿದ್ನಲ್ಲ|कितने सवाल|बहुत सवाल|टाइम खराब|टाइम वेस्ट|समय बर्बाद|पहले ही बताया|बता दिया ना|బుర్ర తింటున్నారు|ఎన్ని ప్రశ్నలు|టైమ్ వేస్ట్|ఆగ్లే హేళిద్నల్ల/i;
 const BOOK_REQUEST = /ಬುಕ್ ಮಾಡಿ|ಬುಕ್ ಮಾಡ್ಕೊಡಿ|ಬುಕ್ ಮಾಡ್ಕ|ಬುಕ್ಕಿಂಗ್ ಮಾಡಿ|ಬುಕ್ ಮಾಡ್ಬಿಡಿ|\bbook (it|now|pannunga|cheyandi)\b|please book|बुक कर|बुकिंग कर|బుక్ చేయ|புக் பண்ண|ബുക്ക് ചെയ്യ/i;
 const MAX_CALLER_FRAGMENTS = 400;
 
@@ -149,7 +152,7 @@ const WA_PROMISE = near(WA_WORD, WA_WILL);
 // "Booked" only after create_booking returned ok.
 const BOOKED_CLAIM = /ಬುಕ್ಕಿಂಗ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಮಾಡಿದ್ದ(?:ೀನಿ|ೇನೆ)|ಬುಕ್ಕಿಂಗ್ ಕನ್ಫರ್ಮ್ ಆ|booking (?:is )?(?:done|confirmed|complete)|(?:is|been|have) booked|booked (?:it|your|the)|बुकिंग हो गई|बुक हो गया|बुक हो गई|बुक कर दिया|బుక్ అయ్యింది|బుక్ చేశాను|బుకింగ్ అయింది|புக் ஆயிடுச்சு|புக் பண்ணிட்டேன்|ബുക്ക് ചെയ്തു|ബുക്കിംഗ് ആയി/i;
 const HOLD_LINE = 'ಕ್ಷಮಿಸಿ, ಲಿಂಕ್ ಇನ್ನೂ ಕಳಿಸಿಲ್ಲ.';
-const WHATSAPP_FAILED_LINE = 'ಕ್ಷಮಿಸಿ, WhatsApp ಕಳಿಸೋಕೆ ಆಗ್ಲಿಲ್ಲ. ನಿಮ್ಮ address ಅಥವಾ ಹತ್ತಿರದ landmark ಹೇಳಿ.';
+const WHATSAPP_FAILED_LINE = 'ಕ್ಷಮಿಸಿ, WhatsApp ಕಳಿಸೋಕೆ ಆಗ್ಲಿಲ್ಲ. ನಿಮ್ಮ ಏರಿಯಾ ಮತ್ತು ಹತ್ತಿರದ ಒಂದು landmark ಹೇಳಿ.';
 const NOT_BOOKED_LINE = 'ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಖಚಿತ ಆಗಿಲ್ಲ.';
 // The fixed lines, in the language the caller asked for (Kannada default;
 // Telugu / Tamil / Malayalam get the English text, which the voice model
@@ -164,7 +167,7 @@ const LINES = {
   hi: {
     price: 'एक मिनट, सही किराया बताती हूँ।',
     hold: 'माफ़ कीजिए, लिंक अभी भेजा नहीं गया है।',
-    waFailed: 'माफ़ कीजिए, WhatsApp नहीं जा पाया। अपना पता या पास का कोई landmark बता दीजिए।',
+    waFailed: 'माफ़ कीजिए, WhatsApp नहीं जा पाया। अपना एरिया और पास का कोई एक landmark बता दीजिए।',
     notBooked: 'बुकिंग अभी पक्की नहीं हुई है।',
     resume: 'माफ़ कीजिए, लाइन थोड़ी कट गई थी।',
     timeUp: 'आपकी बुकिंग हो गई है, हमारी टीम थोड़ी देर में कॉल करेगी। धन्यवाद!',
@@ -175,7 +178,7 @@ const LINES = {
   en: {
     price: "One moment, I'll tell you the exact fare.",
     hold: 'Sorry, the link has not been sent yet.',
-    waFailed: 'Sorry, the WhatsApp could not be sent. Please tell me your address or a nearby landmark.',
+    waFailed: 'Sorry, the WhatsApp could not be sent. Please tell me your area and one nearby landmark.',
     notBooked: 'The booking is not confirmed yet.',
     resume: 'Sorry, the line dropped for a moment.',
     timeUp: 'Your booking is done; our team will call you shortly. Thank you!',
@@ -200,7 +203,7 @@ const GUARDS = [
     active: (st) => st.whatsapp !== 'sent' && st.whatsapp !== 'received',
     test: (t, st) => WA_SENT_CLAIM.test(t) || (waFailed(st) && WA_PROMISE.test(t)),
     line: (st, L) => (waFailed(st) ? L.waFailed : L.hold),
-    hint: 'No WhatsApp has been sent: send_location_request has not succeeded. Never say a link was sent. Ask for the address and a landmark on the call.',
+    hint: 'No WhatsApp has been sent: send_location_request has not succeeded. Never say a link was sent. Ask for the area and one landmark on the call.',
   },
   {
     id: 'booked', what: 'a booking claimed before create_booking succeeded', counter: 'claimGuardStops',
@@ -239,6 +242,7 @@ You run the tools for SaveLife's phone assistant. Use only these tools; never an
 get_quote is the only source of prices; any change to the route (pickup, hospital or branch, service, round trip, wait) needs a new get_quote. To book: read_back_booking, the assistant reads it back and asks; create_booking ONLY after the caller's clear yes to that read-back (the server checks the caller's words) — never after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", never twice. Never say it is booked unless create_booking returned ok. Never say a WhatsApp link was sent unless send_location_request returned status sent. A freezer box kept at home is never priced: freezer_box_request (address, start time, how long), then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
 Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
+LOCATION: a long trip needs only the area or the city at each end — never block on a house number; a local home pickup needs the area plus one landmark at most; caller_will_guide when they say they or the driver will guide. Never re-ask; a frustrated caller gets the quote / booking, not more questions.
 BOOKING — never stall: when the caller says to book, call read_back_booking at once (if not done), and after their yes call create_booking at once. Never answer with text like "please wait / processing" instead of calling the tool. patient_name is optional: never hold a booking for it, never ask it again after the read-back.
 BODY TRANSPORT (body_mini / body_tempo) and freezer box: never ask about a nurse, oxygen, a helper or the medical condition — those are only for living patients.
 Ventilator / ICU / cardiac requests: the package comes from on_device / equipment_requested in get_quote, never from the words. Helper: BLS home pickups only (ask floor and lift first); never for ALS / ACLS / NICU. A BLS caller wanting a monitor or suction: recommend ALS, requote only after they agree. AC: ac_needed.
@@ -629,6 +633,22 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     return v;
   };
 
+  // ── A caller fed up with questions: stop probing ──────────
+  // Once per minute at most: acknowledge briefly, accept what was given and
+  // go to the quote / booking. state.relaxed also stops the tools asking
+  // for location detail (read_back_booking).
+  let frustrationAt = 0;
+  function noticeFrustration(turn) {
+    if (!FRUSTRATED.test(turn) || now() - frustrationAt < 60000 || s.ended || s.ending) return;
+    frustrationAt = now();
+    s.state.relaxed = true;
+    note('system', 'Caller sounds frustrated — stop probing, go to the quote / booking');
+    sendAI({
+      type: 'session.instructions.append', event_id: `event_frustrated_${Date.now()}`, delegation_id: null,
+      content: 'The caller is frustrated with the questions. Acknowledge it in a few words ("ಕ್ಷಮಿಸಿ, ಸರಿ"), accept what they have already given, and go straight to the quote or the booking. Ask nothing more unless the fare truly depends on it.',
+    });
+  }
+
   // ── Booking watchdog: an approved booking always completes ─
   // A real call: the caller said "ಬುಕ್ ಮಾಡಿ" three times, the model never
   // called create_booking, said "ಬುಕ್ಕಿಂಗ್ ಮುಂದುವರಿಸ್ತಿದ್ದೀನಿ" for five
@@ -865,6 +885,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
             if (!audible() && !s.pendingBarge) s.stretchBreak = true;
             onCallerWordsDuringBarge(ev.delta);
             watchBooking(turn);
+            noticeFrustration(turn);
             if (s.callerFrags.length > MAX_CALLER_FRAGMENTS) s.callerFrags.shift();
           }
           // Which letters the transcript used — kept for diagnosis only; the
@@ -1021,6 +1042,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
 module.exports = {
   createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
-  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, LINES, isOnlyAck, TAIL_GRACE_MS, BOOK_REQUEST, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
+  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, LINES, isOnlyAck, TAIL_GRACE_MS, BOOK_REQUEST, FRUSTRATED, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
   MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

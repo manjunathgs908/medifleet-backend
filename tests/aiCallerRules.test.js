@@ -214,7 +214,7 @@ describe('B. conversation rules', () => {
   test('nearest hospital accepted; freezer box one simple question; patient needs; Telugu; opening', () => {
     expect(I).toMatch(/nearest hospital \("ಹತ್ತಿರದ ಆಸ್ಪತ್ರೆ"\), say OK and do NOT insist on a name/);
     expect(I).toMatch(/FREEZER BOX: when the caller says freezer box, ice box or ಶವ ಪೆಟ್ಟಿಗೆ, FIRST ask this one question: "ಫ್ರೀಜರ್ ಬಾಕ್ಸ್ ಮನೆಯಲ್ಲಿ ಇಡಲು ಬೇಕಾ, ಅಥವಾ ಪಾರ್ಥಿವ ಶರೀರವನ್ನು ವಾಹನದಲ್ಲಿ ಸಾಗಿಸಲು ಬೇಕಾ\?"/);
-    expect(I).toMatch(/Box at home: ask the delivery ADDRESS \(with a landmark\), from WHEN it is needed \(start time\), and for HOW LONG/);
+    expect(I).toMatch(/Box at home: ask the delivery area and a landmark \(the exact spot can come by WhatsApp pin or from the driver\), from WHEN it is needed \(start time\), and for HOW LONG/);
     expect(I).toMatch(/Body transport by vehicle: ask the pickup, the destination and the date and time\. The freezer depends on the package: Body Shifting — Tempo includes it; Body Mini — Eeco does not/);
     expect(I).toMatch(/oxygen/);
     expect(I).toMatch(/helper/);
@@ -766,12 +766,13 @@ describe('F. read-back, approval, schedule, freezer flows, language', () => {
     expect(r).toMatchObject({ ok: false, reason: 'pickup_not_before_appointment' });
   });
 
-  test('home pickup without an exact address, landmark or pin: asked for before the read-back', async () => {
+  test('local home pickup with no landmark: ONE landmark asked once — never a house number, never a second block', async () => {
     const c = ctx(AiCall.add({}));
     await quote(c, { patient_at: 'home' });
-    expect(await run('read_back_booking', { when: 'now' }, c)).toMatchObject({ ok: false, reason: 'need_pickup_details', say: expect.stringMatching(/exact address.*landmark/) });
-    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'not_read_back' });
-    expect(createBookedTrip).not.toHaveBeenCalled();
+    const first = await run('read_back_booking', { when: 'now' }, c);
+    expect(first).toMatchObject({ ok: false, reason: 'need_landmark' });
+    expect(first.say).toMatch(/ask ONE nearby landmark.*Never ask a house number/);
+    expect((await run('read_back_booking', { when: 'now' }, c)).ok).toBe(true); // asked once; it never blocks twice
   });
 
   test('a pickup change: the new get_quote voids the old quote and read-back; a failed re-quote leaves nothing to book', async () => {
@@ -836,7 +837,7 @@ describe('F. read-back, approval, schedule, freezer flows, language', () => {
     const c = ctx(AiCall.add({}));
     const r = await run('send_location_request', {}, c);
     expect(r).toMatchObject({ ok: false, status: 'not_sent', reason: 'whatsapp_off' });
-    expect(r.say).toMatch(/Do not say a link was sent.*Ask on the call for the address/);
+    expect(r.say).toMatch(/Do not say a link was sent.*Ask on the call for the area and one nearby landmark/);
     expect(c.state.whatsapp).toBe('off');
   });
 
@@ -971,7 +972,7 @@ describe('G. vehicles, freezer packages, Eeco over 800 km, places, staff questio
     resolvePlaceFromText.mockResolvedValueOnce(single('Victoria Hospital', 1, 2, ['hospital', 'establishment']))
       .mockResolvedValueOnce(single('Assam', 26.2, 92.9, ['administrative_area_level_1', 'political']));
     const r = await run('get_quote', { service_code: 'body_tempo', pickup: 'Victoria Hospital', drop: 'Assam' }, c);
-    expect(r).toMatchObject({ ok: false, reason: 'place_too_vague', which: 'drop', say: expect.stringMatching(/town or district \(or the PIN code\) and the exact drop/) });
+    expect(r).toMatchObject({ ok: false, reason: 'place_too_vague', which: 'drop', say: expect.stringMatching(/Ask which city or town.*the city alone is fine for a long trip.*Never ask for a house number/) });
     expect(quoteTrip).not.toHaveBeenCalled();
     resolvePlaceFromText.mockResolvedValueOnce(single('Victoria Hospital', 1, 2)).mockResolvedValueOnce(single('Guwahati Medical College', 26.1, 91.7, ['hospital', 'establishment']));
     expect((await run('get_quote', { service_code: 'body_tempo', pickup: 'Victoria Hospital', drop: 'GMCH Guwahati' }, c)).ok).toBe(true);
@@ -1021,7 +1022,7 @@ describe('G. vehicles, freezer packages, Eeco over 800 km, places, staff questio
     expect(I).toMatch(/do not keep repeating "ಜಿ", "ಮೇಡಂ" or "ಒಂದು ನಿಮಿಷ"/);
     expect(I).toMatch(/Never read the whole summary again: if create_booking says a part was not heard, repeat only that part/);
     expect(I).toMatch(/A clear no \("ಬೇಡ", "अभी बुक मत कीजिए"\): do not ask again/);
-    expect(I).toMatch(/\("Assam"\), ask the town or district/);
+    expect(I).toMatch(/\("Assam"\), ask which city or town — the area there only if they know it; the city alone is fine for a long trip/);
   });
 });
 
@@ -1392,5 +1393,93 @@ describe('J. equipment, staffing, access, AC — from the package, never guessed
     expect(I).toMatch(/Never assume a vehicle has AC/);
     expect(I).toMatch(/FINISH IN ABOUT 3 MINUTES/);
     expect(I).toMatch(/Never keep the caller waiting with "booking is in progress"/);
+  });
+});
+
+// ============================================================
+describe('K. location detail scales with distance; trust the caller; fewer questions', () => {
+  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes' }) });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const PLACES = {
+    Rajajinagar: { name: 'Rajajinagar', address: 'Rajajinagar, Bengaluru', lat: 12.99, lng: 77.55, types: ['sublocality', 'political'] },
+    Jayanagar: { name: 'Jayanagar', address: 'Jayanagar, Bengaluru', lat: 12.93, lng: 77.58, types: ['sublocality', 'political'] },
+    Satara: { name: 'Satara', address: 'Satara, Maharashtra, India', lat: 17.68, lng: 74.0, types: ['administrative_area_level_2', 'political'] },
+    Pune: { name: 'Pune', address: 'Pune, Maharashtra, India', lat: 18.52, lng: 73.85, types: ['locality', 'political'] },
+    Maharashtra: { name: 'Maharashtra', address: 'Maharashtra, India', lat: 19.7, lng: 75.7, types: ['administrative_area_level_1', 'political'] },
+  };
+  const km = (q) => (q.dropLat > 17 ? 736 : 9);
+  beforeEach(() => {
+    resolvePlaceFromText.mockReset();
+    resolvePlaceFromText.mockImplementation(async (q) => (PLACES[q] ? { status: 'single', place: PLACES[q] } : { status: 'none' }));
+    quoteTrip.mockImplementation(async (q) => ({ distanceKm: km(q), oneWayKm: km(q), fare: { grandTotal: km(q) * 40, vehicleType: q.selectedType === 'bls' ? 'Maruti Eeco' : 'Tempo Traveller' } }));
+    createBookedTrip.mockResolvedValue({ _id: 'tripL', tripNumber: 'TRP-L', estimatedFare: 29440 });
+  });
+
+  test('long trip, home pickup given only as an area: no landmark or house number asked; read back and booked', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    const q = await run('get_quote', { service_code: 'bls_tempo', pickup: 'Rajajinagar', drop: 'Pune', patient_at: 'home', floor: 'ground' }, c);
+    expect(q.ok).toBe(true);
+    expect(q.say).toMatch(/Long-distance trip: the area — or just the city — is enough at each end\. NEVER ask for a house number, road name or exact landmark/);
+    const rb = await run('read_back_booking', { when: 'now', patient_at: 'home' }, c);
+    expect(rb).toMatchObject({ ok: true });
+    expect(rb.summary).toMatch(/Pickup: Rajajinagar, Rajajinagar, Bengaluru\. Drop: Pune, Pune, Maharashtra, India/);
+    expect((await run('create_booking', { customer_confirmed: true }, c)).ok).toBe(true);
+  });
+
+  test('a far city given without an area (a district like Satara) is accepted; only a whole state is refused', async () => {
+    const c = ctx(AiCall.add({}));
+    expect((await run('get_quote', { service_code: 'body_tempo', pickup: 'Jayanagar', drop: 'Satara' }, c)).ok).toBe(true);
+    const r = await run('get_quote', { service_code: 'body_tempo', pickup: 'Jayanagar', drop: 'Maharashtra' }, c);
+    expect(r).toMatchObject({ ok: false, reason: 'place_too_vague' });
+    expect(r.say).toMatch(/Ask which city or town/);
+    expect(r.say).not.toMatch(/house number,|exact drop/);
+  });
+
+  test('local home pickup: the area plus ONE landmark is enough — the say never asks for a house number', async () => {
+    const q = await run('get_quote', { service_code: 'bls', pickup: 'Rajajinagar', drop: 'Jayanagar', patient_at: 'home', floor: 'ground' }, ctx(AiCall.add({})));
+    expect(q.say).toMatch(/Local home pickup: the area plus ONE landmark is enough — the exact spot can come by WhatsApp pin or from the driver\. Do not ask for a house number or road name/);
+  });
+
+  test('"my driver will guide you" / "the bus stop is enough": accepted, recorded for the crew — no more location questions', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await run('get_quote', { service_code: 'bls', pickup: 'Rajajinagar', drop: 'Jayanagar', patient_at: 'home', floor: 'ground' }, c);
+    const rb = await run('read_back_booking', { when: 'now', patient_at: 'home', caller_will_guide: true }, c);
+    expect(rb.ok).toBe(true);
+    await run('create_booking', { customer_confirmed: true }, c);
+    expect(call.needs).toMatchObject({ pickupGuidance: 'caller will guide the exact spot' });
+  });
+
+  test('a landmark given as a bus stop is enough', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await run('get_quote', { service_code: 'bls', pickup: 'Rajajinagar', drop: 'Jayanagar', patient_at: 'home', floor: 'ground' }, c);
+    expect((await run('read_back_booking', { when: 'now', patient_at: 'home', pickup_details: 'near Navarang bus stop' }, c)).ok).toBe(true);
+  });
+
+  test('a frustrated caller (state.relaxed): no location probing at all', async () => {
+    const c = ctx(AiCall.add({}));
+    await run('get_quote', { service_code: 'bls', pickup: 'Rajajinagar', drop: 'Jayanagar', patient_at: 'home', floor: 'ground' }, c);
+    c.state.relaxed = true;
+    expect((await run('read_back_booking', { when: 'now', patient_at: 'home' }, c)).ok).toBe(true);
+  });
+
+  test('frustration words in the call languages are recognised; ordinary answers are not', () => {
+    ['you are asking too much', 'stop wasting my time', 'ಮೇಡಮ್ ಆಗ್ಲೇ ಹೇಳಿದ್ನಲ್ಲ', 'ಟೈಮ್ ವೇಸ್ಟ್ ಮಾಡ್ಬೇಡಿ', 'ಎಷ್ಟು ಸಲ ಹೇಳ್ಬೇಕು', 'बहुत सवाल पूछ रहे हो', 'टाइम खराब मत करो']
+      .forEach((t) => expect([t, session.FRUSTRATED.test(t)]).toEqual([t, true]));
+    ['ಜಯನಗರ ಫೋರ್ತ್ ಬ್ಲಾಕ್', 'ಹೌದು ಬುಕ್ ಮಾಡಿ', 'near the bus stop'].forEach((t) => expect([t, session.FRUSTRATED.test(t)]).toEqual([t, false]));
+  });
+
+  test('instructions: precision by distance, trust the caller, confirm together, frustration', () => {
+    const I = prompt.BASE_INSTRUCTIONS;
+    expect(I).toMatch(/Long-distance \/ inter-city trips: the AREA in the far city is enough; if they do not know the area, the CITY itself is fine/);
+    expect(I).toMatch(/NEVER ask a house number, road name or exact landmark for a far city/);
+    expect(I).toMatch(/Local trips in the city: the area plus ONE landmark is enough/);
+    expect(I).toMatch(/TRUST THE CALLER: if they say a bus stop or landmark is enough, or that they, their driver or family will guide the exact spot, accept it/);
+    expect(I).toMatch(/Never hold up the quote or the booking for a detail that does not change the fare/);
+    expect(I).toMatch(/Confirm several details together in ONE short sentence/);
+    expect(I).toMatch(/IF THE CALLER IS FRUSTRATED .* accept what they have given, and go straight to the quote or the booking — stop probing/);
+    expect(I).not.toMatch(/you need the exact address — house or flat, street/);
   });
 });

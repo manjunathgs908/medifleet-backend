@@ -958,7 +958,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       delete process.env.WA_CALL_LOCATION_ENABLED;
       ai.push(fnCall('send_location_request', {}, 'w1'));
       await flush();
-      expect(outputs()[0]).toMatchObject({ ok: false, status: 'not_sent', reason: 'whatsapp_off', say: expect.stringMatching(/WhatsApp was NOT sent.*Ask on the call for the address/) });
+      expect(outputs()[0]).toMatchObject({ ok: false, status: 'not_sent', reason: 'whatsapp_off', say: expect.stringMatching(/WhatsApp was NOT sent.*Ask on the call for the area and one nearby landmark/) });
       ai.push({ type: 'session.output_transcript.delta', delta: 'ಸರಿ, ಮೊದಲು WhatsApp ನಲ್ಲಿ ಲೊಕೇಶನ್ ಲಿಂಕ್ ಕಳಿಸುತ್ತೇನೆ' });
       await flush();
       expect(plivoWs.of('clearAudio')).toHaveLength(1);
@@ -1490,6 +1490,19 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     await flush();
     expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'equipment_not_in_package', recommend_service_code: 'als_tempo' });
     expect(call().transcript.map((t) => t.text)).toContain('get_quote -> equipment_not_in_package');
+  });
+
+  // ── A caller fed up with questions ──
+  test('"ಆಗ್ಲೇ ಹೇಳಿದ್ನಲ್ಲ, ಟೈಮ್ ವೇಸ್ಟ್" — she is told to acknowledge and go to the quote; probing stops (once a minute at most)', async () => {
+    await begin();
+    callerSays('ಮೇಡಮ್ ಆಗ್ಲೇ ಹೇಳಿದ್ನಲ್ಲ, ಟೈಮ್ ವೇಸ್ಟ್ ಮಾಡ್ಬೇಡಿ');
+    await flush();
+    const said = ai.of('session.instructions.append').map((m) => m.content);
+    expect(said).toEqual([expect.stringMatching(/The caller is frustrated with the questions\. Acknowledge it in a few words .* accept what they have already given, and go straight to the quote or the booking/)]);
+    expect(session._active.get(callId).state.relaxed).toBe(true);
+    callerSays(' ಎಷ್ಟು ಸಲ ಹೇಳ್ಬೇಕು');
+    await flush();
+    expect(ai.of('session.instructions.append')).toHaveLength(1); // not repeated within the minute
   });
 
   test('the tool model\'s own words are logged, so a stalled booking explains itself', async () => {

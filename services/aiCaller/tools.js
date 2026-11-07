@@ -50,7 +50,12 @@ const ASK_TO_BOOK = { kn: 'ಬುಕ್ ಮಾಡಲಾ?', hi: 'बुक कर
 const askToBook = (ctx) => ASK_TO_BOOK[ctx.language] || ASK_TO_BOOK.kn;
 const EECO_OVER_800_KN = 'ಈ ಪ್ರಯಾಣ 800 ಕಿಲೋಮೀಟರ್‌ಗಿಂತ ಹೆಚ್ಚು ಇದೆ. ಇಷ್ಟು ದೂರಕ್ಕೆ ಟೆಂಪೋ ಟ್ರಾವೆಲರ್ ತೆಗೆದುಕೊಳ್ಳಲು ಸಲಹೆ ಕೊಡುತ್ತೇವೆ. ಅದರ ದರ ಹೇಳಲಾ?';
 // A whole country / state / district is not a place an ambulance can go to.
-const VAGUE_TYPES = ['country', 'administrative_area_level_1', 'administrative_area_level_2', 'political', 'colloquial_area'];
+// Only a whole country, state or region is refused — a district or city is
+// a fine destination for a long trip (it barely moves the fare).
+const VAGUE_TYPES = ['country', 'administrative_area_level_1', 'political', 'colloquial_area'];
+// Over this one-way distance a trip is inter-city: the area — or just the
+// city — is enough at each end; never a house number or exact landmark.
+const INTERCITY_KM = 60;
 const tooVague = (r) => {
   const types = r?.place?.types || [];
   return types.length > 0 && types.every((t) => VAGUE_TYPES.includes(t));
@@ -119,7 +124,8 @@ function definitions() {
           appointment_time: { type: 'string', description: 'Only if the caller has a hospital appointment / must ARRIVE by a time: that time, YYYY-MM-DD HH:mm. Never the same thing as the pickup time.' },
           helper_needed   : { type: 'boolean' },
           patient_at      : { type: 'string', enum: ['home', 'hospital', 'other'] },
-          pickup_details  : { type: 'string', description: 'Home pickup: house / flat / street and a landmark, in English letters, as the caller said it.' },
+          pickup_details  : { type: 'string', description: 'Home pickup: whatever the caller gave — an area, a landmark or bus stop, or more — in English letters.' },
+          caller_will_guide: { type: 'boolean', description: 'true if the caller said the landmark / bus stop is enough, or that they, their driver or family will guide the exact spot.' },
           freezer_needed  : { type: 'boolean', description: 'Body transport: true if they need a freezer during the transport.' },
           patient_name    : { type: 'string' },
         },
@@ -365,7 +371,7 @@ async function getQuote(args, ctx) {
     if (tooVague(r)) {
       return {
         ok: false, reason: 'place_too_vague', which, place: r.place.name,
-        say: `"${r.place.name}" is a whole state or district, not a place to ${which === 'drop' ? 'drop at' : 'pick up from'}. Ask the town or district (or the PIN code) and the exact ${which} — hospital, address or landmark — then get_quote again.`,
+        say: `"${r.place.name}" is a whole state, not a place to ${which === 'drop' ? 'drop at' : 'pick up from'}. Ask which city or town — and the area there only if they know it (the city alone is fine for a long trip). Never ask for a house number. Then get_quote again.`,
       };
     }
   }
@@ -440,6 +446,8 @@ async function getQuote(args, ctx) {
   if (f?.kind === 'body') freezer = !verified ? 'unverified' : f.freezerIncluded ? 'included' : 'not_included';
   const nurseIncluded = verified && f.nurseIncluded;
 
+  const longDistance = oneWayKm > INTERCITY_KM;
+
   ctx.state.quoteSeq = (ctx.state.quoteSeq || 0) + 1;
   ctx.state.quote = {
     seq: ctx.state.quoteSeq,
@@ -448,7 +456,7 @@ async function getQuote(args, ctx) {
     usedShared: usesShared,
     quotes: { plain, helper: helperOption },
     helper, waitHours: roundTrip ? waitHours : 0, waitCharge, longTrip, twoDrivers,
-    freezer, verified, vehicle: verified ? f.vehicle : null, isBody,
+    freezer, verified, vehicle: verified ? f.vehicle : null, isBody, longDistance,
     ac: args.ac_needed === true ? (acPriced ? 'addon' : 'confirm') : null,
     access: {
       ...(['ground', 'upstairs'].includes(args.floor) ? { floor: args.floor } : {}),
@@ -486,6 +494,9 @@ async function getQuote(args, ctx) {
     acPriced ? 'AC: the AC add-on is included in this price (from our price list); the team confirms an AC vehicle is available.' : '',
     args.ac_needed === true && !acPriced ? `AC: we cannot confirm AC for ${service.label} from our records — say the team will confirm it; never promise AC.` : '',
     svcFacts?.nurseMandatory ? 'A nurse is mandatory and included in this package.' : '',
+    longDistance
+      ? 'Long-distance trip: the area — or just the city — is enough at each end. NEVER ask for a house number, road name or exact landmark; it does not change this fare.'
+      : args.patient_at === 'home' ? 'Local home pickup: the area plus ONE landmark is enough — the exact spot can come by WhatsApp pin or from the driver. Do not ask for a house number or road name.' : '',
     isBody ? 'Body transport: NEVER ask about a nurse, oxygen, a helper or what happened medically. Only what is needed — pickup, drop, pickup time; the name of the deceased once if not given (optional). Then ask to book.' : '',
     nurse && nurseIncluded ? 'Nurse: a nurse is INCLUDED in this service — say so; no extra charge.' : '',
     nurse && !nurseIncluded ? 'Nurse: there is no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one.' : '',
@@ -569,8 +580,14 @@ async function readBackBooking(args, ctx) {
 
   const patientAt = ['home', 'hospital', 'other'].includes(args.patient_at) ? args.patient_at : q.patientAt;
   const pickupDetails = clean(args.pickup_details, 200);
-  if (patientAt === 'home' && !q.usedShared && !pickupDetails) {
-    return { ok: false, reason: 'need_pickup_details', say: 'Home pickup: ask the exact address — house or flat, street — and a landmark (or send the WhatsApp location request). Then read_back_booking with pickup_details.' };
+  // A landmark for a LOCAL home pickup, asked at most once. Never for a
+  // long trip, never when the caller says they (or the driver) will guide,
+  // never after the caller is fed up with questions — it does not change
+  // the fare, so it never blocks the booking.
+  const guided = args.caller_will_guide === true;
+  if (patientAt === 'home' && !q.usedShared && !pickupDetails && !guided && !q.longDistance && !ctx.state.relaxed && !ctx.state.landmarkAsked) {
+    ctx.state.landmarkAsked = true;
+    return { ok: false, reason: 'need_landmark', say: 'Local home pickup: ask ONE nearby landmark (or send the WhatsApp location request). If they say the driver or family will guide, accept it: read_back_booking with caller_will_guide true. Never ask a house number.' };
   }
 
   const helper = !q.atHospital && !q.isBody && (typeof args.helper_needed === 'boolean' ? args.helper_needed : q.helper);
@@ -584,7 +601,7 @@ async function readBackBooking(args, ctx) {
     when,
     scheduled_time: when === 'later' ? args.scheduled_time : null,
     appointment_time: appointment ? args.appointment_time : null,
-    helper, patientAt, pickupDetails,
+    helper, patientAt, pickupDetails, guided,
     patient_name: clean(args.patient_name, 80),
     fare,
   };
@@ -748,6 +765,8 @@ async function book(args, ctx, d) {
     ...(tripType === 'round_trip' ? { roundTrip: true, waitHours } : {}),
     ...(twoDrivers ? { twoDrivers: true } : {}),
     ...(d.pickupDetails ? { pickupDetails: d.pickupDetails } : {}),
+    // The caller said a landmark is enough / they or the driver will guide.
+    ...(d.guided ? { pickupGuidance: 'caller will guide the exact spot' } : {}),
     // The appointment is NOT the pickup time (scheduleDate): kept apart.
     ...(d.appointment_time ? { appointmentAt: parseIst(d.appointment_time) } : {}),
     ...(typeof args.freezer_box_needed === 'boolean' && ctx.state.quote.freezer !== 'included' ? { freezerBox: args.freezer_box_needed } : {}),
@@ -794,7 +813,7 @@ async function sendLocationRequest(args, ctx) {
       ok: false,
       status: 'not_sent',
       reason: r.status === 'disabled' ? 'whatsapp_off' : 'whatsapp_failed',
-      say: 'WhatsApp was NOT sent. Do not say a link was sent and do not mention WhatsApp again. Ask on the call for the address — house, street, area — and a nearby landmark.',
+      say: 'WhatsApp was NOT sent. Do not say a link was sent and do not mention WhatsApp again. Ask on the call for the area and one nearby landmark (the address — not a house number).',
     };
 }
 

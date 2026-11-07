@@ -54,6 +54,7 @@ const AiCallSchema = new mongoose.Schema(
       specialCare: { type: String, maxlength: 300 },
       twoDrivers : { type: Boolean },          // over 1000 km one way
       pickupDetails: { type: String, maxlength: 200 }, // home pickup: house / street / landmark
+      pickupGuidance: { type: String, maxlength: 100 }, // the caller / driver will guide the exact spot
       appointmentAt: { type: Date },           // hospital appointment — NOT the pickup time (Trip.scheduleDate)
       freezerBox   : { type: Boolean },        // body transport: a freezer box too (team confirms the charge)
       freezerIncluded: { type: Boolean },      // Body Shifting — Tempo: the freezer comes with the package

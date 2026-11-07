@@ -81,7 +81,7 @@ const AiCallSchema = new mongoose.Schema(
     // (languageSource 'requested'); transcriptScript is just which letters
     // the first transcript used — Kannada has come back in Telugu letters.
     language  : { type: String },
-    languageSource  : { type: String, enum: ['requested'] },
+    languageSource  : { type: String, enum: ['requested', 'detected'] },
     transcriptScript: { type: String },
     transcript: [{
       _id : false,

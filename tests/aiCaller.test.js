@@ -1253,6 +1253,45 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     }
   });
 
+  // ── Replying in the language the caller SPEAKS ──
+  // A caller turn ends after 1.5 s of quiet (TURN_IDLE_MS), as on a call.
+  const turn = async (text) => { callerSays(text); await new Promise((r) => setTimeout(r, 1600)); await flush(); };
+  const langAppends = () => ai.of('session.instructions.append').map((m) => m.content).filter((c) => /^LANGUAGE/.test(c));
+
+  test('a caller who keeps speaking Telugu gets REPLIES in Telugu (two turns running)', async () => {
+    await begin();
+    await turn('నాకు అంబులెన్స్ కావాలి అండి, ఇప్పుడు ఎక్కడ ఉంది?');
+    expect(langAppends()).toHaveLength(0);              // one turn is not enough
+    await turn('మాకు రేపు ఉదయం కావాలి, ఎంత అవుతుంది చెప్పండి');
+    expect(langAppends()).toEqual([expect.stringMatching(/the caller is speaking Telugu\. REPLY in Telugu from now on .* not just understand it/)]);
+    expect(call()).toMatchObject({ language: 'te', languageSource: 'detected' });
+  }, 10000);
+
+  test('Kannada transcribed in Telugu letters never switches her to Telugu', async () => {
+    await begin();
+    await turn('బేలగళ నిను తుంబా రాంగ్ ఏళ్తితియా అమౌంట్? సో నిం సరిగ్గా చెక్ మాడి ఏళ్');
+    await turn('ఈవత్, తూ సంఝే ఆరు గంటె బేకిదె');
+    expect(langAppends()).toHaveLength(0);
+    expect(call().language).toBeUndefined();
+    expect(call().transcriptScript).toBe('te');        // the letters are only noted
+  }, 10000);
+
+  test('an explicit "ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ" is never overridden by detection; Hindi speech is followed otherwise', async () => {
+    await begin();
+    await turn('ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ');
+    await turn('నాకు అంబులెన్స్ కావాలి అండి, ఇప్పుడు ఎక్కడ ఉంది?');
+    await turn('మాకు రేపు ఉదయం కావాలి, ఎంత అవుతుంది చెప్పండి');
+    expect(langAppends()).toEqual([expect.stringMatching(/the caller asked for Kannada/)]);
+    expect(call()).toMatchObject({ language: 'kn', languageSource: 'requested' });
+  }, 10000);
+
+  test('Hindi spoken in two turns: replies in Hindi', async () => {
+    await begin();
+    await turn('मुझे ambulance चाहिए, कितना होगा बताइए');
+    await turn('अभी घर से हॉस्पिटल जाना है, आप कब आएंगे');
+    expect(langAppends()).toEqual([expect.stringMatching(/speaking Hindi\. REPLY in Hindi/)]);
+  }, 10000);
+
   test('time limit after a booking: a goodbye and hang up — not a handoff', async () => {
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     try {

@@ -43,6 +43,7 @@ const bookingPush = require('../bookingPush');
 const AiCall = require('../../models/AiCall');
 const { isPastIst, parseIst, sayIst } = require('./prompt');
 const serviceFacts = require('./serviceFacts');
+const { findHospital, label: hospitalLabel } = require('./hospitals');
 
 // "ಬುಕ್ ಮಾಡಲಾ?" in the language the caller chose (session ctx.language).
 const ASK_TO_BOOK = { kn: 'ಬುಕ್ ಮಾಡಲಾ?', hi: 'बुक कर दूँ?', en: 'Shall I book it?', te: 'బుక్ చేయమంటారా?', ta: 'புக் பண்ணட்டுமா?', ml: 'ബുക്ക് ചെയ്യട്ടെ?' };
@@ -81,7 +82,9 @@ function definitions() {
         properties: {
           service_code: { type: 'string', enum: services.map((s) => s.code) },
           pickup      : { type: 'string', description: 'Pickup place as the caller said it (area, landmark, hospital), in English letters.' },
-          drop        : { type: 'string', description: 'Drop place (usually a hospital), in English letters.' },
+          drop        : { type: 'string', description: 'Drop place (usually a hospital) — the hospital NAME only, in English letters.' },
+          pickup_area : { type: 'string', description: 'The area the caller said the pickup hospital / place is in ("Hebbal"), if they said one.' },
+          drop_area   : { type: 'string', description: 'The area the caller said the drop hospital is in ("Vijayanagar"), if they said one.' },
           pickup_choice: { type: 'integer', description: 'If the last get_quote returned several pickup options, the number (1-based) the caller chose.' },
           drop_choice  : { type: 'integer', description: 'If the last get_quote returned several drop options, the number (1-based) the caller chose.' },
           use_shared_location  : { type: 'boolean', description: 'true to use the pickup location the caller shared on WhatsApp (after send_location_request).' },
@@ -213,9 +216,16 @@ function definitions() {
 }
 
 // One place: the caller's choice from the previous options, else a search.
-async function resolvePlace(query, choice, previous) {
+// A hospital is checked (hospitals.js): one location -> confirm its area;
+// several branches -> ask which; not in the area the caller said -> clarify.
+async function resolvePlace(query, choice, previous, area) {
   if (Number.isInteger(choice) && previous?.[choice - 1]) return { status: 'single', place: previous[choice - 1] };
-  return resolvePlaceFromText(String(query || '').slice(0, 200));
+  const h = await findHospital(String(query || '').slice(0, 200), clean(area, 80), { resolve: resolvePlaceFromText });
+  if (h.status === 'not_hospital') return h.result;
+  if (h.status === 'single') return { status: 'single', place: h.place, hospital: true, confirm: h.confirm };
+  if (h.status === 'branches') return { status: 'multiple', places: h.places.slice(0, 5), hospital: true };
+  if (h.status === 'not_in_area') return { status: 'not_in_area', area: h.area, places: h.places.slice(0, 5), hospital: true };
+  return { status: 'none' };
 }
 
 // The pickup the caller shared on WhatsApp, as a resolved place, or null.
@@ -274,18 +284,18 @@ async function getQuote(args, ctx) {
   let d;
   if (!nearest) {
     [p, d] = await Promise.all([
-      p || resolvePlace(args.pickup, args.pickup_choice, ctx.state.options?.pickup),
-      resolvePlace(args.drop, args.drop_choice, ctx.state.options?.drop),
+      p || resolvePlace(args.pickup, args.pickup_choice, ctx.state.options?.pickup, args.pickup_area),
+      resolvePlace(args.drop, args.drop_choice, ctx.state.options?.drop, args.drop_area),
     ]);
   } else if (!p) {
-    p = await resolvePlace(args.pickup, args.pickup_choice, ctx.state.options?.pickup);
+    p = await resolvePlace(args.pickup, args.pickup_choice, ctx.state.options?.pickup, args.pickup_area);
   }
-  ctx.state.options = {
-    pickup: p.status === 'multiple' ? p.places : undefined,
-    drop  : d?.status === 'multiple' ? d.places : undefined,
-  };
+  const optionsOf = (r) => (r && (r.status === 'multiple' || r.status === 'not_in_area') ? r.places : undefined);
+  ctx.state.options = { pickup: optionsOf(p), drop: optionsOf(d) };
   const describe = (r) => (r.status === 'none'
     ? { status: 'not_found' }
+    : r.status === 'not_in_area'
+      ? { status: `no such hospital in ${r.area}`, options: r.places.map((x, i) => `${i + 1}. ${hospitalLabel(x)}`) }
     : r.status === 'multiple'
       ? { status: 'several', options: r.places.slice(0, 5).map((x, i) => `${i + 1}. ${x.name}, ${x.address}`) }
       : { status: 'found', place: placeAddress(r.place) });
@@ -296,8 +306,22 @@ async function getQuote(args, ctx) {
     if (!h) return { ok: false, reason: 'no_nearby_hospital', say: 'Could not find a hospital near the pickup. Ask which hospital they prefer, or offer a callback from the team (end_call follow_up).' };
     d = { status: 'single', place: h };
   }
+  // "Vijayanagar Fortis" when there is no Fortis in Vijayanagar: never accept it.
+  for (const [which, r] of [['pickup', p], ['drop', d]]) {
+    if (r.status === 'not_in_area') {
+      return {
+        ok: false, reason: 'hospital_not_in_area', which, area: r.area,
+        branches: r.places.map((x, i) => `${i + 1}. ${hospitalLabel(x)}`),
+        say: `There is no such hospital in ${r.area}. Tell the caller briefly and ask which one they mean — these are the real branches. Then get_quote again with ${which}_choice (the number) or the right name and area.`,
+      };
+    }
+  }
   if (p.status !== 'single' || d.status !== 'single') {
-    return { ok: false, reason: 'clarify_places', pickup: describe(p), drop: describe(d), say: 'Ask the caller to clarify, then call get_quote again.' };
+    const branches = [p, d].some((r) => r?.status === 'multiple' && r.hospital);
+    return {
+      ok: false, reason: 'clarify_places', pickup: describe(p), drop: describe(d),
+      say: branches ? 'This hospital has several branches: ask which branch or area, then get_quote again with the choice.' : 'Ask the caller to clarify, then call get_quote again.',
+    };
   }
   // "Assam" resolves to a whole state: never quote to the middle of a state.
   for (const [which, r] of [['pickup', p], ['drop', d]]) {
@@ -408,6 +432,8 @@ async function getQuote(args, ctx) {
     tempoService ? `Over 800 km by Eeco: give this fare, then recommend a Tempo Traveller in the caller's language (Kannada: "${EECO_OVER_800_KN}"). Do NOT change the vehicle yourself; only if they agree, get_quote again with service_code ${tempoService.code} (${tempoService.label})${f.kind === 'patient' ? ' — the same care level in a bigger vehicle; it is NOT an ICU ambulance' : ''}.` : '',
     mismatch ? 'The service details do not match our records: do not describe what is included; say the team will confirm the details.' : '',
     nearest ? 'Say this is the nearest hospital found, by name; the team can change it.' : '',
+    ...[['pickup', p], ['drop', d]].filter(([, r]) => r.hospital && r.confirm)
+      .map(([which, r]) => `The ${which} hospital has one location: confirm it by its area in a few words ("${r.confirm} ಅಲ್ವಾ?") — do NOT ask which branch.`),
     'It is an estimate. Then ask if they want to book; when they do, read_back_booking first.',
   ].filter(Boolean).join(' ');
 
@@ -417,6 +443,8 @@ async function getQuote(args, ctx) {
     pickup     : pickup.address,
     drop       : drop.address,
     ...(nearest ? { drop_is_nearest_hospital: true } : {}),
+    ...(p.hospital && p.confirm ? { confirm_pickup: p.confirm } : {}),
+    ...(d.hospital && d.confirm ? { confirm_drop: d.confirm } : {}),
     helper,
     trip_type  : tripType,
     distance_km: Math.round(plain.distanceKm * 10) / 10,
@@ -711,10 +739,13 @@ async function serviceInfo(args, ctx) {
   const services = bookableServices();
   const service = services.find((s) => s.code === args.service_code);
   if (!service) {
+    const known = await require('./servicesKnowledge').load();
     return {
       ok: true,
-      services: services.map((s) => ({ code: s.code, ...serviceFacts.describe(s.code, s.label) })),
-      say: 'Answer from these in one or two plain sentences. If you do not know which service they mean ("duty"?), ask once which service or arrangement. If none of this answers it, record_question for a team member.',
+      // The full real list: road services with active Pricing (DB) + the services our team arranges.
+      services: known.bookable.map((b) => ({ code: b.code, ...serviceFacts.describe(b.code, b.label), ...(b.vehicleType ? { vehicle_in_pricing: b.vehicleType } : {}) })),
+      other_services: known.other.map((o) => ({ name: o.name, about: o.about, booked_by: 'our team (callback with the price)' })),
+      say: 'Answer from these in one or two plain sentences. If you do not know which service they mean ("duty"?), ask once which service or arrangement. Funeral / cremation details or the cargo process: record_question for a team member. If none of this answers it, record_question.',
     };
   }
   const facts = serviceFacts.describe(service.code, service.label);

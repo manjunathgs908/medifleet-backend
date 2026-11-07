@@ -865,7 +865,7 @@ describe('F. read-back, approval, schedule, freezer flows, language', () => {
     expect(I).toMatch(/If the caller ASKS for a language \("ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ", "English please"/);
     expect(I).toMatch(/never by how a transcript is spelled/);
     expect(I).toMatch(/ask ONCE: "ಕನ್ನಡ ಅಥವಾ English — ಯಾವುದರಲ್ಲಿ ಮಾತಾಡಲಿ\?"/);
-    expect(I).toMatch(/confirm which branch/);
+    expect(I).toMatch(/if it has several branches, ask which branch or area/);
     expect(I).toMatch(/PICKUP time .* is not the same as a hospital appointment/);
     expect(I).toMatch(/Say "ಲಿಂಕ್ ಕಳಿಸಿದ್ದೇನೆ" ONLY if it returns status sent/);
     expect(I).toMatch(/"ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", "not yet", "wait", an unclear answer, or a change in any detail = do NOT book/);
@@ -1022,5 +1022,163 @@ describe('G. vehicles, freezer packages, Eeco over 800 km, places, staff questio
     expect(I).toMatch(/Never read the whole summary again: if create_booking says a part was not heard, repeat only that part/);
     expect(I).toMatch(/A clear no \("ಬೇಡ", "अभी बुक मत कीजिए"\): do not ask again/);
     expect(I).toMatch(/\("Assam"\), ask the town or district/);
+  });
+});
+
+// ============================================================
+describe('H. services knowledge, hospital checks, spoken language', () => {
+  const servicesKnowledge = require('../services/aiCaller/servicesKnowledge');
+  const spoken = require('../services/aiCaller/spokenLanguage');
+  const models = require('../models');
+  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes' }) });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const PRICING = [
+    ['BLS', 'Maruti Eeco'], ['BLS_TEMPO', 'Tempo Traveller'], ['ALS_TEMPO', 'Tempo Traveller'], ['ACLS_TEMPO', 'Tempo Traveller'],
+    ['NICU_TEMPO', 'Tempo Traveller'], ['BODY_MINI', 'Maruti Eeco'], ['BODY_TEMPO', 'Tempo Traveller'],
+  ].map(([serviceType, vehicleType]) => ({ serviceType, vehicleType, active: true }));
+  const pricingReturns = (docs) => { models.Pricing = { find: jest.fn(() => ({ select: () => ({ lean: async () => docs }) })) }; };
+  afterEach(() => { delete models.Pricing; });
+
+  describe('A. the real services list', () => {
+    test('road services come from the ACTIVE Pricing docs in the database, with their vehicle', async () => {
+      pricingReturns(PRICING);
+      const k = await servicesKnowledge.load();
+      expect(models.Pricing.find).toHaveBeenCalledWith({ active: true });
+      expect(k.fromDb).toBe(true);
+      expect(k.bookable.map((b) => b.code)).toEqual(['bls', 'bls_tempo', 'als_tempo', 'acls_tempo', 'nicu_tempo', 'body_mini', 'body_tempo']);
+      expect(k.bookable.find((b) => b.code === 'body_tempo')).toMatchObject({ vehicleType: 'Tempo Traveller', purpose: expect.stringMatching(/freezer included/) });
+      expect(k.notes).toEqual([]);
+    });
+
+    test('a service without active Pricing is not offered; a Pricing doc the catalog lacks is reported', async () => {
+      pricingReturns([...PRICING.filter((d) => d.serviceType !== 'NICU_TEMPO'), { serviceType: 'MORTUARY_VAN', vehicleType: 'Van', active: true }]);
+      const k = await servicesKnowledge.load();
+      expect(k.bookable.map((b) => b.code)).not.toContain('nicu_tempo');
+      expect(k.notes).toEqual(expect.arrayContaining([expect.stringMatching(/NICU.*no active Pricing — not offered/), expect.stringMatching(/MORTUARY_VAN: active but not in the catalog/)]));
+    });
+
+    test('no database: the catalog list, flagged as not from the DB', async () => {
+      const k = await servicesKnowledge.load();
+      expect(k.fromDb).toBe(false);
+      expect(k.bookable).toHaveLength(7);
+    });
+
+    test('the full list goes into the instructions: road, body, freezer, air, train, cargo, Antim Yatra — funeral details never guessed', async () => {
+      pricingReturns(PRICING);
+      const text = servicesKnowledge.block(await servicesKnowledge.load());
+      ['BLS (Maruti Eeco) (Maruti Eeco)', 'ACLS (Tempo)', 'NICU (Tempo)', 'Body Mini (Eeco)', 'Body Shifting (Tempo)', 'Air Ambulance', 'Train Ambulance', 'Air Cargo (dead body by air)', 'Freezer Box at home', 'Antim Yatra', 'Event Ambulance', 'Standby Ambulance']
+        .forEach((s) => expect(text).toContain(s));
+      expect(text).toMatch(/answer from this list only/);
+      expect(text).toMatch(/Funeral \/ cremation details and the step-by-step dead-body cargo process are explained by our team/);
+      expect(prompt.buildInstructions({ now: NOW, services: text })).toContain('SAVELIFE SERVICES — the real list');
+      expect(prompt.BASE_INSTRUCTIONS).toMatch(/"what services do you have\?" — answer from the SAVELIFE SERVICES list/);
+    });
+
+    test('service_info with no service: the DB road services plus everything our team arranges', async () => {
+      pricingReturns(PRICING);
+      const r = await run('service_info', { question: 'what services do you have' }, ctx(AiCall.add({})));
+      expect(r.services.map((x) => x.code)).toHaveLength(7);
+      expect(r.services.find((x) => x.code === 'bls')).toMatchObject({ vehicle_in_pricing: 'Maruti Eeco', purpose: expect.any(String) });
+      expect(r.other_services.map((o) => o.name)).toEqual(expect.arrayContaining(['Air Ambulance', 'Train Ambulance (Train Transport)', 'Antim Yatra']));
+    });
+  });
+
+  describe('B. hospitals checked on Google', () => {
+    const at = (name, address, lat, lng, types = ['hospital', 'health', 'establishment']) => ({ name, address, lat, lng, types });
+    const places = {
+      Jayanagar: { status: 'single', place: { name: 'Jayanagar', address: 'Jayanagar, Bengaluru', lat: 12.93, lng: 77.58, types: ['sublocality', 'political'] } },
+      'Baptist Hospital': { status: 'single', place: at('Bangalore Baptist Hospital', 'Bellary Rd, Esteem Nagar, Hebbal, Bengaluru, Karnataka 560024, India', 13.04, 77.59) },
+      'Rainbow Hospital': { status: 'multiple', places: [
+        at('Rainbow Children\'s Hospital', 'Marathahalli, Bengaluru, Karnataka, India', 12.95, 77.70),
+        at('Rainbow Children\'s Hospital', 'Bellary Rd, Hebbal, Bengaluru, Karnataka, India', 13.03, 77.59),
+        at('Rainbow Children\'s Hospital', 'Bannerghatta Rd, Bengaluru, Karnataka, India', 12.88, 77.60),
+      ] },
+      'Fortis Vijayanagar': { status: 'multiple', places: [
+        at('Fortis Hospital', 'Bannerghatta Rd, Bengaluru, Karnataka, India', 12.89, 77.60),
+        at('Fortis Hospital', 'Cunningham Rd, Bengaluru, Karnataka, India', 12.99, 77.59),
+      ] },
+      'Vijayanagar Bengaluru': { status: 'single', place: { name: 'Vijayanagar', address: 'Vijayanagar, Bengaluru', lat: 12.97, lng: 77.53, types: ['sublocality_level_1', 'political'] } },
+    };
+    beforeEach(() => {
+      // Like a search: case-insensitive, and "Rainbow Hospital Hebbal" still finds the Rainbow results.
+      const find = (q) => {
+        const lq = q.toLowerCase().replace('vijayanagar fortis', 'fortis vijayanagar');
+        const hit = Object.entries(places).find(([k]) => lq === k.toLowerCase()) || Object.entries(places).find(([k]) => lq.startsWith(k.toLowerCase()));
+        return hit ? hit[1] : { status: 'none' };
+      };
+      resolvePlaceFromText.mockReset(); // drop any queued once-values left by earlier tests
+      resolvePlaceFromText.mockImplementation(async (q) => find(q));
+      quoteTrip.mockResolvedValue({ fare: { grandTotal: 1450, vehicleType: 'Maruti Eeco' }, distanceKm: 9, oneWayKm: 9 });
+    });
+
+    test('ONE real location: quoted, and confirmed by its area — never "which branch"', async () => {
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Baptist Hospital', patient_at: 'home' }, ctx(AiCall.add({})));
+      expect(r).toMatchObject({ ok: true, confirm_drop: 'Bangalore Baptist Hospital, Hebbal' });
+      expect(r.say).toMatch(/one location: confirm it by its area in a few words \("Bangalore Baptist Hospital, Hebbal ಅಲ್ವಾ\?"\) — do NOT ask which branch/);
+    });
+
+    test('several real branches: ask which branch — nothing quoted yet', async () => {
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Rainbow Hospital' }, ctx(AiCall.add({})));
+      expect(r).toMatchObject({ ok: false, reason: 'clarify_places', drop: { status: 'several', options: expect.arrayContaining([expect.stringMatching(/Hebbal/)]) } });
+      expect(r.say).toMatch(/several branches: ask which branch or area/);
+      expect(quoteTrip).not.toHaveBeenCalled();
+    });
+
+    test('branches + the area the caller said: that branch, confirmed', async () => {
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Rainbow Hospital', drop_area: 'Hebbal' }, ctx(AiCall.add({})));
+      expect(r).toMatchObject({ ok: true, confirm_drop: 'Rainbow Children\'s Hospital, Hebbal' });
+    });
+
+    test('"Vijayanagar Fortis" — no Fortis in Vijayanagar: never accepted; the real branches are offered', async () => {
+      const c = ctx(AiCall.add({}));
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Fortis', drop_area: 'Vijayanagar' }, c);
+      expect(r).toMatchObject({ ok: false, reason: 'hospital_not_in_area', which: 'drop', area: 'Vijayanagar' });
+      expect(r.branches).toEqual(['1. Fortis Hospital, Bannerghatta Rd', '2. Fortis Hospital, Cunningham Rd']);
+      expect(quoteTrip).not.toHaveBeenCalled();
+      // The caller picks one: quoted to that real branch.
+      const ok = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Fortis', drop_choice: 2 }, c);
+      expect(ok).toMatchObject({ ok: true, drop: 'Fortis Hospital, Cunningham Rd, Bengaluru, Karnataka, India' });
+    });
+
+    test('the area said inside the name ("Vijayanagar Fortis") is recognised — only when Google confirms it is an area', async () => {
+      const r = await run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Vijayanagar Fortis' }, ctx(AiCall.add({})));
+      expect(r).toMatchObject({ ok: false, reason: 'hospital_not_in_area', area: 'vijayanagar' });
+    });
+
+    test('an abbreviation in the name is not mistaken for an area', async () => {
+      places['GMCH Guwahati'] = { status: 'single', place: at('Guwahati Medical College Hospital', 'Bhangagarh, Guwahati, Assam 781032, India', 26.15, 91.77) };
+      const r = await run('get_quote', { service_code: 'body_tempo', pickup: 'Jayanagar', drop: 'GMCH Guwahati' }, ctx(AiCall.add({})));
+      expect(r.ok).toBe(true);
+    });
+
+    test('instructions: hospital name + area, confirm one location, branches, not-in-area', () => {
+      const I = prompt.BASE_INSTRUCTIONS;
+      expect(I).toMatch(/Pass the hospital NAME as drop and the area they said as drop_area/);
+      expect(I).toMatch(/if it has ONE location, just confirm its area \("Bangalore Baptist Hospital, Hebbal ಅಲ್ವಾ\?"\) — never ask "which branch"/);
+      expect(I).toMatch(/hospital_not_in_area\), say so and ask which one they mean — never accept it as said/);
+    });
+  });
+
+  describe('C. the language the caller SPEAKS, not the letters', () => {
+    // Lines from a real call: Kannada speech, transcribed in Telugu letters.
+    const KANNADA_IN_TELUGU_LETTERS = ['బేలగళ నిను తుంబా రాంగ్ ఏళ్తితియా అమౌంట్? సో నిం సరిగ్గా చెక్ మాడి ఏళ్', 'ఈవత్, తూ సంఝే ఆరు గంటె బేకిదె', 'మనెల్లిదరే', 'అలా అంబులెన్సే బేకాగిరాదు'];
+    test.each(KANNADA_IN_TELUGU_LETTERS)('Kannada in Telugu letters is never taken for Telugu: "%s"', (t) => {
+      expect(['kn', null]).toContain(spoken.detect(t).lang);
+    });
+    test.each([
+      ['నాకు అంబులెన్స్ కావాలి అండి, ఇప్పుడు ఎక్కడ ఉంది?', 'te'],
+      ['எனக்கு ambulance வேணும், எவ்வளவு ஆகும் சொல்லுங்க', 'ta'],
+      ['എനിക്ക് ambulance വേണം, എത്ര ആണ്', 'ml'],
+      ['मुझे ambulance चाहिए, कितना होगा बताइए', 'hi'],
+      ['ಮೇಡಮ್ ನಂಗೆ ambulance ಬೇಕು ಇವತ್ತು ಸಂಜೆ', 'kn'],
+      ['naaku ambulance kavali andi, ippudu', 'te'],
+    ])('spoken language: "%s" -> %s', (t, lang) => expect(spoken.detect(t).lang).toBe(lang));
+    test('too little to tell: no decision', () => {
+      expect(spoken.detect('ok ok').lang).toBeNull();
+      expect(spoken.detect('Rainbow hospital Hebbal').lang).toBeNull();
+    });
+    test('instructions: reply in Telugu / Tamil / Malayalam / Hindi, not just understand', () => {
+      expect(prompt.BASE_INSTRUCTIONS).toMatch(/If the caller keeps speaking Telugu, Tamil, Malayalam or Hindi, REPLY in that language/);
+    });
   });
 });

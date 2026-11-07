@@ -64,8 +64,10 @@ const calls = require('./calls');
 const tools = require('./tools');
 const prompt = require('./prompt');
 const styleExamples = require('./styleExamples');
+const servicesKnowledge = require('./servicesKnowledge');
 const approvalWords = require('./approval');
 const { detectLanguageRequest } = require('./language');
+const spokenLanguage = require('./spokenLanguage');
 
 const OPENAI_CONNECT_TIMEOUT_MS = 10000; // socket open + session.started
 const HANGUP_AFTER_GOODBYE_MS = 8000;    // if Plivo never confirms the goodbye finished playing
@@ -274,6 +276,8 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     turns: { caller: '', assistant: '' }, turnTimer: { caller: null, assistant: null }, turnStart: { caller: 0, assistant: 0 }, turnSeq: 0,
     // Language the caller explicitly asked for (null = Kannada default / model's choice).
     language: null, cannotNoted: null, langFrom: 0,
+    // 'requested' (the caller asked) or 'detected' (spoken in 2 turns running).
+    languageSource: null, spokenTurns: [],
     // Playback clock: when Sahana's audio already sent to Plivo finishes
     // playing, and her stretches of speech (for the read-back check).
     playUntil: 0, stretches: [], stretchBreak: false, bargeIns: 0, pendingBarge: null,
@@ -287,8 +291,11 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   // This call's instructions: today's IST date (server time) and the real
   // SaveLife calls to copy the style of. Built before connecting, so
   // session.start can go the moment the socket opens.
-  const examples = await styleExamples.loadForPrompt();
-  s.instructions = prompt.buildInstructions({ now: new Date(), examples });
+  // ...and SaveLife's real services (active Pricing docs + the catalog).
+  const [examples, services] = await Promise.all([styleExamples.loadForPrompt(), servicesKnowledge.load()]);
+  s.instructions = prompt.buildInstructions({ now: new Date(), examples, services: servicesKnowledge.block(services) });
+  s.servicesFromDb = services.fromDb;
+  if (services.notes.length) console.warn(`[aiCaller] services list: ${services.notes.join('; ')}`);
   s.styleExamples = examples.length;
 
   const sendPlivo = (msg) => { try { if (plivoWs.readyState === WebSocket.OPEN) plivoWs.send(JSON.stringify(msg)); } catch { /* caller gone */ } };
@@ -319,7 +326,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     const text = s.turns[who];
     s.turns[who] = '';
     if (who === 'assistant') s.guarded.clear(); // claim guards are per spoken turn
-    else s.langFrom = 0;
+    else { s.langFrom = 0; if (text && !s.ended) onCallerTurnDone(text); }
     note(who, text);
   };
   const addFragment = (who, delta) => {
@@ -508,8 +515,9 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     const r = detectLanguageRequest(turn.slice(s.langFrom));
     if (!r) return;
     s.langFrom = turn.length;
-    if (r.lang && r.lang !== s.language) {
+    if (r.lang && (r.lang !== s.language || s.languageSource !== 'requested')) {
       s.language = r.lang;
+      s.languageSource = 'requested';
       note('system', `Caller asked for ${r.name} — language locked`);
       AiCall.updateOne({ _id: callId }, { $set: { language: r.lang, languageSource: 'requested' } }).catch(() => {});
       sendAI({ type: 'session.instructions.append', event_id: `event_lang_${r.lang}_${Date.now()}`, delegation_id: null, content: languageLock(r.lang) });
@@ -518,6 +526,30 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
       sendAI({ type: 'session.instructions.append', event_id: `event_lang_unclear_${Date.now()}`, delegation_id: null, content: `The caller says they do not understand ${r.name}. Ask ONCE, briefly, which language they want — then keep to it.` });
     }
   };
+
+  // ── Language the caller SPEAKS (spokenLanguage.js), turn by turn ──
+  // Two finished caller turns in a row in the same language (judged by the
+  // words, never the transcript's letters) and Sahana replies in it. An
+  // explicit request ("ಕನ್ನಡ ಮಾತಾಡಿ", "English please") always wins and is
+  // never overridden by detection.
+  function onCallerTurnDone(text) {
+    const { lang } = spokenLanguage.detect(text);
+    if (!lang) return;
+    s.spokenTurns.push(lang);
+    if (s.spokenTurns.length > 4) s.spokenTurns.shift();
+    if (s.languageSource === 'requested') return;
+    const [a, b] = s.spokenTurns.slice(-2);
+    if (s.spokenTurns.length < 2 || a !== b || lang === (s.language || 'kn')) return;
+    s.language = lang;
+    s.languageSource = 'detected';
+    const name = spokenLanguage.NAMES[lang];
+    note('system', `Caller is speaking ${name} — replying in ${name}`);
+    AiCall.updateOne({ _id: callId }, { $set: { language: lang, languageSource: 'detected' } }).catch(() => {});
+    sendAI({
+      type: 'session.instructions.append', event_id: `event_lang_detected_${lang}_${Date.now()}`, delegation_id: null,
+      content: `LANGUAGE: the caller is speaking ${name}. REPLY in ${name} from now on — every sentence, the quote, the read-back and the goodbye — not just understand it. Switch again only if they ask, or consistently speak another language.`,
+    });
+  }
 
   // ── Was the read-back answered with a clear yes? (tools: create_booking)
   // The read-back is Sahana's first COMPLETE stretch of speech after

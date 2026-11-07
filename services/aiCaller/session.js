@@ -37,6 +37,20 @@
  *     goodbye and hang up; otherwise a person ('time_limit');
  *   - GPT-Live dropping mid-call reconnects (MAX_AI_RECONNECTS) with the
  *     conversation so far, and the call carries on;
+ *   - BARGE-IN: GPT-Live has no "cancel response" event and audio already
+ *     sent to Plivo keeps playing, so the bridge does it: caller speech
+ *     (energy of the inbound mu-law, AI_BARGE_IN_RMS for AI_BARGE_IN_MS —
+ *     longer than a "ಹೂಂ") while Sahana is audible sends Plivo clearAudio,
+ *     and her audio is held back until the caller has been quiet for
+ *     AI_CALLER_DONE_MS. The opening (the recording notice) is never cut;
+ *   - LANGUAGE: an explicit request ("ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ", "English please")
+ *     locks the language at once (session.instructions.append) until the
+ *     caller asks again — never inferred from transcript letters;
+ *   - CLAIM GUARDS: a price before get_quote, "link sent" without a
+ *     successful WhatsApp send, or "booked" before create_booking
+ *     succeeded is cut off mid-sentence (clearAudio) and corrected;
+ *   - BOOKING APPROVAL: create_booking asks the session (ctx.approval)
+ *     whether the caller's own words after the read-back were a clear yes;
  *   - ANY failure hands off to a person. The session never transfers or
  *     hangs up through Plivo's REST API: it records the next step on the
  *     AiCall and closes the stream, and Plivo's <Redirect> after <Stream>
@@ -50,6 +64,8 @@ const calls = require('./calls');
 const tools = require('./tools');
 const prompt = require('./prompt');
 const styleExamples = require('./styleExamples');
+const approvalWords = require('./approval');
+const { detectLanguageRequest } = require('./language');
 
 const OPENAI_CONNECT_TIMEOUT_MS = 10000; // socket open + session.started
 const HANGUP_AFTER_GOODBYE_MS = 8000;    // if Plivo never confirms the goodbye finished playing
@@ -59,6 +75,12 @@ const MAX_AI_RECONNECTS = 2;             // a GPT-Live drop mid-call: reconnect 
 const RECENT_TURNS = 40;                 // conversation kept in memory, handed to a reconnected session
 const TIME_UP_GOODBYE_MS = 7000;         // time limit after a booking: the goodbye plays, then the call ends
 const MAX_TRANSCRIPT = 200;
+const VOICE_GAP_MS = 250;      // a gap this short inside caller speech does not end it
+const MAX_HOLD_MS = 8000;      // noise that never stops (traffic, a siren) cannot mute Sahana for longer
+const STRETCH_GAP_MS = 800;    // Sahana's audio closer together than this is one stretch of speech
+const OPENING_PROTECT_MAX_MS = 20000;
+const APPROVAL_WAIT_MS = 1500; // the caller's "yes" transcript may land just after the tool call
+const MAX_CALLER_FRAGMENTS = 400;
 
 // The opening, said as soon as the call connects: hello, the disclosure
 // (automated assistant, call recorded) in Kannada then English, then the
@@ -87,6 +109,62 @@ const PRICE_HOLD_LINE = 'ಒಂದು ನಿಮಿಷ, ನಿಖರ ದರ ಹ�
 const saysPrice = (text) => PRICE_WORDS.test(String(text || ''));
 const TIME_UP_BOOKED_LINE = 'ನಿಮ್ಮ ಬುಕ್ಕಿಂಗ್ ಆಗಿದೆ, ನಮ್ಮ ತಂಡ ಸ್ವಲ್ಪ ಹೊತ್ತಲ್ಲಿ ಕರೆ ಮಾಡುತ್ತಾರೆ. ಧನ್ಯವಾದಗಳು!';
 
+// "Link sent" only after send_location_request really sent it (tools set
+// state.whatsapp). After a failed / switched-off send, not even "I'll send
+// it" — Sahana asks for the address on the call instead.
+const WA_WORD = '(?:whats ?app|ವಾಟ್ಸ್ ?ಆ?ಪ್|ವಾಟ್ಸಾಪ್|ವಾಟ್ಸಪ್|ಲಿಂಕ್|\\blink\\b|ಮೆಸೇಜ್|व्हाट्सएप|व्हाट्सऐप|लिंक|వాట్సాప్|లింక్|வாட்ஸ்அப்|லிங்க்|വാട്സ്ആപ്പ്|ലിങ്ക്)';
+const WA_SENT = '(?:ಕಳಿಸಿದ್ದ|ಕಳುಹಿಸಿದ್ದ|ಕಳಿಸಿದೆ|ಕಳುಹಿಸಿದೆ|ಕಳಿಸಿದೀನಿ|ಕಳ್ಸಿದ್ದೀನಿ|ಕಳ್ಸಿದೀನಿ|\\bsent\\b|भेज दिया|भेजा है|भेज दी|పంపాను|పంపించాను|அனுப்பிட்டேன்|அனுப்பியிருக்கேன்|അയച്ചിട്ടുണ്ട്|അയച്ചു)';
+const WA_WILL = '(?:ಕಳಿಸ್ತೀನಿ|ಕಳಿಸುತ್ತೇನೆ|ಕಳುಹಿಸುತ್ತೇನೆ|ಕಳಿಸ್ತೇನೆ|ಕಳ್ಸ್ತೀನಿ|\\bsend\\b|\\bsending\\b|भेज रही|भेजती|పంపిస్తాను|పంపుతాను|அனுப்புறேன்|അയയ്ക്കാം)';
+const near = (a, b) => new RegExp(`${a}[^.?!।]{0,60}${b}|${b}[^.?!।]{0,30}${a}`, 'i');
+const WA_SENT_CLAIM = near(WA_WORD, WA_SENT);
+const WA_PROMISE = near(WA_WORD, WA_WILL);
+// "Booked" only after create_booking returned ok.
+const BOOKED_CLAIM = /ಬುಕ್ಕಿಂಗ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಆ(?:ಯ್ತು|ಗಿದೆ|ಯಿತು)|ಬುಕ್ ಮಾಡಿದ್ದ(?:ೀನಿ|ೇನೆ)|ಬುಕ್ಕಿಂಗ್ ಕನ್ಫರ್ಮ್ ಆ|booking (?:is )?(?:done|confirmed|complete)|(?:is|been|have) booked|booked (?:it|your|the)|बुकिंग हो गई|बुक हो गया|बुक हो गई|बुक कर दिया|బుక్ అయ్యింది|బుక్ చేశాను|బుకింగ్ అయింది|புக் ஆயிடுச்சு|புக் பண்ணிட்டேன்|ബുക്ക് ചെയ്തു|ബുക്കിംഗ് ആയി/i;
+const HOLD_LINE = 'ಒಂದು ನಿಮಿಷ.';
+const WHATSAPP_FAILED_LINE = 'ಕ್ಷಮಿಸಿ, WhatsApp ಕಳಿಸೋಕೆ ಆಗ್ಲಿಲ್ಲ. ನಿಮ್ಮ address ಅಥವಾ ಹತ್ತಿರದ landmark ಹೇಳಿ.';
+const NOT_BOOKED_LINE = 'ಒಂದು ನಿಮಿಷ, ಬುಕ್ಕಿಂಗ್ ಇನ್ನೂ ಖಚಿತ ಆಗಿಲ್ಲ.';
+const waFailed = (st) => st.whatsapp === 'off' || st.whatsapp === 'failed';
+
+// Things Sahana must never say before they are true. Checked on her own
+// words as they are spoken; the first hit in a spoken turn cuts her audio
+// (Plivo clearAudio) and she says the line instead.
+const GUARDS = [
+  {
+    id: 'price', what: 'a price said before get_quote', counter: 'priceGuardStops',
+    active: (st) => !st.quote, test: (t) => saysPrice(t), line: () => PRICE_HOLD_LINE,
+  },
+  {
+    id: 'whatsapp', what: 'a WhatsApp link claimed without a successful send', counter: 'claimGuardStops',
+    active: (st) => st.whatsapp !== 'sent' && st.whatsapp !== 'received',
+    test: (t, st) => WA_SENT_CLAIM.test(t) || (waFailed(st) && WA_PROMISE.test(t)),
+    line: (st) => (waFailed(st) ? WHATSAPP_FAILED_LINE : HOLD_LINE),
+    hint: 'No WhatsApp has been sent: send_location_request has not succeeded. Never say a link was sent. Ask for the address and a landmark on the call.',
+  },
+  {
+    id: 'booked', what: 'a booking claimed before create_booking succeeded', counter: 'claimGuardStops',
+    active: (st) => !st.booked, test: (t) => BOOKED_CLAIM.test(t), line: () => NOT_BOOKED_LINE,
+    hint: 'Nothing is booked: create_booking has not returned ok. Never say it is booked until it does.',
+  },
+];
+
+const BARGE_IN_NOTE = 'The caller started talking over you, so your audio was stopped — they did not hear the rest. Let them finish, then answer what they said, briefly, one question at a time. Do not repeat what they already told you.';
+
+// Decoded G.711 mu-law -> 16-bit linear, for the caller's speech level.
+const MULAW = new Int16Array(256);
+for (let i = 0; i < 256; i += 1) {
+  const u = ~i & 0xff;
+  const mag = ((((u & 0x0f) << 3) + 0x84) << ((u >> 4) & 7)) - 0x84;
+  MULAW[i] = u & 0x80 ? -mag : mag;
+}
+function frameLevel(b64) {
+  const buf = Buffer.from(String(b64 || ''), 'base64');
+  if (!buf.length) return { rms: 0, ms: 0 };
+  let sum = 0;
+  for (const b of buf) sum += MULAW[b] * MULAW[b];
+  return { rms: Math.sqrt(sum / buf.length), ms: buf.length / 8 }; // 8 kHz, one byte a sample
+}
+const audioMs = (b64) => Buffer.from(String(b64 || ''), 'base64').length / 8;
+
 // The base rules (prompt.BASE_INSTRUCTIONS); each call's instructions add
 // today's IST date with every relative day resolved, and the style
 // examples — prompt.buildInstructions, at session.start.
@@ -96,7 +174,7 @@ const INSTRUCTIONS = prompt.BASE_INSTRUCTIONS;
 const DELEGATE_INSTRUCTIONS = `
 NEVER state any price, fare or rupee amount that did not come from get_quote in this call — no estimate, no "around", no range.
 You run the tools for SaveLife's phone assistant. Use only these tools; never answer medical questions — use handoff_to_human for those, for a real medical emergency, or when the caller asks for a person. Never hand off just because the caller says "urgent".
-get_quote is the only source of prices. create_booking only after the caller clearly confirmed the read-back details (customer_confirmed true). A freezer box kept at home is never priced: freezer_box_request, then end_call follow_up.
+get_quote is the only source of prices; any change to the route (pickup, hospital or branch, service, round trip, wait) needs a new get_quote. To book: read_back_booking, the assistant reads it back and asks; create_booking ONLY after the caller's clear yes to that read-back (the server checks the caller's words) — never after "not yet" / "ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", never twice. Never say it is booked unless create_booking returned ok. Never say a WhatsApp link was sent unless send_location_request returned status sent. A freezer box kept at home is never priced: freezer_box_request (address, start time, how long), then end_call follow_up.
 Round trip / up and down / the ambulance must wait: get_quote with round_trip true and wait_hours — quote it, never hand off for it.
 Call get_quote as soon as service, pickup and drop are known; pass patient_at when known (hospital = no helper). Say the price its "say" gives (for a home pickup: without and with helper in one go). Answer extra-charge questions from that quote; do not repeat a question already answered.
 Nurse: pass nurse_needed; never quote a nurse charge (the team confirms it). Over 1000 km: two drivers are assigned.
@@ -119,6 +197,13 @@ const DISTRESS = [
   /ശ്വാസമില്ല|ശ്വാസം കിട്ടുന്നില്ല|ബോധമില്ല|ബോധം പോയി|ഹൃദയാഘാതം|നെഞ്ചുവേദന|രക്തസ്രാവം|അപസ്മാരം|bodham illa|shwasam illa/i,
 ];
 const isDistress = (text) => DISTRESS.some((re) => re.test(String(text || '')));
+
+// Sent the moment the caller asks for a language (and on a reconnect).
+const LANGUAGE_NAMES = { kn: 'Kannada', en: 'English', hi: 'Hindi', te: 'Telugu', ta: 'Tamil', ml: 'Malayalam' };
+const languageLock = (code) => {
+  const name = LANGUAGE_NAMES[code] || code;
+  return `LANGUAGE: the caller asked for ${name}. From now on speak ONLY ${name} — every sentence, including prices, the read-back and the goodbye — until the caller clearly asks for another language. Do not switch because of a few words in another language or how a transcript is spelled.`;
+};
 
 const SCRIPTS = [[/[ಀ-೿]/, 'kn'], [/[ऀ-ॿ]/, 'hi'], [/[ఀ-౿]/, 'te'], [/[஀-௿]/, 'ta'], [/[ഀ-ൿ]/, 'ml']];
 const scriptLanguage = (text) => (SCRIPTS.find(([re]) => re.test(text)) || [null, 'en'])[1];
@@ -144,7 +229,7 @@ function usageFields(u = {}) {
 
 const active = new Map(); // callId -> session (one per call)
 
-async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOpenAI }) {
+async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOpenAI, now = Date.now, approvalWaitMs = APPROVAL_WAIT_MS }) {
   if (active.has(callId)) { plivoWs.close(); return null; }
   const call = await AiCall.findById(callId).select('+phone status');
   if (!call || call.status !== 'in_progress') { plivoWs.close(); return null; }
@@ -152,9 +237,19 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
   const s = {
     callId, phone: call.phone, plivoWs, openai: null,
     streamId: null, socketOpen: false, ready: false, ended: false, ending: false,
-    state: {}, timers: [], languageSet: false, priceStopped: false,
+    state: {}, timers: [], scriptNoted: false, guarded: new Set(),
     recent: [], everReady: false, reconnects: 0,
-    turns: { caller: '', assistant: '' }, turnTimer: { caller: null, assistant: null },
+    turns: { caller: '', assistant: '' }, turnTimer: { caller: null, assistant: null }, turnStart: { caller: 0, assistant: 0 }, turnSeq: 0,
+    // Language the caller explicitly asked for (null = Kannada default / model's choice).
+    language: null, cannotNoted: null, langFrom: 0,
+    // Playback clock: when Sahana's audio already sent to Plivo finishes
+    // playing, and her stretches of speech (for the read-back check).
+    playUntil: 0, stretches: [], stretchBreak: false, bargeIns: 0,
+    // The opening (recording notice) is never cut by barge-in.
+    protect: false, openingHeard: false, protectSince: 0,
+    // Caller speech detector (in audio time, from the frames themselves).
+    vad: { voiced: 0, silence: 0, talking: false, holdMs: 0, capped: false },
+    callerFrags: [], // { at, text } — what the caller said and when (approval)
   };
   active.set(callId, s);
   // This call's instructions: today's IST date (server time) and the real
@@ -181,20 +276,23 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     AiCall.updateOne({ _id: callId }, { $push: { openaiErrors: { $each: [{ at: new Date(), code: String(code || ''), message: String(message || '').slice(0, 500) }], $slice: -20 } } }).catch(() => {});
   };
 
-  // Transcript fragments -> turns: a turn is written when that speaker goes
-  // quiet for TURN_IDLE_MS or the other speaker starts.
+  // Transcript fragments -> turns: a turn is written when THAT speaker has
+  // been quiet for TURN_IDLE_MS. The other speaker's fragments no longer
+  // end it — a "ಹೂಂ" or "ಮೇಡಮ್" over the top used to split a sentence
+  // mid-word ("ಎಬ್ಬ" / "ಳ ಆಸ್ಪತ್ರ" / "ೆಯಿಂದ" on a real call), which also
+  // hid distress words split across the pieces.
   const flushTurn = (who) => {
     clearTimeout(s.turnTimer[who]);
     s.turnTimer[who] = null;
     const text = s.turns[who];
     s.turns[who] = '';
-    if (who === 'assistant') s.priceStopped = false; // the guard is per spoken turn
+    if (who === 'assistant') s.guarded.clear(); // claim guards are per spoken turn
+    else s.langFrom = 0;
     note(who, text);
   };
   const addFragment = (who, delta) => {
     if (!delta) return '';
-    const other = who === 'caller' ? 'assistant' : 'caller';
-    if (s.turns[other]) flushTurn(other);
+    if (!s.turns[who]) s.turnStart[who] = ++s.turnSeq; // order the open turns started in
     s.turns[who] += delta;
     clearTimeout(s.turnTimer[who]);
     s.turnTimer[who] = setTimeout(() => flushTurn(who), TURN_IDLE_MS);
@@ -216,8 +314,8 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     if (s.ended) return;
     s.ended = true;
     s.timers.forEach(clearTimeout);
-    flushTurn('caller');
-    flushTurn('assistant');
+    // Open turns, oldest first.
+    ['caller', 'assistant'].sort((a, b) => s.turnStart[a] - s.turnStart[b]).forEach(flushTurn);
     active.delete(callId);
     closeOpenAI();
     try { plivoWs.close(); } catch { /* already closed */ }
@@ -254,6 +352,129 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     s.timers.push(setTimeout(cleanup, HANGUP_AFTER_GOODBYE_MS));
   };
 
+  // ── Barge-in ──────────────────────────────────────────────
+  // Sahana's audio is "audible" until the playback clock runs out (each
+  // delta is bytes/8 ms of 8 kHz mu-law). The caller talking over her for
+  // AI_BARGE_IN_MS clears Plivo's buffer; her audio is then held back
+  // until the caller has finished (AI_CALLER_DONE_MS of quiet).
+  const audible = () => now() < s.playUntil;
+  const bargeIn = () => {
+    const t = now();
+    sendPlivo({ event: 'clearAudio', streamId: s.streamId });
+    const last = s.stretches[s.stretches.length - 1];
+    if (last && last.end > t) { last.end = t; last.interrupted = true; }
+    s.playUntil = t;
+    s.bargeIns += 1;
+    AiCall.updateOne({ _id: callId }, { $inc: { bargeIns: 1 } }).catch(() => {});
+    note('system', 'Caller interrupted — assistant audio stopped');
+    sendAI({ type: 'session.thinking.append', event_id: `event_barge_${s.bargeIns}`, delegation_id: null, content: BARGE_IN_NOTE });
+  };
+  const onCallerAudio = (payload) => {
+    const { rms, ms } = frameLevel(payload);
+    if (!ms) return;
+    const v = s.vad;
+    if (s.protect && ((s.openingHeard && !audible()) || now() - s.protectSince > OPENING_PROTECT_MAX_MS)) s.protect = false;
+    if (rms >= config.bargeInRms()) {
+      v.voiced += ms;
+      v.silence = 0;
+    } else {
+      v.silence += ms;
+      if (v.silence > VOICE_GAP_MS) v.voiced = 0;
+    }
+    const done = v.silence >= config.callerDoneMs();
+    if (v.talking) {
+      v.holdMs += ms;
+      if (done) v.talking = false;
+      else if (v.holdMs >= MAX_HOLD_MS) { v.talking = false; v.capped = true; }
+      return;
+    }
+    if (v.capped) { if (done) v.capped = false; return; }
+    if (v.voiced >= config.bargeInMs()) {
+      v.talking = true;
+      v.holdMs = 0;
+      if (!s.protect && audible()) bargeIn();
+    }
+  };
+  // Sahana's audio -> Plivo, unless the caller is mid-sentence.
+  const onAssistantAudio = (delta) => {
+    if (s.vad.talking && !s.protect) return; // let the caller finish
+    const t = now();
+    const ms = audioMs(delta);
+    const last = s.stretches[s.stretches.length - 1];
+    s.playUntil = Math.max(t, s.playUntil) + ms;
+    if (!last || s.stretchBreak || t > last.end + STRETCH_GAP_MS) {
+      s.stretches.push({ start: t, end: s.playUntil, interrupted: false });
+      if (s.stretches.length > 100) s.stretches.shift();
+      s.stretchBreak = false;
+    } else {
+      last.end = s.playUntil;
+    }
+    if (s.protect) s.openingHeard = true;
+    sendPlivo({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: delta } });
+  };
+
+  // ── Claim guards (GUARDS) on Sahana's own words ───────────
+  const checkClaims = (said) => {
+    for (const g of GUARDS) {
+      if (s.guarded.has(g.id) || !g.active(s.state) || !g.test(said, s.state)) continue;
+      s.guarded.add(g.id);
+      sendPlivo({ event: 'clearAudio', streamId: s.streamId });
+      s.playUntil = now();
+      note('system', `Stopped ${g.what}: "${said.trim().slice(0, 200)}"`);
+      console.warn(`[aiCaller] ${g.what} on ${callId} — audio cleared`);
+      AiCall.updateOne({ _id: callId }, { $inc: { [g.counter]: 1 } }).catch(() => {});
+      if (g.hint) sendAI({ type: 'session.thinking.append', event_id: `event_${g.id}_hint_${Date.now()}`, delegation_id: null, content: g.hint });
+      sendAI({ type: 'session.commentary.append', event_id: `event_${g.id}_hold_${Date.now()}`, delegation_id: null, content: g.line(s.state) });
+      return;
+    }
+  };
+
+  // ── Language: only an explicit request changes it ─────────
+  // Looks only at what the caller said since the last request acted on in
+  // this turn, so "ಕನ್ನಡದಲ್ಲಿ... no, English please" switches twice.
+  const onCallerTurnText = (turn) => {
+    const r = detectLanguageRequest(turn.slice(s.langFrom));
+    if (!r) return;
+    s.langFrom = turn.length;
+    if (r.lang && r.lang !== s.language) {
+      s.language = r.lang;
+      note('system', `Caller asked for ${r.name} — language locked`);
+      AiCall.updateOne({ _id: callId }, { $set: { language: r.lang, languageSource: 'requested' } }).catch(() => {});
+      sendAI({ type: 'session.instructions.append', event_id: `event_lang_${r.lang}_${Date.now()}`, delegation_id: null, content: languageLock(r.lang) });
+    } else if (r.cannot && s.cannotNoted !== r.cannot && r.cannot === (s.language || 'kn')) {
+      s.cannotNoted = r.cannot;
+      sendAI({ type: 'session.instructions.append', event_id: `event_lang_unclear_${Date.now()}`, delegation_id: null, content: `The caller says they do not understand ${r.name}. Ask ONCE, briefly, which language they want — then keep to it.` });
+    }
+  };
+
+  // ── Was the read-back answered with a clear yes? (tools: create_booking)
+  // The read-back is Sahana's first uninterrupted stretch of speech after
+  // read_back_booking returned. Approval = the caller's words AFTER it
+  // finished playing are a clear yes, and nothing the caller said since
+  // the read-back was prepared is a no / not yet.
+  const judgeApproval = () => {
+    const p = s.state.pending;
+    if (!p) return { status: 'not_read_back' };
+    const after = s.stretches.filter((st) => st.start >= p.at);
+    const rb = after.find((st) => !st.interrupted);
+    if (!rb) return { status: after.length ? 'read_back_interrupted' : 'not_read_back' };
+    if (now() < rb.end) return { status: 'not_read_back' }; // still being read out
+    const since = s.callerFrags.filter((f) => f.at >= p.at).map((f) => f.text).join('');
+    if (approvalWords.saysNo(since)) return { status: 'no', heard: since };
+    const answer = s.callerFrags.filter((f) => f.at >= rb.end).map((f) => f.text).join('');
+    return { status: approvalWords.classify(answer), heard: answer };
+  };
+  const approval = async () => {
+    const until = Date.now() + approvalWaitMs;
+    let v = judgeApproval();
+    while (!['yes', 'no', 'read_back_interrupted'].includes(v.status) && Date.now() < until) {
+      await new Promise((r) => { setTimeout(r, 100); });
+      if (s.ended) break;
+      v = judgeApproval();
+    }
+    return v;
+  };
+
   // ── OpenAI ────────────────────────────────────────────────
   // GPT-Live dropping AFTER the session started (OpenAI closed the socket,
   // a network error) does not end the call: a fresh session is opened —
@@ -266,7 +487,8 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     'THE LINE DROPPED FOR A MOMENT AND YOU ARE BACK ON THE SAME CALL. Do NOT say the opening again. '
       + 'You have just said a short sorry; continue exactly where the conversation stopped and never ask again for anything already answered.'
       + (s.state.quote ? ' A quote was already given (get_quote ok) — read it back again if needed.' : '')
-      + (s.state.booked ? ` The booking is ALREADY made (${s.state.booked}) — do not book again; just say goodbye if nothing else is needed.` : ''),
+      + (s.state.booked ? ` The booking is ALREADY made (${s.state.booked}) — do not book again; just say goodbye if nothing else is needed.` : '')
+      + (s.language ? ` ${languageLock(s.language)}` : ''),
     `CONVERSATION SO FAR:\n${s.recent.map((t) => `${t.role === 'caller' ? 'Caller' : 'You'}: ${t.text}`).join('\n') || '(nothing yet)'}`,
   ].join('\n\n');
 
@@ -283,6 +505,8 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
     }
     s.reconnects += 1;
     s.ready = false;
+    // What was being said goes into the conversation handed to the new session.
+    ['caller', 'assistant'].filter((w) => s.turns[w]).sort((a, b) => s.turnStart[a] - s.turnStart[b]).forEach(flushTurn);
     console.warn(`[aiCaller] OpenAI dropped on ${callId}: ${why} — reconnecting (${s.reconnects}/${MAX_AI_RECONNECTS})`);
     note('system', `AI line dropped (${why}) — reconnecting`);
     AiCall.updateOne({ _id: callId }, { $inc: { aiReconnects: 1 } }).catch(() => {});
@@ -375,32 +599,34 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
             sendAI({ type: 'session.commentary.append', event_id: `event_resume_${s.reconnects}`, delegation_id: null, content: RESUME_LINE });
           } else {
             note('system', `AI session started (${config.realtimeModel()} + ${config.delegateModel()}, ${s.styleExamples} style example${s.styleExamples === 1 ? '' : 's'})`);
-            // The opening — disclosure, then "ambulance ಬೇಕಾ?": the first thing it says.
+            // The opening — disclosure, then "ambulance ಬೇಕಾ?": the first thing it
+            // says, and never cut off by barge-in (it is the recording notice).
+            s.protect = true;
+            s.protectSince = now();
             sendAI({ type: 'session.commentary.append', event_id: 'event_disclosure', delegation_id: null, content: OPENING });
           }
           break;
         case 'session.output_audio.delta':
-          if (ev.delta) sendPlivo({ event: 'playAudio', media: { contentType: 'audio/x-mulaw', sampleRate: 8000, payload: ev.delta } });
+          if (ev.delta) onAssistantAudio(ev.delta);
           break;
         case 'session.output_transcript.delta': {
           const said = addFragment('assistant', ev.delta);
-          // A price before any real quote: stop it mid-sentence.
-          if (!s.state.quote && !s.priceStopped && saysPrice(said)) {
-            s.priceStopped = true;
-            sendPlivo({ event: 'clearAudio', streamId: s.streamId });
-            note('system', `Stopped a price said before get_quote: "${said.trim().slice(0, 200)}"`);
-            console.warn(`[aiCaller] price said before get_quote on ${callId} — audio cleared`);
-            AiCall.updateOne({ _id: callId }, { $inc: { priceGuardStops: 1 } }).catch(() => {});
-            sendAI({ type: 'session.commentary.append', event_id: `event_price_hold_${Date.now()}`, delegation_id: null, content: PRICE_HOLD_LINE });
-          }
+          if (said) checkClaims(said); // a price / "link sent" / "booked" that is not true yet: stop it mid-sentence
           break;
         }
         case 'session.input_transcript.delta': {
           const turn = addFragment('caller', ev.delta);
-          if (!s.languageSet && turn.trim()) {
-            s.languageSet = true;
-            AiCall.updateOne({ _id: callId }, { $set: { language: scriptLanguage(turn) } }).catch(() => {});
+          if (ev.delta) {
+            s.callerFrags.push({ at: now(), text: ev.delta });
+            if (s.callerFrags.length > MAX_CALLER_FRAGMENTS) s.callerFrags.shift();
           }
+          // Which letters the transcript used — kept for diagnosis only; the
+          // call language changes only on an explicit request.
+          if (!s.scriptNoted && turn.trim()) {
+            s.scriptNoted = true;
+            AiCall.updateOne({ _id: callId }, { $set: { transcriptScript: scriptLanguage(turn) } }).catch(() => {});
+          }
+          onCallerTurnText(turn);
           if (isDistress(turn)) { flushTurn('caller'); await handOff('distress'); }
           break;
         }
@@ -473,8 +699,10 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
     const handler = tools.HANDLERS[item.name];
     const output = handler
-      ? await handler(args, { callId, phone: s.phone, state: s.state })
+      ? await handler(args, { callId, phone: s.phone, state: s.state, approval, now })
       : { ok: false, reason: 'unknown_tool' };
+    // The read-back is the NEXT thing she says: start a fresh stretch of speech.
+    if (item.name === 'read_back_booking' && output.ok) s.stretchBreak = true;
     note('system', `${item.name} -> ${output.ok ? 'ok' : output.reason}`);
     sendAI({ type: 'response.item.create', event_id: `event_out_${item.call_id}`, item: { type: 'function_call_output', call_id: item.call_id, output: JSON.stringify(output) } });
     sendAI({ type: 'response.create', event_id: `event_continue_${item.call_id}` });
@@ -489,6 +717,7 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
       s.streamId = msg.start?.streamId || msg.streamId || null;
     } else if (msg.event === 'media' && msg.media?.payload) {
       if (s.ready && !s.ending) sendAI({ type: 'session.input_audio.append', audio: msg.media.payload });
+      if (!s.ending) onCallerAudio(msg.media.payload);
     } else if (msg.event === 'playedStream' && msg.name === 'goodbye') {
       cleanup();
     } else if (msg.event === 'stop') {
@@ -503,6 +732,6 @@ async function createSession({ callId, plivoWs, connectOpenAI = defaultConnectOp
 
 module.exports = {
   createSession, INSTRUCTIONS, DELEGATE_INSTRUCTIONS, DISCLOSURE_KN, DISCLOSURE_EN, OPENING, RESUME_LINE, TIME_UP_BOOKED_LINE,
-  PRICE_HOLD_LINE, saysPrice,
+  PRICE_HOLD_LINE, saysPrice, HOLD_LINE, WHATSAPP_FAILED_LINE, NOT_BOOKED_LINE, BARGE_IN_NOTE, languageLock, frameLevel,
   MAX_AI_RECONNECTS, isDistress, scriptLanguage, _active: active,
 };

@@ -53,12 +53,18 @@ const AiCallSchema = new mongoose.Schema(
       nurse      : { type: Boolean },          // asked for a nurse (charge confirmed by the team)
       specialCare: { type: String, maxlength: 300 },
       twoDrivers : { type: Boolean },          // over 1000 km one way
+      pickupDetails: { type: String, maxlength: 200 }, // home pickup: house / street / landmark
+      appointmentAt: { type: Date },           // hospital appointment — NOT the pickup time (Trip.scheduleDate)
+      freezerBox   : { type: Boolean },        // body transport: a freezer box too (team confirms the charge)
     },
     // A request the team prices and calls back about (not bookable here).
     request: {
       type: { type: String, enum: ['freezer_box'] },
       area: { type: String, maxlength: 200 },
+      address: { type: String, maxlength: 300 }, // delivery address for a box kept at home
+      startAt: { type: Date },                   // from when
       days: { type: Number },
+      hours: { type: Number },                   // instead of days, if less than a day
       at  : { type: Date },
     },
     // The pickup the caller shared on WhatsApp during the call
@@ -70,7 +76,12 @@ const AiCallSchema = new mongoose.Schema(
       at     : Date,
     },
 
+    // The call language. Set only when the caller explicitly asks for one
+    // (languageSource 'requested'); transcriptScript is just which letters
+    // the first transcript used — Kannada has come back in Telugu letters.
     language  : { type: String },
+    languageSource  : { type: String, enum: ['requested'] },
+    transcriptScript: { type: String },
     transcript: [{
       _id : false,
       role: { type: String, enum: ['assistant', 'caller', 'system'] },
@@ -104,6 +115,10 @@ const AiCallSchema = new mongoose.Schema(
     aiReconnects: { type: Number, default: 0 },
     // Times the assistant began saying a price before get_quote and was cut off (session.js).
     priceGuardStops: { type: Number, default: 0 },
+    // Times "link sent" / "booked" was said before it was true and cut off (session.js).
+    claimGuardStops: { type: Number, default: 0 },
+    // Times the caller spoke over the assistant and her audio was stopped (session.js).
+    bargeIns: { type: Number, default: 0 },
 
     error: { type: String, maxlength: 500 },
     // Why the OpenAI side ended, as OpenAI said it — handshake HTTP status,

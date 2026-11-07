@@ -105,6 +105,16 @@ const delegateModel = () => process.env.AI_DELEGATE_MODEL || 'gpt-6-luna';
 const realtimeVoice = () => process.env.AI_REALTIME_VOICE || 'marin';
 const liveUrl = () => process.env.AI_LIVE_WS_URL || 'wss://api.openai.com/v1/live/sessions';
 
+// Barge-in (session.js): the caller talking over Sahana stops her audio.
+// Caller speech = inbound frames louder than AI_BARGE_IN_RMS (16-bit RMS of
+// the decoded mu-law) for AI_BARGE_IN_MS — long enough that a backchannel
+// ("ಹೂಂ", "ಆ", "ಮೇಡಮ್") does not cut her off. The caller has finished after
+// AI_CALLER_DONE_MS of quiet. Tunable on Render without a deploy.
+const bounded = (v, def, min, max) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.min(Math.max(n, min), max) : def; };
+const bargeInRms = () => bounded(process.env.AI_BARGE_IN_RMS, 900, 100, 8000);
+const bargeInMs = () => bounded(process.env.AI_BARGE_IN_MS, 600, 200, 2000);
+const callerDoneMs = () => bounded(process.env.AI_CALLER_DONE_MS, 700, 300, 3000);
+
 // ── Rough cost — rates from env only, never hardcoded ───────
 // AI_COST_*_USD_PER_1M: OpenAI Realtime price per 1M tokens of each kind.
 // AI_COST_USD_TO_INR: exchange rate. AI_COST_PLIVO_PAISE_PER_MIN: Plivo's
@@ -141,5 +151,6 @@ function estimateCostPaise(usage = {}, durationSec = 0) {
 module.exports = {
   envEnabled, allowlist, isAllowlisted, toggleEnabled, missingConfig, contactedUsVia,
   activeCall, checkCanCall, maxCallSeconds, realtimeModel, delegateModel, realtimeVoice, liveUrl,
+  bargeInRms, bargeInMs, callerDoneMs,
   costRates, estimateCostPaise, ACTIVE_STATES,
 };

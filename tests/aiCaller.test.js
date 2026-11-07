@@ -381,14 +381,19 @@ const fnCall = (name, args, id = 'c1') => ({
   event: { type: 'response.output_item.done', item: { type: 'function_call', call_id: id, name, arguments: JSON.stringify(args) } },
 });
 
+// 8 kHz mu-law: `ms` of silence (0xFF) or of loud speech (0x00 = full scale).
+const muLaw = (ms, loud) => Buffer.alloc(Math.round(ms * 8), loud ? 0x00 : 0xff).toString('base64');
+
 describe('STEP 2C. the conversation (GPT-Live)', () => {
   let callId; let plivoWs; let ai;
+  // The session's clock (playback, read-back timing) — moved by hand.
+  const clock = { t: 1700000000000 };
   const begin = async ({ started = true } = {}) => {
     const created = await AiCall.create({ phone: TEST_NO, status: 'in_progress', plivoCallUuid: 'uuid-1' });
     callId = String(created._id);
     plivoWs = new FakeSocket(1);
     ai = new FakeSocket(0);
-    await session.createSession({ callId, plivoWs, connectOpenAI: () => ai });
+    await session.createSession({ callId, plivoWs, connectOpenAI: () => ai, now: () => clock.t, approvalWaitMs: 0 });
     plivoWs.push({ event: 'start', start: { streamId: 'st-1' } });
     ai.open();
     if (started) ai.push({ type: 'session.started', session: { id: 'sess_1' } });
@@ -413,7 +418,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
       audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
       delegation: { type: 'responses', responses: { model: 'gpt-6-luna', instructions: session.DELEGATE_INSTRUCTIONS, tool_choice: 'auto' } },
     });
-    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'create_booking', 'send_location_request', 'freezer_box_request', 'handoff_to_human', 'end_call']);
+    expect(start.session.delegation.responses.tools.map((t) => t.name)).toEqual(['get_quote', 'read_back_booking', 'create_booking', 'send_location_request', 'freezer_box_request', 'handoff_to_human', 'end_call']);
     // Each call's instructions carry today's date in IST (server time).
     expect(start.session.instructions).toMatch(/DATE AND TIME — right now it is \w+day \d{1,2} \w+ 20\d\d, \d\d:\d\d India time \(IST\)/);
     // Nothing is sent before session.started — not even audio.
@@ -487,6 +492,14 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(ai.of('response.create')).toHaveLength(1); // the backend response is continued explicitly
     expect(quoteTrip).toHaveBeenCalledWith(expect.objectContaining({ selectedType: 'bls', tripType: 'one_way', pickupLat: 12.93 }));
 
+    // Read back, Sahana says it (1 s of audio), it finishes playing, the caller says yes.
+    ai.push(fnCall('read_back_booking', { when: 'now', patient_name: 'Lakshmi' }, 'call_r'));
+    await flush();
+    expect(JSON.parse(ai.of('response.item.create')[1].item.output)).toMatchObject({ ok: true, summary: expect.stringMatching(/Pickup: Jayanagar, Bengaluru\. Drop: Victoria Hospital, Bengaluru\. Pickup time: now\..*Fare: ₹1450 \(estimate\)/) });
+    clock.t += 50;
+    ai.push({ type: 'session.output_audio.delta', delta: muLaw(1000, false) });
+    clock.t += 1200;
+    ai.push({ type: 'session.input_transcript.delta', delta: 'ಹೌದು, ಬುಕ್ ಮಾಡಿ' });
     ai.push(fnCall('create_booking', { patient_name: 'Lakshmi', when: 'now', customer_confirmed: true }, 'call_b'));
     await flush();
     const [body, opts] = createBookedTrip.mock.calls[0];
@@ -494,7 +507,7 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(body).toMatchObject({ patientName: 'Lakshmi', patientPhone: TEST_NO, selectedType: 'bls', pickupLat: 12.93, scheduleType: 'now', effectiveDist: 6.2 });
     expect(bookingPush.notifyIncomingBooking).toHaveBeenCalledWith('trip1');
     expect(call()).toMatchObject({ trip: 'trip1', outcome: 'booked' });
-    expect(JSON.parse(ai.of('response.item.create')[1].item.output)).toMatchObject({ ok: true, trip_number: 'TRP-1' });
+    expect(JSON.parse(ai.of('response.item.create')[2].item.output)).toMatchObject({ ok: true, trip_number: 'TRP-1', say: expect.stringMatching(/"ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು".*the team will call shortly to confirm the ambulance/) });
   });
 
   test('no booking without a quote or without a clear yes', async () => {
@@ -830,6 +843,258 @@ describe('STEP 2C. the conversation (GPT-Live)', () => {
     expect(session.INSTRUCTIONS).toMatch(/"ಒಂದು ನಿಮಿಷ, ನಿಖರ ದರ ಹೇಳ್ತೀನಿ"/);
     expect(session.DELEGATE_INSTRUCTIONS).toMatch(/NEVER state any price, fare or rupee amount that did not come from get_quote/);
     expect(session.INSTRUCTIONS).toMatch(/KEEP TRACK — before every question, check what the caller has already told you/);
+  });
+
+  // ── Turns, barge-in, language, claims, booking approval ──
+  // Sahana speaks `ms` of audio; the caller sends `ms` of audio in 20 ms frames.
+  const sahanaSays = (ms) => ai.push({ type: 'session.output_audio.delta', delta: muLaw(ms, false) });
+  const callerAudio = (ms, loud) => { for (let i = 0; i < ms; i += 20) plivoWs.push({ event: 'media', media: { payload: muLaw(20, loud) } }); };
+  const callerSays = (text) => ai.push({ type: 'session.input_transcript.delta', delta: text });
+  // The opening plays to the end (it is never cut), then normal rules apply.
+  const pastOpening = () => { sahanaSays(2000); clock.t += 2100; callerAudio(20, false); };
+  const outputs = () => ai.of('response.item.create').map((m) => JSON.parse(m.item.output));
+  const quoteRoute = async (drop = 'Victoria Hospital', id = 'q1') => {
+    resolvePlaceFromText.mockImplementation(async (q) => ({ status: 'single', place: { name: q, address: 'Bengaluru', lat: q === 'Jayanagar' ? 12.93 : 12.96, lng: 77.58 } }));
+    quoteTrip.mockResolvedValue({ oneWayKm: 6.2, distanceKm: 6.2, fare: { grandTotal: 1450 } });
+    createBookedTrip.mockResolvedValue({ _id: 'trip1', tripNumber: 'TRP-1', estimatedFare: 1450 });
+    ai.push(fnCall('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop, patient_at: 'hospital' }, id));
+    await flush();
+  };
+  // read_back_booking, then Sahana reads it out (1.5 s) and it finishes playing.
+  const readBack = async (id = 'r1') => {
+    ai.push(fnCall('read_back_booking', { when: 'now' }, id));
+    await flush();
+    clock.t += 20;
+    sahanaSays(1500);
+    clock.t += 1600;
+  };
+
+  test('caller interrupts with a location correction: Sahana stops at once, stays quiet until they finish', async () => {
+    await begin();
+    pastOpening();
+    sahanaSays(3000);           // "...pickup Jayanagar ಅಲ್ವಾ? ಮತ್ತೆ ಯಾವ ಆಸ್ಪತ್ರೆ..."
+    clock.t += 500;             // half a second in, still playing
+    const played = plivoWs.of('playAudio').length;
+    callerAudio(700, true);     // "ಇಲ್ಲ ಇಲ್ಲ, JP Nagar..."
+    expect(plivoWs.of('clearAudio')).toEqual([{ event: 'clearAudio', streamId: 'st-1' }]);
+    expect(ai.of('session.thinking.append').map((m) => m.content)).toEqual([session.BARGE_IN_NOTE]);
+    await flush();
+    expect(call().bargeIns).toBe(1);
+    // The rest of the old answer (or a reply jumping in) is not played while they talk.
+    sahanaSays(400);
+    expect(plivoWs.of('playAudio')).toHaveLength(played);
+    callerSays('ಇಲ್ಲ, Jayanagar ಅಲ್ಲ, JP Nagar 6th phase');
+    callerAudio(600, true);
+    callerAudio(700, false);    // finished
+    sahanaSays(400);            // her reply to the correction
+    expect(plivoWs.of('playAudio')).toHaveLength(played + 1);
+    expect(plivoWs.of('clearAudio')).toHaveLength(1);
+  });
+
+  test('a backchannel ("ಹೂಂ") does not cut her off; the opening (recording notice) is never cut', async () => {
+    await begin();
+    sahanaSays(4000);           // the opening
+    clock.t += 300;
+    callerAudio(900, true);     // "ಹಲೋ ಹಲೋ" over the opening
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+    callerAudio(800, false);
+    clock.t += 4000;
+    callerAudio(20, false);     // opening over
+    sahanaSays(3000);
+    clock.t += 200;
+    callerAudio(300, true);     // "ಹೂಂ"
+    callerAudio(400, false);
+    expect(plivoWs.of('clearAudio')).toHaveLength(0);
+  });
+
+  test('a short pause no longer splits a sentence into pieces in the transcript', async () => {
+    await begin();
+    callerSays('ಮೇಡಮ್ ಎಬ್ಬಳ ಆಸ್ಪತ್ರೆಯಿಂದ');
+    ai.push({ type: 'session.output_transcript.delta', delta: 'ಸರಿ' });   // she says "ಸರಿ" in the pause
+    callerSays(' ದಾವಣಗೆರೆಗೆ ಹೋಗಬೇಕು');
+    plivoWs.close();
+    await flush();
+    const turns = call().transcript.filter((t) => t.role !== 'system').map((t) => `${t.role}: ${t.text}`);
+    expect(turns).toEqual(['caller: ಮೇಡಮ್ ಎಬ್ಬಳ ಆಸ್ಪತ್ರೆಯಿಂದ ದಾವಣಗೆರೆಗೆ ಹೋಗಬೇಕು', 'assistant: ಸರಿ']);
+  });
+
+  test('"ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ" / "English please" switch at once and stick; transcript letters never switch it', async () => {
+    await begin();
+    callerSays('ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ');
+    await flush();
+    let appended = ai.of('session.instructions.append').map((m) => m.content);
+    expect(appended).toEqual([expect.stringMatching(/the caller asked for Kannada\. From now on speak ONLY Kannada .* until the caller clearly asks for another language/)]);
+    expect(call()).toMatchObject({ language: 'kn', languageSource: 'requested' });
+    // Kannada speech that the transcriber wrote in Telugu letters: no switch.
+    plivoWs.push({ event: 'media', media: { payload: muLaw(20, false) } });
+    callerSays(' మనెల్లిదరే, మహాలక్ష్మి లేఅవుట్');
+    await flush();
+    expect(ai.of('session.instructions.append')).toHaveLength(1);
+    expect(call().language).toBe('kn');
+    callerSays(' sorry, English please');
+    await flush();
+    appended = ai.of('session.instructions.append').map((m) => m.content);
+    expect(appended[1]).toMatch(/speak ONLY English/);
+    expect(call().language).toBe('en');
+    callerSays(' ok English, Jayanagar');   // naming it again changes nothing
+    await flush();
+    expect(ai.of('session.instructions.append')).toHaveLength(2);
+  });
+
+  test('the first transcript\'s letters are kept only as a diagnostic, never as the call language', async () => {
+    await begin();
+    callerSays('మనెల్లిదరే');
+    await flush();
+    expect(call().transcriptScript).toBe('te');
+    expect(call().language).toBeUndefined();
+  });
+
+  test('WhatsApp off: "ಲಿಂಕ್ ಕಳಿಸ್ತೀನಿ" is cut off and she asks for the address on the call', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      delete process.env.WA_CALL_LOCATION_ENABLED;
+      ai.push(fnCall('send_location_request', {}, 'w1'));
+      await flush();
+      expect(outputs()[0]).toMatchObject({ ok: false, status: 'not_sent', reason: 'whatsapp_off', say: expect.stringMatching(/WhatsApp was NOT sent.*Ask on the call for the address/) });
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಸರಿ, ಮೊದಲು WhatsApp ನಲ್ಲಿ ಲೊಕೇಶನ್ ಲಿಂಕ್ ಕಳಿಸುತ್ತೇನೆ' });
+      await flush();
+      expect(plivoWs.of('clearAudio')).toHaveLength(1);
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.WHATSAPP_FAILED_LINE);
+      expect(call().claimGuardStops).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('"ಲಿಂಕ್ ಕಳಿಸಿದ್ದೇನೆ" only after a successful send', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ನಿಮಗೆ ಲಿಂಕ್ ಕಳಿಸಿದ್ದೇನೆ' }); // never sent
+      await flush();
+      expect(plivoWs.of('clearAudio')).toHaveLength(1);
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.HOLD_LINE);
+      session._active.get(callId).guarded.clear();         // next spoken turn
+      session._active.get(callId).state.whatsapp = 'sent'; // send_location_request returned sent
+      ai.push({ type: 'session.output_transcript.delta', delta: ' ಲಿಂಕ್ ಕಳಿಸಿದ್ದೇನೆ, location share ಮಾಡಿ' });
+      await flush();
+      expect(plivoWs.of('clearAudio')).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('"ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ" creates ZERO bookings — even if the model claims customer_confirmed', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    await readBack();
+    callerSays('ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ, ನಮ್ಮ ಅಣ್ಣನ ಹತ್ರ ಕೇಳ್ತೀನಿ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'caller_said_no', say: expect.stringMatching(/Do NOT book and do NOT say it is booked/) });
+    // A later "ok" without a fresh read-back still books nothing.
+    callerSays(' ಸರಿ ಓಕೆ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+    expect(call().trip).toBeUndefined();
+  });
+
+  test('explicit approval creates exactly ONE booking — retries and duplicate calls never make a second', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    await readBack();
+    callerSays('ಹೌದು ಮೇಡಮ್, ಬುಕ್ ಮಾಡಿ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2')); // a duplicate, while the first is in flight
+    await flush(10);
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b3')); // a retry afterwards
+    await flush();
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+    const results = outputs().slice(-3);
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    expect(results.filter((r) => r.reason === 'already_booked')).toHaveLength(2);
+    expect(call()).toMatchObject({ trip: 'trip1', outcome: 'booked' });
+  });
+
+  test('a "ಹೌದು" said while the read-back is still playing is not approval; an unclear answer books nothing', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(3000);
+    clock.t += 1000;
+    callerSays('ಹೌದು');                      // a backchannel mid-read-back
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_not_read_back' });
+    clock.t += 2500;                          // read-back over
+    callerSays(' ಎಷ್ಟು ಹೊತ್ತಲ್ಲಿ ಬರುತ್ತೆ?');   // a question, not a yes
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_unclear' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('the caller cutting into the read-back means it must be read again', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute();
+    ai.push(fnCall('read_back_booking', { when: 'now' }, 'r1'));
+    await flush();
+    clock.t += 20;
+    sahanaSays(3000);
+    clock.t += 800;
+    callerAudio(700, true);                    // talks over it
+    callerAudio(700, false);
+    callerSays('ಹೌದು ಹೌದು ಮಾಡಿ');
+    clock.t += 3000;
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'approval_read_back_interrupted' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('a changed hospital branch: new get_quote voids the old read-back; the new route is read back and booked', async () => {
+    await begin();
+    pastOpening();
+    await quoteRoute('Rainbow Hospital Marathahalli');
+    await readBack();
+    callerSays('ಇಲ್ಲ, Hebbal Rainbow');
+    clock.t += 3000;
+    await quoteRoute('Rainbow Hospital Hebbal', 'q2');
+    callerSays(' ಹೌದು ಮಾಡಿ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b1'));
+    await flush();
+    expect(outputs().at(-1)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    await readBack('r2');
+    expect(outputs().at(-1).summary).toMatch(/Drop: Rainbow Hospital Hebbal, Bengaluru/);
+    callerSays('ಹೌದು, ಮಾಡಿ');
+    ai.push(fnCall('create_booking', { when: 'now', customer_confirmed: true }, 'b2'));
+    await flush();
+    expect(createBookedTrip).toHaveBeenCalledTimes(1);
+    expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ dropLabel: 'Rainbow Hospital Hebbal, Bengaluru' });
+  });
+
+  test('"ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು" before create_booking succeeded is cut off and corrected', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await begin();
+      await quoteRoute();
+      ai.push({ type: 'session.output_transcript.delta', delta: 'ಸರಿ, ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು' });
+      await flush();
+      expect(plivoWs.of('clearAudio')).toHaveLength(1);
+      expect(ai.of('session.commentary.append').map((m) => m.content)).toContain(session.NOT_BOOKED_LINE);
+      expect(createBookedTrip).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test('time limit after a booking: a goodbye and hang up — not a handoff', async () => {

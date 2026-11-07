@@ -210,8 +210,9 @@ describe('B. conversation rules', () => {
   });
   test('nearest hospital accepted; freezer box one simple question; patient needs; Telugu; opening', () => {
     expect(I).toMatch(/nearest hospital \("ಹತ್ತಿರದ ಆಸ್ಪತ್ರೆ"\), say OK and do NOT insist on a name/);
-    expect(I).toMatch(/FREEZER BOX: ask ONE simple question/);
-    expect(I).toMatch(/Box at home: ask only the AREA and for HOW MANY DAYS/);
+    expect(I).toMatch(/FREEZER BOX: when the caller says freezer box, ice box or ಶವ ಪೆಟ್ಟಿಗೆ, FIRST ask this one question: "ಫ್ರೀಜರ್ ಬಾಕ್ಸ್ ಮನೆಯಲ್ಲಿ ಇಡಲು ಬೇಕಾ, ಅಥವಾ ಪಾರ್ಥಿವ ಶರೀರವನ್ನು ವಾಹನದಲ್ಲಿ ಸಾಗಿಸಲು ಬೇಕಾ\?"/);
+    expect(I).toMatch(/Box at home: ask the delivery ADDRESS \(with a landmark\), from WHEN it is needed \(start time\), and for HOW LONG/);
+    expect(I).toMatch(/Body transport by vehicle: ask the pickup, the destination and the date and time, and whether they ALSO need a freezer box/);
     expect(I).toMatch(/oxygen/);
     expect(I).toMatch(/helper/);
     expect(I).toMatch(/Prioritise Kannada, English, Hindi, Telugu, Tamil and Malayalam/);
@@ -241,8 +242,16 @@ describe('B. conversation rules', () => {
 
 // ============================================================
 describe('C. tools', () => {
-  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {} });
+  // approval: what the session reports about the caller's own answer to
+  // the read-back — a clear yes here (the gate itself is tested in D).
+  const ctx = (call) => ({ callId: call._id, phone: '9876543210', state: {}, approval: async () => ({ status: 'yes', heard: 'ಹೌದು' }) });
   const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  // Read back, the caller's yes, then book.
+  const confirmAndBook = async (c, readBack, extra = {}) => {
+    const rb = await run('read_back_booking', readBack, c);
+    if (!rb.ok) return rb;
+    return run('create_booking', { customer_confirmed: true, ...extra }, c);
+  };
   const single = (name, lat, lng) => ({ status: 'single', place: { name, address: 'Bengaluru', lat, lng } });
 
   beforeEach(() => {
@@ -298,15 +307,14 @@ describe('C. tools', () => {
     expect(q).toMatchObject({ fare_without_helper_rupees: 1450, fare_with_helper_rupees: 1750, helper_extra_rupees: 300, estimated_fare_rupees: 1450 });
     expect(q.say).toMatch(/Quote both in one go: without helper ₹1450; with helper ₹1750\./);
     expect(q.say).toMatch(/Then ask if they want to book/);
-    const r = await run('create_booking', {
-      patient_name: 'Lakshmi', when: 'now', customer_confirmed: true, helper_needed: true,
-      patient_condition: 'fell at home, hip pain', oxygen_needed: false, patient_at: 'home',
-    }, c);
+    const r = await confirmAndBook(c, { when: 'now', helper_needed: true, patient_at: 'home', pickup_details: '12 Main Rd, near Ganesha temple' }, {
+      patient_name: 'Lakshmi', patient_condition: 'fell at home, hip pain', oxygen_needed: false, patient_at: 'home',
+    });
     expect(r.ok).toBe(true);
     expect(quoteTrip).toHaveBeenCalledTimes(2); // no re-quote
-    expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ helperEnabled: true });
+    expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ helperEnabled: true, pickupLabel: '12 Main Rd, near Ganesha temple, A, Bengaluru' });
     expect(createBookedTrip.mock.calls[0][1]).toEqual({ bookingSource: 'ai_telecaller' });
-    expect(call.needs).toEqual({ condition: 'fell at home, hip pain', oxygen: false, helper: true, patientAt: 'home' });
+    expect(call.needs).toEqual({ condition: 'fell at home, hip pain', oxygen: false, helper: true, patientAt: 'home', pickupDetails: '12 Main Rd, near Ganesha temple' });
   });
 
   test('the caller already said no helper: quoted without, "+₹X if you want a helper"', async () => {
@@ -328,7 +336,7 @@ describe('C. tools', () => {
     expect(q).toMatchObject({ helper: false, helper_offered: false, estimated_fare_rupees: 1450 });
     expect(q).not.toHaveProperty('fare_with_helper_rupees');
     expect(q.say).toMatch(/The patient is at a hospital: do NOT ask about a helper/);
-    await run('create_booking', { when: 'now', customer_confirmed: true, helper_needed: true }, c);
+    expect((await confirmAndBook(c, { when: 'now', helper_needed: true })).ok).toBe(true);
     expect(createBookedTrip.mock.calls[0][0].helperEnabled).toBeUndefined();
     expect(call.needs).toMatchObject({ helper: false, patientAt: 'hospital' });
   });
@@ -351,7 +359,7 @@ describe('C. tools', () => {
     const q = await run('get_quote', { service_code: 'als_tempo', pickup: 'A', drop: 'Delhi', patient_at: 'hospital' }, c);
     expect(q).toMatchObject({ two_drivers: true, long_trip: true, estimated_fare_rupees: 52000 });
     expect(q.say).toMatch(/Over 1000 km: tell the caller two drivers are assigned/);
-    await run('create_booking', { when: 'now', customer_confirmed: true, nurse_needed: true, special_care: 'ventilator, suction' }, c);
+    await confirmAndBook(c, { when: 'now' }, { nurse_needed: true, special_care: 'ventilator, suction' });
     expect(call.needs).toMatchObject({ twoDrivers: true, nurse: true, specialCare: 'ventilator, suction' });
   });
 
@@ -362,8 +370,8 @@ describe('C. tools', () => {
     const q = await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B', patient_at: 'hospital', nurse_needed: true }, c);
     expect(q.estimated_fare_rupees).toBe(1450);
     expect(q.say).toMatch(/no nurse charge in our price list — say the team will confirm the nurse charge; do not quote one/);
-    const r = await run('create_booking', { when: 'now', customer_confirmed: true, nurse_needed: true }, c);
-    expect(r.say).toMatch(/the team will confirm the nurse and its charge/);
+    const r = await confirmAndBook(c, { when: 'now' }, { nurse_needed: true });
+    expect(r.say).toMatch(/the team will call shortly to confirm the ambulance \(it is not assigned yet\) and the nurse and its charge/);
     expect(call.needs.nurse).toBe(true);
   });
 
@@ -371,21 +379,24 @@ describe('C. tools', () => {
     const c = ctx(AiCall.add({}));
     resolvePlaceFromText.mockResolvedValueOnce(single('A', 1, 2)).mockResolvedValueOnce(single('B', 3, 4));
     await run('get_quote', { service_code: 'bls', pickup: 'A', drop: 'B' }, c);
-    const r = await run('create_booking', { when: 'later', scheduled_time: '2020-01-01 10:00', customer_confirmed: true }, c);
+    const r = await confirmAndBook(c, { when: 'later', scheduled_time: '2020-01-01 10:00' });
     expect(r).toMatchObject({ ok: false, reason: 'past_time' });
     expect(createBookedTrip).not.toHaveBeenCalled();
   });
 
-  test('freezer box at home: area + days recorded for a callback, never priced', async () => {
+  test('freezer box at home: delivery address + start time + duration recorded for a callback, never priced', async () => {
     const call = AiCall.add({});
     const c = ctx(call);
-    expect(await run('freezer_box_request', { area: '', days: 2 }, c)).toMatchObject({ ok: false, reason: 'need_area' });
-    expect(await run('freezer_box_request', { area: 'Basavanagudi', days: 0 }, c)).toMatchObject({ ok: false, reason: 'need_days' });
-    const r = await run('freezer_box_request', { area: 'Basavanagudi', days: 3 }, c);
+    expect(await run('freezer_box_request', { start_time: 'now', days: 2 }, c)).toMatchObject({ ok: false, reason: 'need_address' });
+    expect(await run('freezer_box_request', { address: '4th Cross, Basavanagudi', days: 2 }, c)).toMatchObject({ ok: false, reason: 'need_start' });
+    expect(await run('freezer_box_request', { address: '4th Cross, Basavanagudi', start_time: 'now', days: 0 }, c)).toMatchObject({ ok: false, reason: 'need_duration' });
+    expect(await run('freezer_box_request', { address: '4th Cross, Basavanagudi', start_time: '2020-01-01 10:00', days: 2 }, c)).toMatchObject({ ok: false, reason: 'past_time' });
+    const r = await run('freezer_box_request', { address: '4th Cross, Basavanagudi, near BMS College', start_time: '2099-01-02 18:00', days: 3 }, c);
     expect(r.ok).toBe(true);
     expect(r.say).toMatch(/call back/);
-    expect(call.request).toMatchObject({ type: 'freezer_box', area: 'Basavanagudi', days: 3 });
+    expect(call.request).toMatchObject({ type: 'freezer_box', address: '4th Cross, Basavanagudi, near BMS College', days: 3, startAt: new Date('2099-01-02T12:30:00Z') });
     expect(quoteTrip).not.toHaveBeenCalled();
+    expect(createBookedTrip).not.toHaveBeenCalled();
   });
 
   test('send_location_request: WhatsApp off -> just ask the area; on -> sent for this AI call', async () => {
@@ -432,7 +443,7 @@ describe('C. tools', () => {
       const call = AiCall.add({});
       const c = ctx(call);
       await quoteRT(c, { round_trip: true, wait_hours: 1.5 });
-      expect((await run('create_booking', { when: 'now', customer_confirmed: true }, c)).ok).toBe(true);
+      expect((await confirmAndBook(c, { when: 'now' })).ok).toBe(true);
       expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ tripType: 'round_trip', returnAddress: 'Jayanagar, Bengaluru', dist: 8, effectiveDist: 16 });
       expect(call.needs).toMatchObject({ roundTrip: true, waitHours: 1.5 });
     });
@@ -710,5 +721,153 @@ describe('E. style examples from real calls', () => {
       expect(body.instructions).toMatch(/DATE AND TIME — right now it is/);
       expect(body.instructions).toMatch(/Caller: Jayanagar, call ••••••2345/);
     });
+  });
+});
+
+// ============================================================
+describe('F. read-back, approval, schedule, freezer flows, language', () => {
+  const approve = (status) => async () => ({ status, heard: '' });
+  const ctx = (call, status = 'yes') => ({ callId: call._id, phone: '9876543210', state: {}, approval: approve(status) });
+  const run = (name, args, c) => tools.HANDLERS[name](args, c);
+  const single = (name, lat, lng) => ({ status: 'single', place: { name, address: 'Bengaluru', lat, lng } });
+  const quote = (c, args = {}) => {
+    resolvePlaceFromText.mockResolvedValueOnce(single('Jayanagar', 1, 2)).mockResolvedValueOnce(single('Narayana Health', 3, 4));
+    return run('get_quote', { service_code: 'bls', pickup: 'Jayanagar', drop: 'Narayana Health', ...args }, c);
+  };
+  beforeEach(() => {
+    quoteTrip.mockResolvedValue({ fare: { grandTotal: 1450 }, distanceKm: 4.2, oneWayKm: 4.2 });
+    createBookedTrip.mockResolvedValue({ _id: 'trip1', tripNumber: 'TRP-1', estimatedFare: 1450 });
+  });
+
+  test('home pickup at 6:00 PM, hospital appointment at 6:30 PM: kept separate in the read-back, the booking and the record', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await quote(c, { patient_at: 'home' });
+    const rb = await run('read_back_booking', {
+      when: 'later', scheduled_time: '2099-01-02 18:00', appointment_time: '2099-01-02 18:30',
+      patient_at: 'home', pickup_details: '42, 3rd Main, near Vijaya Bank',
+    }, c);
+    expect(rb.ok).toBe(true);
+    expect(rb.summary).toMatch(/Pickup: 42, 3rd Main, near Vijaya Bank, Jayanagar, Bengaluru\. Drop: Narayana Health, Bengaluru\. Pickup time: \w{3} 2 Jan, 6:00 PM\. Hospital appointment: \w{3} 2 Jan, 6:30 PM \(separate from the pickup time\)\./);
+    expect(rb.say).toMatch(/separately, the appointment time/);
+    expect(rb.say).toMatch(/It is NOT booked yet/);
+    expect((await run('create_booking', { customer_confirmed: true }, c)).ok).toBe(true);
+    expect(createBookedTrip.mock.calls[0][0]).toMatchObject({ scheduleType: 'later', scheduleDate: '2099-01-02T18:00' });
+    expect(call.needs.appointmentAt).toEqual(new Date('2099-01-02T13:00:00Z')); // 18:30 IST
+  });
+
+  test('an appointment at or before the pickup is refused — the appointment is not the pickup time', async () => {
+    const c = ctx(AiCall.add({}));
+    await quote(c, { patient_at: 'hospital' });
+    const r = await run('read_back_booking', { when: 'later', scheduled_time: '2099-01-02 18:30', appointment_time: '2099-01-02 18:30' }, c);
+    expect(r).toMatchObject({ ok: false, reason: 'pickup_not_before_appointment' });
+  });
+
+  test('home pickup without an exact address, landmark or pin: asked for before the read-back', async () => {
+    const c = ctx(AiCall.add({}));
+    await quote(c, { patient_at: 'home' });
+    expect(await run('read_back_booking', { when: 'now' }, c)).toMatchObject({ ok: false, reason: 'need_pickup_details', say: expect.stringMatching(/exact address.*landmark/) });
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('a pickup change: the new get_quote voids the old quote and read-back; a failed re-quote leaves nothing to book', async () => {
+    const c = ctx(AiCall.add({}));
+    await quote(c, { patient_at: 'hospital' });
+    expect((await run('read_back_booking', { when: 'now' }, c)).ok).toBe(true);
+    resolvePlaceFromText.mockResolvedValueOnce({ status: 'multiple', places: [{ name: 'Manipal', address: 'Old Airport Rd', lat: 5, lng: 6 }, { name: 'Manipal', address: 'Hebbal', lat: 7, lng: 8 }] })
+      .mockResolvedValueOnce(single('Narayana Health', 3, 4));
+    expect(await run('get_quote', { service_code: 'bls', pickup: 'Manipal', drop: 'Narayana Health' }, c)).toMatchObject({ ok: false, reason: 'clarify_places' });
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'no_quote' });
+    expect(await run('read_back_booking', { when: 'now' }, c)).toMatchObject({ ok: false, reason: 'no_quote' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('different details at create_booking than were read back: refused, read back again', async () => {
+    const c = ctx(AiCall.add({}));
+    await quote(c, { patient_at: 'hospital' });
+    await run('read_back_booking', { when: 'later', scheduled_time: '2099-01-02 18:00' }, c);
+    expect(await run('create_booking', { customer_confirmed: true, when: 'later', scheduled_time: '2099-01-02 19:00' }, c)).toMatchObject({ ok: false, reason: 'details_changed', changed: ['scheduled_time'] });
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'not_read_back' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test.each([['no', 'caller_said_no'], ['unclear', 'approval_unclear'], ['not_read_back', 'approval_not_read_back']])('caller answer "%s": no booking', async (status, reason) => {
+    const c = ctx(AiCall.add({}), status);
+    await quote(c, { patient_at: 'hospital' });
+    await run('read_back_booking', { when: 'now' }, c);
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('a booking already on the AiCall (a retry after state was lost) is never booked twice', async () => {
+    const c = ctx(AiCall.add({ trip: 'tripX' }));
+    await quote(c, { patient_at: 'hospital' });
+    await run('read_back_booking', { when: 'now' }, c);
+    expect(await run('create_booking', { customer_confirmed: true }, c)).toMatchObject({ ok: false, reason: 'already_booked', trip_number: 'tripX' });
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('body transport: pickup, destination, time — and "freezer box too?" recorded with the booking, never priced', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    await quote(c, { patient_at: 'hospital' });
+    await run('read_back_booking', { when: 'later', scheduled_time: '2099-01-02 07:00' }, c);
+    const r = await run('create_booking', { customer_confirmed: true, freezer_box_needed: true }, c);
+    expect(r.say).toMatch(/and the freezer box and its charge/);
+    expect(call.needs.freezerBox).toBe(true);
+    expect(call.request).toBeUndefined(); // not a home freezer-box request
+  });
+
+  test('freezer box at home never books a vehicle', async () => {
+    const call = AiCall.add({});
+    const c = ctx(call);
+    const r = await run('freezer_box_request', { address: '7 Temple St, Malleshwaram', start_time: 'now', hours: 12 }, c);
+    expect(r.ok).toBe(true);
+    expect(call.request).toMatchObject({ type: 'freezer_box', address: '7 Temple St, Malleshwaram', hours: 12 });
+    expect(quoteTrip).not.toHaveBeenCalled();
+    expect(createBookedTrip).not.toHaveBeenCalled();
+  });
+
+  test('WhatsApp disabled: not_sent, and she is told to ask the address on the call', async () => {
+    const c = ctx(AiCall.add({}));
+    const r = await run('send_location_request', {}, c);
+    expect(r).toMatchObject({ ok: false, status: 'not_sent', reason: 'whatsapp_off' });
+    expect(r.say).toMatch(/Do not say a link was sent.*Ask on the call for the address/);
+    expect(c.state.whatsapp).toBe('off');
+  });
+
+  test('approval words: a no / not yet always wins; unclear is not a yes', () => {
+    const approval = require('../services/aiCaller/approval');
+    ['ಹೌದು ಮೇಡಮ್, ಬುಕ್ ಮಾಡಿ', 'ಮಾಡಿ ಮಾಡಿ', 'మాడి మాడి', 'yes please', 'ok book it', 'हाँ कर दो', 'சரி பண்ணுங்க', 'ശരി'].forEach((t) => expect([t, approval.classify(t)]).toEqual([t, 'yes']));
+    ['ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ', 'ಬೇಡ', 'ಆಮೇಲೆ ಹೇಳ್ತೀನಿ', 'not yet', 'wait', 'अभी नहीं', 'బేడా', 'வேண்டாம்', 'ಹೌದು ಆದ್ರೆ ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ'].forEach((t) => expect([t, approval.classify(t)]).toEqual([t, 'no']));
+    ['ಎಷ್ಟು ಹೊತ್ತಲ್ಲಿ ಬರುತ್ತೆ?', '', 'ಹಲೋ', 'मतलब कितना'].forEach((t) => expect([t, approval.classify(t)]).toEqual([t, 'unclear']));
+  });
+
+  test('language requests: explicit only; places and look-alike words are not requests', () => {
+    const { detectLanguageRequest: d } = require('../services/aiCaller/language');
+    expect(d('ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ')).toEqual({ lang: 'kn', name: 'Kannada' });
+    expect(d('English please')).toEqual({ lang: 'en', name: 'English' });
+    expect(d('Hindi mein boliye')).toEqual({ lang: 'hi', name: 'Hindi' });
+    expect(d('ನನಗೆ ಕನ್ನಡ ಬರಲ್ಲ')).toEqual({ cannot: 'kn', name: 'Kannada' });
+    ['ambulance pickup discharge', 'ಹಿಂದಿನ ರಸ್ತೆಯಲ್ಲಿ ಮನೆ', 'Tamil Nadu alli hogbeku', 'Dakshina Kannada alli', 'మనెల్లిదరే', 'Kannada beda English please']
+      .forEach((t) => expect([t, d(t)]).toEqual([t, null]));
+  });
+
+  test('instructions: listen, language lock, branch, pickup vs appointment, WhatsApp honesty, booking only after a clear yes', () => {
+    const I = prompt.BASE_INSTRUCTIONS;
+    expect(I).toMatch(/LISTEN — let the caller finish/);
+    expect(I).toMatch(/do not jump in with "ಸರಿ", "ಹೂಂ" or "ಓಕೆ" while they are still talking/);
+    expect(I).toMatch(/ONE short question at a time/);
+    expect(I).toMatch(/If the caller ASKS for a language \("ಕನ್ನಡದಲ್ಲಿ ಮಾತಾಡಿ", "English please"/);
+    expect(I).toMatch(/never by how a transcript is spelled/);
+    expect(I).toMatch(/ask ONCE: "ಕನ್ನಡ ಅಥವಾ English — ಯಾವುದರಲ್ಲಿ ಮಾತಾಡಲಿ\?"/);
+    expect(I).toMatch(/confirm which branch/);
+    expect(I).toMatch(/PICKUP time .* is not the same as a hospital appointment/);
+    expect(I).toMatch(/Say "ಲಿಂಕ್ ಕಳಿಸಿದ್ದೇನೆ" ONLY if it returns status sent/);
+    expect(I).toMatch(/"ಇನ್ನೂ ಬುಕ್ ಮಾಡಬೇಡಿ", "not yet", "wait", an unclear answer, or a change in any detail = do NOT book/);
+    expect(I).toMatch(/Say "ಬುಕ್ಕಿಂಗ್ ಆಯ್ತು" ONLY after create_booking returned ok/);
+    expect(I).toMatch(/If ANYTHING in the route changes .* call get_quote again and say the NEW fare/);
+    expect(session.DELEGATE_INSTRUCTIONS).toMatch(/create_booking ONLY after the caller's clear yes to that read-back/);
   });
 });

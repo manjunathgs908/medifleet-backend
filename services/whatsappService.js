@@ -17,7 +17,7 @@ if (!WA_TOKEN || !WA_PHONE_NUMBER_ID) {
 // failure (bad token, invalid template, rate limit) must not crash
 // whatever flow step triggered it -- callers check the return value
 // (null on failure) instead of relying on a caught exception.
-async function sendMessage(payload) {
+async function postMessage(payload) {
   try {
     const res = await axios.post(BASE_URL, payload, {
       headers: {
@@ -26,11 +26,16 @@ async function sendMessage(payload) {
       },
       timeout: 15000,
     });
-    return res.data;
+    return { data: res.data };
   } catch (err) {
     console.error('[whatsappService] Send failed:', err.response?.data || err.message);
-    return null;
+    const e = err.response?.data?.error;
+    return { data: null, error: { code: e?.code ?? null, message: e?.error_data?.details || e?.message || err.message } };
   }
+}
+
+async function sendMessage(payload) {
+  return (await postMessage(payload)).data;
 }
 
 async function sendText(to, body) {
@@ -146,4 +151,17 @@ async function sendLocationRequest(to, bodyText) {
   });
 }
 
-module.exports = { sendText, sendButtons, sendList, sendTemplate, sendDocument, sendLocationRequest };
+// Same send as sendTemplate, but says WHY it failed: { ok: true, data } or
+// { ok: false, error: { code, message } } with Meta's error code (e.g.
+// 132001 = no approved template by that name + language). Never throws.
+async function sendTemplateResult(to, templateName, languageCode, components) {
+  const r = await postMessage({
+    messaging_product: 'whatsapp',
+    to,
+    type: 'template',
+    template: { name: templateName, language: { code: languageCode }, components: components || [] },
+  });
+  return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
+}
+
+module.exports = { sendText, sendButtons, sendList, sendTemplate, sendTemplateResult, sendDocument, sendLocationRequest };

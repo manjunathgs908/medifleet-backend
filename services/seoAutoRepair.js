@@ -386,7 +386,7 @@ async function autoRepairArticle(articleId, { maxAttempts = MAX_AUTO_REPAIR_ATTE
     // an `instanceof undefined` here would throw away the very error it is
     // trying to report.
     const reason = err?.name === 'ClaudeApiError'
-      ? `stopped by the Anthropic API (${err.code}): ${err.message}`
+      ? `stopped by the AI provider API (${err.code}): ${err.message}`
       : `error: ${err.message}`;
     timeline.push(reason);
     try {

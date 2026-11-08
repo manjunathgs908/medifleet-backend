@@ -28,6 +28,19 @@ const WhatsAppLeadSchema = new mongoose.Schema(
     source: { type: String, default: 'whatsapp' },
 
     status: { type: String, enum: ['new', 'contacted', 'closed'], default: 'new', index: true },
+
+    // The pickup the customer shared on WhatsApp (services/waWelcomeLocation.js:
+    // a location pin, or a typed address resolved through Places) — what the
+    // CRM Dispatch form pre-fills from. confirmedAt: the customer replied Yes
+    // to "is this the pickup point?". Absent on every other lead.
+    pickup: {
+      label      : String,
+      lat        : Number,
+      lng        : Number,
+      source     : { type: String, enum: ['pin', 'typed'] },
+      at         : Date,
+      confirmedAt: Date,
+    },
     notes : { type: String, trim: true },
 
     // CRM incoming alert (full-screen ring + background push) — see

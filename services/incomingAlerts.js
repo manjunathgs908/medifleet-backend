@@ -90,15 +90,22 @@ function bookingAlert({ trip, via }) {
   };
 }
 
+// A lead with a pickup (services/waWelcomeLocation.js: the customer shared
+// it from the welcome template) says so, and carries it for the Dispatch
+// form; every other lead's alert is exactly as before.
 function leadAlert(lead) {
   const id = String(lead._id);
+  const p = lead.pickup?.label ? lead.pickup : null;
   return {
     key: `wa_lead:${id}`, type: 'wa_lead', id, at: lead.createdAt,
     title: `New WhatsApp lead - ${lead.service}`,
     service: lead.service,
-    stage: 'Asked for a service with no automated booking — call back',
+    stage: p
+      ? `Shared pickup on WhatsApp${p.confirmedAt ? ' (confirmed)' : ''}: ${p.label} — call to book`
+      : 'Asked for a service with no automated booking — call back',
     ...phoneFields(lead.phone),
     link: '/whatsapp-leads',
+    ...(p ? { pickup: { label: p.label, lat: p.lat, lng: p.lng, confirmed: !!p.confirmedAt } } : {}),
   };
 }
 

@@ -143,6 +143,9 @@ async function onInbound(message, deps = {}) {
 
     const pending = await LocationRequest.findOne({ phone: ten, status: 'sent', sentAt: { $gte: new Date(Date.now() - PENDING_MS) } }).sort({ sentAt: -1 });
     if (!pending) return false;
+    // The newest ask came from the welcome template's button: that flow
+    // (services/waWelcomeLocation.js) takes the pin, and fills any call too.
+    if (pending.source === 'whatsapp_welcome') return false;
     const inBotFlow = !!(await WhatsAppSession.exists({ phone: message.from }));
 
     if (message.type === 'location') {
@@ -164,4 +167,4 @@ async function onInbound(message, deps = {}) {
   }
 }
 
-module.exports = { request, onInbound, receive, enabled, ASK_TEXT, PENDING_MS, DEDUPE_MS, WINDOW_MS };
+module.exports = { request, onInbound, receive, applyToTargets, isMobile, enabled, ASK_TEXT, PENDING_MS, DEDUPE_MS, WINDOW_MS };

@@ -693,6 +693,10 @@ exports.incoming = async (req, res, next) => {
     // (services/locationRequests — off unless WA_CALL_LOCATION_ENABLED).
     // Never awaited, so nothing about it can delay or change this call.
     if (log.callbackEligible) requestPickupLocation(from, log._id);
+    // ...and the savelife_welcome template, once per number per IST day
+    // (services/callWelcome — off unless WA_CALL_WELCOME_ENABLED). Same:
+    // never awaited.
+    if (log.callbackEligible) sendCallWelcome(from, log._id);
     serverTrail('server:incoming_routed', {
       logId   : String(log._id),
       decision: routing.decision,
@@ -1356,6 +1360,47 @@ function requestPickupLocation(phone, logId) {
     console.error('[locationRequests] request failed:', err.message);
   }
 }
+
+function sendCallWelcome(phone, logId) {
+  try {
+    require('../services/callWelcome').onIncomingCall(phone, logId)
+      .catch((err) => console.error('[callWelcome] send failed:', err.message));
+  } catch (err) {
+    console.error('[callWelcome] send failed:', err.message);
+  }
+}
+
+// ============================================================
+// @route   POST /api/calls/:id/send-welcome
+// @desc    Send the savelife_welcome WhatsApp template ("📍 Send Location")
+//          to this call's customer. The number is read here, server-side —
+//          the CRM only ever shows it masked. Once per number per IST day,
+//          shared with the automatic send on incoming calls; works whether
+//          or not WA_CALL_WELCOME_ENABLED is on.
+//          200 { success: true, status: 'sent' | 'already_sent_today', sentAt }
+//          409 { success: false, status: 'in_progress' }
+//          400 { success: false, status: 'not_mobile' }
+//          502 { success: false, status: 'failed', reason, message, code }
+// @access  Private [CRM operations staff]
+// ============================================================
+const WELCOME_HTTP = { sent: 200, already_sent_today: 200, in_progress: 409, not_mobile: 400, failed: 502 };
+
+exports.sendWelcome = async (req, res, next) => {
+  try {
+    if (!isObjectId(String(req.params.id))) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const log = await CallLog.findById(req.params.id).select('+customerPhone');
+    if (!log) return res.status(404).json({ success: false, message: 'Call not found.' });
+    const r = await require('../services/callWelcome').send({
+      phone: log.customerPhone, source: 'manual', callLog: log._id, sentBy: req.user._id,
+    });
+    const http = WELCOME_HTTP[r.status] || 502;
+    const message = r.message
+      || (r.status === 'sent' ? 'Welcome message sent on WhatsApp.' : r.status === 'already_sent_today' ? 'Already sent to this number today.' : undefined);
+    return res.status(http).json({ success: http === 200, ...r, ...(message ? { message } : {}) });
+  } catch (err) {
+    next(err);
+  }
+};
 
 // LIVE CALL CAPTURE (services/callCapture): fire-and-forget once an
 // operator has the call. It checks for itself that capture is switched on

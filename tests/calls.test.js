@@ -42,6 +42,7 @@ jest.mock('../models/CallLog', () => ({
   create: jest.fn(), findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), updateOne: jest.fn(),
 }));
 jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
+jest.mock('../services/callWelcome', () => ({ onIncomingCall: jest.fn(async () => ({ status: 'disabled' })), send: jest.fn() }));
 jest.mock('../models/WebrtcDebugEvent', () => ({
   insertMany: jest.fn(async (docs) => docs),
   create    : jest.fn(async (doc) => doc),
@@ -1533,5 +1534,47 @@ describe('telecaller performance', () => {
     });
     expect(log).toEqual(expect.objectContaining({ status: 'completed', agentUser: 'u-san', agentName: 'santosh', talkSec: 42 }));
     expect(log.answeredAt).toBeInstanceOf(Date);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+describe('incoming: the savelife_welcome WhatsApp template (services/callWelcome)', () => {
+  const callWelcome = require('../services/callWelcome');
+  beforeEach(() => {
+    Trip.findOne.mockReturnValue(chain(null));
+    require('../models').Lead.findOne.mockReturnValue(chain(null));
+  });
+
+  it('a customer\'s call hands the caller\'s real number and the call to callWelcome (not awaited; the call is routed as usual)', async () => {
+    User.find.mockReturnValue(chain([{ phone: '9000000001' }]));
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'wel-1' } });
+    expect(callWelcome.onIncomingCall).toHaveBeenCalledWith(CUSTOMER, '64b000000000000000000001');
+    expect(res.body).toContain('<Number>919000000001</Number>');
+  });
+
+  it('even when nobody is on duty (the caller hears busy) — they can still share their pickup', async () => {
+    User.find.mockReturnValue(chain([]));
+    delete process.env.PLIVO_FALLBACK_AGENTS;
+    await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'wel-busy' } });
+    expect(callWelcome.onIncomingCall).toHaveBeenCalledWith(CUSTOMER, expect.anything());
+  });
+
+  it('not for a staff member calling from their own ring phone', async () => {
+    User.find.mockReturnValue(chain([
+      { _id: 'u1', name: 'Me', callMode: 'phone', phone: '9000000001', callPhone: '9986844442' },
+      { _id: 'u2', name: 'Desk', callMode: 'phone', phone: '9123456780' },
+    ]));
+    await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'wel-self' } });
+    expect(callWelcome.onIncomingCall).not.toHaveBeenCalled();
+  });
+
+  it('a failing welcome never breaks the call', async () => {
+    User.find.mockReturnValue(chain([{ phone: '9000000001' }]));
+    callWelcome.onIncomingCall.mockRejectedValueOnce(new Error('boom'));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const { res } = await run(ctrl.incoming, { method: 'POST', body: { From: '919986844442', CallUUID: 'wel-x' } });
+    await new Promise((r) => setImmediate(r));
+    expect(res.body).toContain('<Dial');
+    errSpy.mockRestore();
   });
 });

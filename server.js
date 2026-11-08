@@ -43,6 +43,10 @@ app.use(cors({
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan('dev'));
 
+// Public files (public/) at the root — e.g. the WhatsApp welcome banner,
+// https://api.savelife.health/welcome-banner.png. See middleware/publicFiles.js.
+app.use(require('./middleware/publicFiles'));
+
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Cloud Database Connected Successfully.'))
   .catch(err => console.error('Database connection error:', err));

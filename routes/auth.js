@@ -194,4 +194,75 @@ router.put('/users/:id/deactivate', protect, authorize('owner'), async (req, res
   } catch (err) { next(err); }
 });
 
+// PATCH /api/auth/users/:id/status — the owner's Active/Inactive toggle on
+// the Staff page. Body: { isActive: true | false }.
+//
+// isActive is a stored field (User.isActive), and it is what every login
+// path and protect() check — so this one flag is the whole switch:
+//   - false: protect() answers 403 on their very next request, password /
+//     OTP / PIN login refuse, and the call-duty ring list, lead/callback
+//     assignee lists and push alerts already skip them. Their refresh
+//     token is cleared (nothing left to renew a session with) and call
+//     duty is switched off, so reactivating does not silently put them
+//     back on the incoming-call ring list.
+//   - true: they can log in again (a fresh login — the old session is gone).
+//
+// Only drivers and telecallers: an owner can't switch themselves (or
+// another owner login) off from here and lock the CRM out. A driver who
+// holds an active Assignment is refused — cutting them off mid-duty would
+// leave the ambulance claimed and the trip stranded; end their duty first.
+// Setting the status it already has is a no-op 200.
+//
+// The older PUT /users/:id/deactivate stays as it is for anything still
+// calling it.
+const STATUS_ROLES = ['driver', 'telecaller'];
+router.patch('/users/:id/status', protect, authorize('owner'), async (req, res, next) => {
+  try {
+    const { isActive } = req.body || {};
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'isActive must be true or false.' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.id))) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+    if (String(req.params.id) === String(req.user._id)) {
+      return res.status(400).json({ success: false, code: 'SELF', message: 'You cannot change your own status.' });
+    }
+
+    const user = await User.findById(req.params.id).select('name role isActive');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    if (!STATUS_ROLES.includes(user.role)) {
+      return res.status(400).json({ success: false, code: 'ROLE_NOT_ALLOWED', message: 'Only drivers and telecallers can be activated or deactivated here.' });
+    }
+
+    const view = () => ({ _id: user._id, name: user.name, role: user.role, isActive: user.isActive });
+    if (user.isActive === isActive) {
+      return res.json({ success: true, changed: false, message: `${user.name} is already ${isActive ? 'active' : 'inactive'}.`, user: view() });
+    }
+
+    if (!isActive && user.role === 'driver') {
+      const onDuty = await Assignment.findOne({ driver: user._id, active: true });
+      if (onDuty) {
+        return res.status(409).json({
+          success: false,
+          code   : 'DRIVER_ON_DUTY',
+          message: `${user.name} is on duty. End their duty before deactivating them.`,
+        });
+      }
+    }
+
+    // A targeted update, not user.save(): a legacy staff record with some
+    // other field that no longer validates must not block the switch.
+    await User.updateOne(
+      { _id: user._id },
+      isActive
+        ? { $set: { isActive: true } }
+        : { $set: { isActive: false, callDuty: false }, $unset: { refreshToken: 1 } },
+    );
+    user.isActive = isActive;
+    console.info(`[auth] status ${isActive ? 'active' : 'inactive'} for user=${user._id} role=${user.role} by owner=${req.user._id}`);
+    return res.json({ success: true, changed: true, message: `${user.name} is now ${isActive ? 'active' : 'inactive'}.`, user: view() });
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

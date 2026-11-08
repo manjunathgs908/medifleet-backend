@@ -65,17 +65,17 @@ const blocking = (claim, action = 'rewrite') => ({ claim, severity: 'unsupported
 // The name must start with "mock" — jest hoists jest.mock() above the file,
 // and only mock-prefixed bindings may be referenced from inside the factory.
 const mockCreate = jest.fn();
-jest.mock('@anthropic-ai/sdk', () => jest.fn(() => ({ messages: { create: mockCreate } })));
+jest.mock('openai', () => jest.fn(() => ({ responses: { create: mockCreate } })));
 
 beforeEach(() => {
   // getClient() throws without this; the value is never sent anywhere,
   // because the transport above is a stub.
-  process.env.ANTHROPIC_API_KEY = 'not-a-credential-the-sdk-is-mocked';
+  process.env.OPENAI_API_KEY = 'not-a-credential-the-sdk-is-mocked';
 });
 afterEach(() => {
   jest.clearAllMocks();
   jest.restoreAllMocks();
-  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
 });
 
 const createSpy = mockCreate;
@@ -83,9 +83,9 @@ const createSpy = mockCreate;
 /** Force what the single repair call returns. */
 const respond = (payload) => {
   mockCreate.mockResolvedValue({
-    stop_reason: 'end_turn',
+    status: 'completed',
     usage: { input_tokens: 10, output_tokens: 10 },
-    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    output_text: JSON.stringify(payload),
   });
 };
 
@@ -112,7 +112,7 @@ describe('A. repair rewrites an unsupported claim', () => {
 
     await repairArticle(doc);
 
-    const prompt = createSpy.mock.calls[0][0].messages[0].content;
+    const prompt = createSpy.mock.calls[0][0].input;
     expect(prompt).toContain('A totally unrelated invented claim about kittens.');
   });
 });
@@ -129,7 +129,7 @@ describe('B. repair deletes a claim it cannot safely reword', () => {
 
     await repairArticle(doc);
 
-    const prompt = createSpy.mock.calls[0][0].messages[0].content;
+    const prompt = createSpy.mock.calls[0][0].input;
     expect(prompt).toContain('[unsupported / remove]');
     expect(doc.content).toBe('Sentence gone.');
   });
@@ -144,7 +144,7 @@ describe('C. repair fixes a short meta description', () => {
     const r = await repairArticle(doc);
 
     expect(SHORT_META.length).toBe(146);
-    const prompt = createSpy.mock.calls[0][0].messages[0].content;
+    const prompt = createSpy.mock.calls[0][0].input;
     expect(prompt).toMatch(/146 characters and MUST end up between 150 and 160/);
     expect(doc.metaDescription).toBe(fixed);
     expect(r.metaBefore).toBe(146);
@@ -182,7 +182,7 @@ describe('D. repair does not introduce fixed pricing', () => {
 
     await repairArticle(doc);
 
-    const prompt = createSpy.mock.calls[0][0].messages[0].content;
+    const prompt = createSpy.mock.calls[0][0].input;
     expect(prompt).toMatch(/do not introduce a price/i);
   });
 

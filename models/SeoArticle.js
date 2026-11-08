@@ -350,6 +350,7 @@ const seoArticleSchema = new Schema(
     // turns out to be wrong months later, this is how you find every other
     // page generated the same way.
     generation: {
+      provider: { type: String }, // 'openai' | 'anthropic' -- which API wrote it
       model: { type: String },
       effort: { type: String },
       factSheetHash: { type: String },

@@ -51,7 +51,7 @@ function claudeFailure(res, err) {
       retryable: Boolean(err.retryable),
     });
   }
-  if (/ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
+  if (/OPENAI_API_KEY|ANTHROPIC_API_KEY|declined this request/.test(err.message)) {
     return res.status(503).json({ success: false, message: err.message });
   }
   return null;

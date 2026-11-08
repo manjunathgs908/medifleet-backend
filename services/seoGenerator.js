@@ -3,7 +3,7 @@
  * ============================================================
  * Keyword -> cluster -> intent -> brief -> draft -> checks -> DRAFT row.
  *
- * One Claude call produces the whole article as a validated JSON object
+ * One model call (OpenAI by default; see aiConfig) produces the whole article as a validated JSON object
  * (structured outputs, so there is no parsing to get wrong), and a second
  * pass fact-checks the result against the same fact sheet. Two passes
  * because a model asked to write and to police itself in one breath does
@@ -54,9 +54,24 @@ const { buildContentBrief, renderBriefForPrompt } = require('./seoBrief');
 // nothing here can produce an image URL. See services/seoMedia.js.
 const { validateMedia } = require('./seoMedia');
 
-// Never hard-coded. An unset key is a configuration answer, not a crash.
-const MODEL = process.env.SEO_CLAUDE_MODEL || 'claude-opus-5';
-const EFFORT = process.env.SEO_CLAUDE_EFFORT || 'high';
+// ── Which model writes, checks and repairs ────────────────────
+// OpenAI (Responses API) by default. SEO_AI_PROVIDER=anthropic switches back
+// to the previous Claude path with an env change and no code push -- kept as
+// the rollback until the OpenAI migration is verified in production, which is
+// also why ANTHROPIC_API_KEY stays. Read per call, not at load, so flipping
+// the variable takes effect on the next request.
+//
+// Model and effort are never hard-coded beyond a default:
+//   OpenAI:    SEO_OPENAI_MODEL || OPENAI_MODEL || gpt-6-astra
+//              SEO_OPENAI_EFFORT (reasoning effort) || high
+//   Anthropic: SEO_CLAUDE_MODEL || claude-opus-5, SEO_CLAUDE_EFFORT || high
+function aiConfig() {
+  const provider = String(process.env.SEO_AI_PROVIDER || 'openai').trim().toLowerCase() === 'anthropic'
+    ? 'anthropic' : 'openai';
+  return provider === 'anthropic'
+    ? { provider, model: process.env.SEO_CLAUDE_MODEL || 'claude-opus-5', effort: process.env.SEO_CLAUDE_EFFORT || 'high' }
+    : { provider, model: process.env.SEO_OPENAI_MODEL || process.env.OPENAI_MODEL || 'gpt-6-astra', effort: process.env.SEO_OPENAI_EFFORT || 'high' };
+}
 
 // Below this a "unique" page is really a reworded one. Tunable without a
 // deploy because the right threshold depends on how close the keyword set is.
@@ -114,22 +129,37 @@ const normaliseClaims = (raw) => (raw || []).map((c) =>
     : { claim: c.claim, severity: c.severity || 'unsupported', action: c.action || 'rewrite' },
 );
 
-let client = null;
-function getClient() {
+// SDKs are required inside these getters, not at module load. This file is
+// reachable from server.js via routes/seo.js, so a missing or broken SDK
+// package at the top level would take the whole dispatch API down on boot --
+// booking, tracking and all -- to break SEO Studio. Deferring it confines
+// that failure to this one feature.
+let anthropicClient = null;
+function getAnthropicClient() {
   if (!process.env.ANTHROPIC_API_KEY) {
     throw new Error('ANTHROPIC_API_KEY is not set — SEO generation is unavailable.');
   }
-  if (!client) {
-    // Required here, not at module load. This file is reachable from
-    // server.js via routes/seo.js, so a missing or broken SDK package at the
-    // top level would take the whole dispatch API down on boot -- booking,
-    // tracking and all -- to break a feature nobody is using yet. Deferring
-    // it confines that failure to this one endpoint.
+  if (!anthropicClient) {
     // eslint-disable-next-line global-require
     const Anthropic = require('@anthropic-ai/sdk');
-    client = new Anthropic();
+    anthropicClient = new Anthropic();
   }
-  return client;
+  return anthropicClient;
+}
+
+let openaiClient = null;
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY is not set — SEO generation is unavailable.');
+  }
+  if (!openaiClient) {
+    // eslint-disable-next-line global-require
+    const OpenAI = require('openai');
+    // The SDK's own retries (2) and 10-minute timeout, as before; the
+    // generation budget below decides when to stop starting new calls.
+    openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  }
+  return openaiClient;
 }
 
 /**
@@ -371,8 +401,9 @@ How to repair:
 - Keep the existing voice, British-Indian English, Markdown structure and heading order.`;
 
 /**
- * A failure that came from the Anthropic API itself, rather than from
- * anything about the article being written.
+ * A failure that came from the AI provider's API itself (OpenAI, or Anthropic
+ * when SEO_AI_PROVIDER=anthropic), rather than from anything about the
+ * article being written.
  *
  * The distinction is operational, not academic. An exhausted balance, an
  * expired key and a rate limit are all things an owner can act on, and each
@@ -380,6 +411,11 @@ How to repair:
  * Studio say "Generation failed", which sends somebody to read the draft when
  * the true answer is "top up the account" -- so the API's own wording is
  * carried through to the operator intact.
+ *
+ * The class keeps its historical name: controllers/seoController.js and
+ * services/seoAutoRepair.js match on err.name === 'ClaudeApiError', and the
+ * JSON the Studio receives ({ message, code, retryable } with the status) is
+ * identical whichever provider produced it.
  *
  * Carries a status, a coarse code and a sentence saying what to do. It never
  * carries the key, a header, or any part of the request.
@@ -397,11 +433,80 @@ class ClaudeApiError extends Error {
 /**
  * Translate an SDK throw into something an operator can act on.
  *
- * Deliberately shape-tolerant: the SDK exposes `status` and a nested
- * `error.error.type`, but a DNS failure has neither, and an SDK version bump
- * must not quietly turn a billing stop back into a stack trace.
+ * Deliberately shape-tolerant: both SDKs expose `status`, OpenAI adds `code`
+ * / `type` and a nested `error`, Anthropic nests `error.error.type`, and a
+ * DNS failure has none of it. An SDK version bump must not quietly turn a
+ * billing stop back into a stack trace.
  */
-function toClaudeApiError(err) {
+function toClaudeApiError(err, provider = aiConfig().provider) {
+  // Already mapped (a call that threw one of ours): keep it as it is.
+  if (err?.name === 'ClaudeApiError') return err;
+  return provider === 'anthropic' ? toAnthropicApiError(err) : toOpenAIApiError(err);
+}
+
+function toOpenAIApiError(err) {
+  const status  = err?.status ?? err?.response?.status ?? null;
+  const apiCode = String(err?.code || err?.error?.code || err?.type || err?.error?.type || '');
+  const detail  = err?.error?.message || err?.message || 'no detail given';
+  const lower   = (apiCode + ' ' + detail).toLowerCase();
+  const { model } = aiConfig();
+
+  // Out of credit arrives as a 429 with code insufficient_quota -- the same
+  // status as a rate limit, so it must be told apart BEFORE the 429 branch,
+  // or "add credit" is reported as "wait a minute" forever.
+  if (status === 402 || lower.includes('insufficient_quota') || lower.includes('exceeded your current quota') || lower.includes('billing')) {
+    return new ClaudeApiError(
+      'OpenAI rejected the request: ' + detail
+        + ' Add credit at platform.openai.com/settings/organization/billing and run this again.'
+        + ' Nothing was written to the article.',
+      { status: 402, code: 'billing' },
+    );
+  }
+  if (status === 401 || lower.includes('invalid_api_key') || lower.includes('incorrect api key')) {
+    return new ClaudeApiError(
+      'OpenAI rejected the API key (' + (status || 401) + '). Check OPENAI_API_KEY in'
+        + ' the Render environment. Nothing was written to the article.',
+      { status: 401, code: 'auth' },
+    );
+  }
+  if (status === 403 || status === 404 || lower.includes('model_not_found')) {
+    return new ClaudeApiError(
+      'OpenAI refused the model "' + model + '" (' + (status || '?') + '): ' + detail
+        + ' Check OPENAI_MODEL in the Render environment and that this API key\'s project can use it.'
+        + ' Nothing was written to the article.',
+      { status: 401, code: 'auth' },
+    );
+  }
+  if (status === 429) {
+    return new ClaudeApiError(
+      'OpenAI rate limit reached. Wait a minute and try again.'
+        + ' Nothing was written to the article.',
+      { status: 429, code: 'rate_limit', retryable: true },
+    );
+  }
+  if (status === 503 || lower.includes('overloaded') || lower.includes('slow_down')) {
+    return new ClaudeApiError(
+      'OpenAI is overloaded right now. Try again shortly.'
+        + ' Nothing was written to the article.',
+      { status: 503, code: 'overloaded', retryable: true },
+    );
+  }
+  if (status && status >= 500) {
+    return new ClaudeApiError(
+      'OpenAI returned a ' + status + '. That is upstream, not your article --'
+        + ' try again shortly. Nothing was written.',
+      { status: 503, code: 'upstream', retryable: true },
+    );
+  }
+  return new ClaudeApiError(
+    'The OpenAI API call failed' + (status ? ' (' + status + ')' : '') + ': ' + detail,
+    { status: status || 503, code: 'upstream' },
+  );
+}
+
+// The previous provider's mapping, unchanged -- used only when
+// SEO_AI_PROVIDER=anthropic.
+function toAnthropicApiError(err) {
   const status  = err?.status ?? err?.response?.status ?? null;
   const apiType = err?.error?.error?.type || err?.error?.type || '';
   const detail  = err?.error?.error?.message || err?.message || 'no detail given';
@@ -452,22 +557,132 @@ function toClaudeApiError(err) {
   );
 }
 
-async function callClaude({ system, prompt, schema, maxTokens = 16000 }) {
+// ── OpenAI strict structured outputs ──────────────────────────
+// Strict mode requires every property of every object to be listed in
+// `required`. REPAIR_SCHEMA depends on the opposite -- a field the repair did
+// not touch is ABSENT, so it cannot be silently reworded -- so optional
+// properties are sent as required-but-nullable, and a null that comes back
+// for one of them is deleted again before anyone sees it. The schemas
+// themselves (and what the prompts say about them) are unchanged.
+function nullable(node) {
+  const types = Array.isArray(node.type) ? node.type : [node.type];
+  const out = { ...node, type: [...new Set([...types, 'null'])] };
+  if (Array.isArray(node.enum) && !node.enum.includes(null)) out.enum = [...node.enum, null];
+  return out;
+}
+
+function toStrictSchema(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (node.type === 'object' && node.properties) {
+    const required = new Set(node.required || []);
+    const properties = {};
+    for (const [key, child] of Object.entries(node.properties)) {
+      const strict = toStrictSchema(child);
+      properties[key] = required.has(key) ? strict : nullable(strict);
+    }
+    return { ...node, properties, required: Object.keys(node.properties), additionalProperties: false };
+  }
+  if (node.type === 'array' && node.items) return { ...node, items: toStrictSchema(node.items) };
+  return node;
+}
+
+function dropOptionalNulls(value, node) {
+  if (!node || value === null || value === undefined) return value;
+  if (node.type === 'object' && node.properties && typeof value === 'object' && !Array.isArray(value)) {
+    const required = new Set(node.required || []);
+    for (const key of Object.keys(value)) {
+      if (value[key] === null && !required.has(key)) delete value[key];
+      else if (node.properties[key]) value[key] = dropOptionalNulls(value[key], node.properties[key]);
+    }
+    return value;
+  }
+  if (node.type === 'array' && node.items && Array.isArray(value)) {
+    return value.map((v) => dropOptionalNulls(v, node.items));
+  }
+  return value;
+}
+
+// Reasoning tokens count against max_output_tokens on OpenAI (they did not
+// against Claude's max_tokens in the same way), so each call's budget is
+// doubled unless SEO_OPENAI_MAX_OUTPUT_TOKENS sets one figure for all calls.
+const openaiMaxOutputTokens = (maxTokens) =>
+  Number(process.env.SEO_OPENAI_MAX_OUTPUT_TOKENS) || maxTokens * 2;
+
+async function callOpenAI({ system, prompt, schema, name, maxTokens }) {
+  const { model, effort } = aiConfig();
   const startedAt = Date.now();
   let res;
   try {
-    res = await getClient().messages.create({
-      model: MODEL,
-      max_tokens: maxTokens,
-      thinking: { type: 'adaptive' },
-      output_config: { effort: EFFORT, format: { type: 'json_schema', schema } },
-      system,
-      messages: [{ role: 'user', content: prompt }],
+    res = await getOpenAIClient().responses.create({
+      model,
+      // The rules go in `instructions`, the fact sheet and article in
+      // `input` -- the same system/user split the prompts were written for.
+      instructions: system,
+      input: prompt,
+      reasoning: { effort },
+      max_output_tokens: openaiMaxOutputTokens(maxTokens),
+      text: { format: { type: 'json_schema', name, schema: toStrictSchema(schema), strict: true } },
+      // Drafts are unpublished business copy; nothing to keep on OpenAI's side.
+      store: false,
     });
   } catch (err) {
     // Nothing has been written at this point. Every caller saves only after a
     // call returns, so a throw here leaves the article exactly as it was.
-    throw err instanceof ClaudeApiError ? err : toClaudeApiError(err);
+    throw toClaudeApiError(err, 'openai');
+  }
+
+  // A safety decline: a refusal part instead of the JSON. Same wording the
+  // controller already maps to a 503 ("declined this request").
+  const refusal = (res.output || [])
+    .flatMap((item) => (item?.type === 'message' ? item.content || [] : []))
+    .find((part) => part?.type === 'refusal');
+  if (refusal || res.incomplete_details?.reason === 'content_filter') {
+    const why = String(refusal?.refusal || 'content filter').slice(0, 200);
+    throw new Error(`OpenAI declined this request (${why}).`);
+  }
+  if (res.status === 'failed') {
+    throw toClaudeApiError({ status: 503, error: res.error || {}, message: res.error?.message }, 'openai');
+  }
+  // Cut off before the JSON finished -- normally the output budget. Retryable,
+  // and nothing has been written; parsing half an object would only produce
+  // a confusing SyntaxError.
+  if (res.status === 'incomplete') {
+    throw new ClaudeApiError(
+      `OpenAI stopped before finishing (${res.incomplete_details?.reason || 'incomplete'}). `
+        + 'Nothing was written to the article. Try again; if it keeps happening, raise SEO_OPENAI_MAX_OUTPUT_TOKENS.',
+      { status: 503, code: 'upstream', retryable: true },
+    );
+  }
+
+  const text = typeof res.output_text === 'string' && res.output_text
+    ? res.output_text
+    : (res.output || [])
+      .flatMap((item) => (item?.type === 'message' ? item.content || [] : []))
+      .filter((part) => part?.type === 'output_text')
+      .map((part) => part.text)
+      .join('');
+  const data = dropOptionalNulls(JSON.parse(text), schema);
+  // Responses usage is { input_tokens, output_tokens, ... } -- the same two
+  // names spend() already adds up.
+  return { data, usage: res.usage, ms: Date.now() - startedAt };
+}
+
+// The previous Claude call, unchanged -- used only when SEO_AI_PROVIDER=anthropic.
+async function callAnthropic({ system, prompt, schema, maxTokens }) {
+  const { model, effort } = aiConfig();
+  const startedAt = Date.now();
+  let res;
+  try {
+    res = await getAnthropicClient().messages.create({
+      model,
+      max_tokens: maxTokens,
+      thinking: { type: 'adaptive' },
+      output_config: { effort, format: { type: 'json_schema', schema } },
+      system,
+      messages: [{ role: 'user', content: prompt }],
+    });
+  } catch (err) {
+    throw toClaudeApiError(err, 'anthropic');
   }
 
   // A safety decline is a 200 with stop_reason 'refusal' — content would be
@@ -477,6 +692,19 @@ async function callClaude({ system, prompt, schema, maxTokens = 16000 }) {
   }
   const text = res.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
   return { data: JSON.parse(text), usage: res.usage, ms: Date.now() - startedAt };
+}
+
+/**
+ * One structured-output call: `system` rules, `prompt` data, the reply as an
+ * object matching `schema`. Returns { data, usage: { input_tokens,
+ * output_tokens }, ms } whichever provider answered, so the writer, the fact
+ * check and the repair are provider-blind. `name` labels the schema for
+ * OpenAI (letters, digits, _ and -).
+ */
+async function callModel({ system, prompt, schema, name = 'seo_output', maxTokens = 16000 }) {
+  return aiConfig().provider === 'anthropic'
+    ? callAnthropic({ system, prompt, schema, maxTokens })
+    : callOpenAI({ system, prompt, schema, name, maxTokens });
 }
 
 /**
@@ -491,10 +719,11 @@ async function runFactCheck(article, factBlock, spend) {
   const view = {};
   for (const k of CHECKABLE_FIELDS) view[k] = article[k];
 
-  const { data, usage, ms } = await callClaude({
+  const { data, usage, ms } = await callModel({
     system: CHECKER_SYSTEM,
     prompt: `FACT SHEET:\n${factBlock}\n\nARTICLE:\n${JSON.stringify(view, null, 2)}`,
     schema: CHECK_SCHEMA,
+    name: 'seo_fact_check',
     maxTokens: 8000,
   });
   spend(usage, ms);
@@ -532,10 +761,11 @@ async function repairClaims(article, claims, factBlock, spend, extraInstructions
     ),
   ].join('\n');
 
-  const { data, usage, ms } = await callClaude({
+  const { data, usage, ms } = await callModel({
     system: REPAIR_SYSTEM,
     prompt,
     schema: REPAIR_SCHEMA,
+    name: 'seo_repair',
   });
   spend(usage, ms);
 
@@ -828,7 +1058,8 @@ async function generateDraft(input, user) {
     if (kind !== 'writer' && ms > slowestCycleCallMs) slowestCycleCallMs = ms;
   };
 
-  console.log(`[SEO] generation started — keyword="${String(keyword).trim()}" model=${MODEL} effort=${EFFORT}`);
+  const ai = aiConfig();
+  console.log(`[SEO] generation started — keyword="${String(keyword).trim()}" provider=${ai.provider} model=${ai.model} effort=${ai.effort}`);
 
   const facts = await buildFactSheet();
   // Two views of the same sheet, and which call gets which is a safety
@@ -868,10 +1099,11 @@ async function generateDraft(input, user) {
     writerFactBlock,
   ].filter(Boolean).join('\n');
 
-  const { data: article, usage, ms: writerMs } = await callClaude({
+  const { data: article, usage, ms: writerMs } = await callModel({
     system: WRITER_SYSTEM,
     prompt: brief,
     schema: ARTICLE_SCHEMA,
+    name: 'seo_article',
   });
   spend(usage, writerMs, 'writer');
 
@@ -991,8 +1223,9 @@ async function generateDraft(input, user) {
     shingles,
     checks,
     generation: {
-      model: MODEL,
-      effort: EFFORT,
+      provider: ai.provider,
+      model: ai.model,
+      effort: ai.effort,
       factSheetHash: facts.hash,
       // What this article was asked to accomplish. Kept so a reviewer can
       // judge the draft against its brief rather than against a guess.
@@ -1376,4 +1609,5 @@ module.exports = {
   evaluateGates, recheckArticle, repairArticle, isBlocking,
   DuplicateKeywordError, NothingToRepairError, ClaudeApiError, toClaudeApiError,
   KeywordCoveredError,
+  aiConfig, toStrictSchema, dropOptionalNulls,
 };

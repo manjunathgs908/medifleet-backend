@@ -34,7 +34,7 @@ jest.mock('../services/seoFacts', () => ({
 }));
 
 const mockCreate = jest.fn();
-jest.mock('@anthropic-ai/sdk', () => jest.fn(() => ({ messages: { create: mockCreate } })));
+jest.mock('openai', () => jest.fn(() => ({ responses: { create: mockCreate } })));
 
 const SeoArticle = require('../models/SeoArticle');
 const { repairArticle, TITLE_MIN, TITLE_MAX, META_MIN, META_MAX } = require('../services/seoGenerator');
@@ -76,17 +76,17 @@ const respond = (...payloads) => {
   mockCreate.mockReset();
   for (const p of payloads) {
     mockCreate.mockResolvedValueOnce({
-      stop_reason: 'end_turn',
+      status: 'completed',
       usage: { input_tokens: 10, output_tokens: 10 },
-      content: [{ type: 'text', text: JSON.stringify(p) }],
+      output_text: JSON.stringify(p),
     });
   }
 };
 
-const promptOf = (callIndex) => mockCreate.mock.calls[callIndex][0].messages[0].content;
+const promptOf = (callIndex) => mockCreate.mock.calls[callIndex][0].input;
 
-beforeEach(() => { process.env.ANTHROPIC_API_KEY = 'not-a-credential-the-sdk-is-mocked'; });
-afterEach(() => { jest.clearAllMocks(); delete process.env.ANTHROPIC_API_KEY; });
+beforeEach(() => { process.env.OPENAI_API_KEY = 'not-a-credential-the-sdk-is-mocked'; });
+afterEach(() => { jest.clearAllMocks(); delete process.env.OPENAI_API_KEY; });
 
 // ============================================================
 describe('A. the repair is never shown a fare it could copy out', () => {

@@ -41,7 +41,7 @@ jest.mock('../models/SeoLivePage', () => ({
 
 // The SDK is replaced wholesale, so ANY Anthropic call is visible here.
 const mockCreate = jest.fn();
-jest.mock('@anthropic-ai/sdk', () => jest.fn(() => ({ messages: { create: mockCreate } })));
+jest.mock('openai', () => jest.fn(() => ({ responses: { create: mockCreate } })));
 
 jest.mock('../services/seoFacts', () => ({
   buildFactSheet: jest.fn().mockResolvedValue({
@@ -85,17 +85,17 @@ const OWNER_KEYWORD = 'What a BLS Ambulance Carries';
 
 beforeEach(() => {
   mockPages = LIVE_PAGES;
-  process.env.ANTHROPIC_API_KEY = 'not-a-credential-the-sdk-is-mocked';
+  process.env.OPENAI_API_KEY = 'not-a-credential-the-sdk-is-mocked';
   jest.spyOn(SeoArticle, 'create').mockResolvedValue({});
 });
 afterEach(() => {
   jest.clearAllMocks();
   jest.restoreAllMocks();
-  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
 });
 
 // Every refusal must satisfy all three of these, or the guard has not saved
-// anything: no Anthropic call, no fact sheet, no draft row.
+// anything: no OpenAI call, no fact sheet, no draft row.
 const expectNothingSpent = () => {
   expect(mockCreate).not.toHaveBeenCalled();
   expect(buildFactSheet).not.toHaveBeenCalled();
@@ -242,7 +242,7 @@ describe('D. the existing token-set coverage still works', () => {
 describe('E. a free slug is let straight through', () => {
   test('the guard does not block, and the flow reaches the fact sheet', async () => {
     stubFindOne({ byKeyword: null, bySlug: null });
-    mockCreate.mockRejectedValue(new Error('stopped at the Claude boundary on purpose'));
+    mockCreate.mockRejectedValue(new Error('stopped at the model boundary on purpose'));
 
     // It fails at the Anthropic call, which is exactly the point: the pre-spend
     // guards let it through and generation began.
@@ -255,7 +255,7 @@ describe('E. a free slug is let straight through', () => {
 
   test('the refusal is not a duplicate or coverage error', async () => {
     stubFindOne({ byKeyword: null, bySlug: null });
-    mockCreate.mockRejectedValue(new Error('stopped at the Claude boundary on purpose'));
+    mockCreate.mockRejectedValue(new Error('stopped at the model boundary on purpose'));
 
     const err = await generateDraft({ keyword: 'what to ask before booking an ambulance' }, {}).catch((e) => e);
     expect(err.name).not.toBe('DuplicateKeywordError');

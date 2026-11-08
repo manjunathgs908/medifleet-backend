@@ -42,7 +42,7 @@ jest.mock('../models/SeoLivePage', () => ({
 
 // The SDK is replaced wholesale, so any Claude call is visible as a call here.
 const mockCreate = jest.fn();
-jest.mock('@anthropic-ai/sdk', () => jest.fn(() => ({ messages: { create: mockCreate } })));
+jest.mock('openai', () => jest.fn(() => ({ responses: { create: mockCreate } })));
 jest.mock('../services/seoFacts', () => ({
   buildFactSheet: jest.fn().mockResolvedValue({ business: {}, livePages: [], hash: 'h' }),
 }));
@@ -172,18 +172,18 @@ describe('other curated pages are matched too — not just freezer box', () => {
 // ============================================================
 describe('F. nothing is spent when the keyword is covered', () => {
   beforeEach(() => {
-    process.env.ANTHROPIC_API_KEY = 'not-a-credential-the-sdk-is-mocked';
+    process.env.OPENAI_API_KEY = 'not-a-credential-the-sdk-is-mocked';
     // No existing ARTICLE for the keyword, so only the coverage guard can stop it.
     jest.spyOn(SeoArticle, 'findOne').mockReturnValue({ select: () => ({ lean: async () => null }) });
     jest.spyOn(SeoArticle, 'create').mockResolvedValue({});
   });
-  afterEach(() => { jest.clearAllMocks(); jest.restoreAllMocks(); delete process.env.ANTHROPIC_API_KEY; });
+  afterEach(() => { jest.clearAllMocks(); jest.restoreAllMocks(); delete process.env.OPENAI_API_KEY; });
 
   test('a covered keyword throws KeywordCoveredError and calls Claude ZERO times', async () => {
     await expect(generateDraft({ keyword: 'Freezer Box in Bangalore' }, {}))
       .rejects.toMatchObject({ name: 'KeywordCoveredError' });
 
-    expect(mockCreate).not.toHaveBeenCalled();       // no Anthropic call
+    expect(mockCreate).not.toHaveBeenCalled();       // no OpenAI call
     expect(buildFactSheet).not.toHaveBeenCalled();   // not even the fact sheet
     expect(SeoArticle.create).not.toHaveBeenCalled(); // and no draft row
   });

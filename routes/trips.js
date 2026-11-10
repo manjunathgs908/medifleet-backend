@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
 const paymentCtrl = require('../controllers/paymentController');
+const tripCallCtrl = require('../controllers/tripCallController');
 // protectUserOrOwner on the two read routes only — a fleet Owner needs to
 // see their own trips, and protect() alone cannot serve them because it
 // looks subjects up in the User collection. Every other route here stays
@@ -31,6 +32,10 @@ router.post('/:id/messages', protect, authorize('driver'), tripCtrl.postDriverMe
 router.post('/:id/payment/order',  paymentCtrl.createOrder);
 router.post('/:id/payment/verify', paymentCtrl.verifyPayment);
 router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
+// Driver <-> customer masked call (Plivo masking number). from:'driver' uses
+// the driver login; from:'customer' must prove it is this trip's customer
+// (trackingToken or customer-app login). Only while the trip is active.
+router.post('/:id/call', tripCallCtrl.authenticate, tripCallCtrl.startCall);
 router.get('/live', protect, authorize(...OPERATIONS, 'driver'), tripCtrl.getLiveBoard);
 router.get('/', protectUserOrOwner, tripCtrl.getTrips);
 router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);

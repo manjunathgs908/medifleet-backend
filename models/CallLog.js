@@ -40,6 +40,13 @@ const CallLogSchema = new mongoose.Schema(
     // recorded per call so it can be checked, not assumed.
     callerId: { type: String },
 
+    // Driver<->customer masked trip call (POST /api/trips/:id/call,
+    // services/tripCalls.js): bridged on PLIVO_MASKING_NUMBER, and only while
+    // the trip is still active -- re-checked when the first party answers.
+    // Context stays 'trip', so the CRM lists these exactly like before.
+    tripMasked  : { type: Boolean },
+    tripCallFrom: { type: String, enum: ['driver', 'customer'] },
+
     // What the call was about.
     context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming', 'test_ring'], required: true },
     trip        : { type: mongoose.Schema.Types.ObjectId, ref: 'Trip', index: true },

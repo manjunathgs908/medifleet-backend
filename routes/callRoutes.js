@@ -18,6 +18,7 @@ const { connectCall } = require('../services/exotelService');
 const plivo = require('../services/plivoService');
 const { placePlivoCall, ringPhoneOf } = require('../controllers/callController');
 const { normalisePhone } = require('../utils/phone');
+const { assertCallable, TripCallError } = require('../services/tripCalls');
 
 // Public base URL Exotel posts call-status updates back to. Hardcoded
 // like the other external API URLs in this codebase (see
@@ -65,6 +66,16 @@ router.post('/connect', async (req, res, next) => {
       : { tripNumber: tripId };
     const trip = await Trip.findOne(query).populate('driver', 'name phone callPhone');
     if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+
+    // Calls between driver and customer close when the trip does -- the same
+    // rule as POST /api/trips/:id/call (services/tripCalls.js). The released
+    // customer app shows `message` from a non-2xx response as-is.
+    try {
+      assertCallable(trip, initiator);
+    } catch (err) {
+      if (!(err instanceof TripCallError)) throw err;
+      return res.status(err.status).json({ success: false, code: err.code, message: err.message });
+    }
 
     const driverPhone   = trip.driver?.phone;
     const customerPhone = trip.patientPhone;

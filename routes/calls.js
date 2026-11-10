@@ -10,6 +10,7 @@
 const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../controllers/callController');
+const tripCallCtrl = require('../controllers/tripCallController');
 const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
 const { OPERATIONS: CRM_CALLS } = require('../middleware/auth');
@@ -29,6 +30,11 @@ router.all('/test-answer', ctrl.requirePlivoSignature, ctrl.testAnswer);
 router.all('/transfer-answer', ctrl.requirePlivoSignature, ctrl.transferAnswer);
 // The phone Dial's live report: a phone picked up, or hung up.
 router.all('/dial-event', ctrl.requirePlivoSignature, ctrl.dialEvent);
+// Driver <-> customer masked trip calls (controllers/tripCallController.js):
+// the initiator answered -> bridge if the trip is still active; and the
+// answer URL for the masking number's own application (a redial).
+router.all('/trip-answer',  ctrl.requirePlivoSignature, tripCallCtrl.answer);
+router.all('/trip-inbound', ctrl.requirePlivoSignature, tripCallCtrl.inbound);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
 // cannot reach these. Telecallers (CRM_CALLS) take and return customer

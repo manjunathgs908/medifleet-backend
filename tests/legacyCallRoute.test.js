@@ -38,7 +38,7 @@ const connect = router.stack.find((l) => l.route?.path === '/connect').route.sta
 
 const CUSTOMER = '9986844442';
 const trip = {
-  _id: 't1', patientPhone: CUSTOMER, callLogs: [], save: jest.fn(),
+  _id: 't1', patientPhone: CUSTOMER, callLogs: [], save: jest.fn(), status: 'en_route', driverConfirmed: true,
   driver: { _id: 'd1', name: 'Ravi', phone: '9123456789', callPhone: '9876500000' },
 };
 const populated = (value) => ({ populate: () => Promise.resolve(value) });
@@ -79,4 +79,22 @@ it('a driver on an older app build rings their own call ring number first', asyn
   expect(exotel.connectCall).not.toHaveBeenCalled();
   expect(mockCreateCall.mock.calls[0][1]).toBe('919876500000');
   expect(CallLog.create.mock.calls[0][0].firstLeg).toBe('agent');
+});
+
+// Calls close with the trip (same rule as POST /api/trips/:id/call). The
+// released customer app shows `message` from a non-2xx response.
+it.each([
+  ['completed', 'TRIP_COMPLETED'],
+  ['cancelled', 'TRIP_CANCELLED'],
+])('a %s trip is refused (409 %s) and nobody is rung', async (status, code) => {
+  Trip.findOne.mockReturnValue(populated({ ...trip, status }));
+  for (const initiator of ['customer', 'driver']) {
+    const res = await call({ tripId: 't1', initiator });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ success: false, code });
+    expect(res.body.message).toMatch(/closed/);
+  }
+  expect(mockCreateCall).not.toHaveBeenCalled();
+  expect(exotel.connectCall).not.toHaveBeenCalled();
+  expect(CallLog.create).not.toHaveBeenCalled();
 });

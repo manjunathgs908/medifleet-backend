@@ -55,20 +55,26 @@ const apiUrl = (path) => `${PUBLIC_API_BASE}${path}`;
 // number, and only the call-log id travels in the URLs: /answer looks the
 // other number up again, so it is never in a URL, a query string or a
 // client.
-async function callFirstLeg({ phone, logId }) {
+//
+// Optional, for driver<->customer trip calls (services/tripCalls.js):
+// callerId (the masking number instead of PLIVO_NUMBER), answerPath (its own
+// answer webhook, which re-checks the trip is still active) and timeLimit.
+// Every existing caller passes none of these and is unchanged.
+async function callFirstLeg({ phone, logId, callerId, answerPath = '/api/calls/answer', timeLimit = 3600 }) {
+  const from = callerId || companyNumber();
   const res = await getClient().calls.create(
-    companyNumber(),
+    from,
     toE164(phone),
-    apiUrl(`/api/calls/answer?log=${logId}`),
+    apiUrl(`${answerPath}?log=${logId}`),
     {
       answerMethod : 'POST',
       hangupUrl    : apiUrl(`/api/calls/events?log=${logId}`),
       hangupMethod : 'POST',
       ringTimeout  : 40,
-      timeLimit    : 3600,
+      timeLimit,
     },
   );
-  return { requestId: res.requestUuid || res.request_uuid || null, callerId: companyNumber() };
+  return { requestId: res.requestUuid || res.request_uuid || null, callerId: from };
 }
 
 // "Ring my phone now (test)": rings one staff ring phone from the company
@@ -346,7 +352,9 @@ const PHONE_RING_SECONDS = 40;
 // hangs up (DialAction=hangup). The action URL only fires when the Dial
 // ends, which is too late for the CRM to offer Transfer on a call answered
 // on a phone.
-function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS }) {
+// callerId: optional, for trip calls on the masking number; defaults to
+// PLIVO_NUMBER exactly as before. timeLimit likewise defaults to an hour.
+function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS, callerId, timeLimit = 3600 }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
   const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
   const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
@@ -357,7 +365,7 @@ function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_
     : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
-    + `<Dial callerId="${esc(companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="3600"${live}${sipHeaders}>${legs}</Dial>`,
+    + `<Dial callerId="${esc(callerId || companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="${Number(timeLimit) || 3600}"${live}${sipHeaders}>${legs}</Dial>`,
   );
 }
 

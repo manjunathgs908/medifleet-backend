@@ -311,6 +311,20 @@ const hangupCall = (uuid) => plivoRest('delete', `/Call/${encodeURIComponent(uui
 
 const deleteEndpoint = (endpointId) => plivoRest('delete', `/Endpoint/${encodeURIComponent(endpointId)}/`);
 
+// Creates one endpoint exactly as asked — for the in-app trip calls
+// (services/tripVoip.js), which keep their own records and link their
+// endpoints to the "SaveLife Trip VoIP" application, never the CRM's.
+// Plivo appends digits to `username`; the real one comes back.
+async function createEndpoint({ username, password, alias, appId }) {
+  const { data } = await plivoRest('post', '/Endpoint/', {
+    username, password, alias, ...(appId ? { app_id: appId } : {}),
+  });
+  if (!data?.username || !data?.endpoint_id) {
+    throw Object.assign(new Error('Plivo returned no endpoint'), { response: { data } });
+  }
+  return { id: data.endpoint_id, username: data.username };
+}
+
 // Plivo issues the token: POST /JWT/Token/ — only used when
 // PLIVO_WEBRTC_LOGIN=token (password login is the default). Receive-only:
 // the outgoing grant was tried and did not help registration, and the CRM
@@ -354,18 +368,38 @@ const PHONE_RING_SECONDS = 40;
 // on a phone.
 // callerId: optional, for trip calls on the masking number; defaults to
 // PLIVO_NUMBER exactly as before. timeLimit likewise defaults to an hour.
-function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS, callerId, timeLimit = 3600 }) {
+// In-app trip calls (services/tripVoip.js) also pass, all optional:
+//   actionPath  the Dial's action webhook instead of /api/calls/events —
+//               trip VoIP calls must never reach the CRM's "app not
+//               answered -> ring the on-duty phones" step there;
+//   sipHeaders  extra { key: value } pairs (letters/digits only) sent to
+//               the in-app legs after logId;
+//   callerName  the name the in-app leg shows;
+//   callbackPath  the Dial's live callbackUrl (DialAction=answer the moment
+//               the other side picks up) — how a trip VoIP call knows it is
+//               CONNECTED, not just ringing.
+// Every existing caller passes none of them and gets exactly the old XML.
+const SIP_HEADER_RE = /^[A-Za-z0-9]{1,32}$/;
+function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS, callerId, timeLimit = 3600, actionPath, sipHeaders: extraHeaders, callerName, callbackPath }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
-  const dialUrl = esc(apiUrl(`/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
+  const dialUrl = esc(apiUrl(actionPath
+    ? `${actionPath}?log=${logId}`
+    : `/api/calls/events?log=${logId}&leg=dial${stage ? `&stage=${stage}` : ''}`));
   const legs = numbers.map((n) => `<Number>${esc(toE164(n))}</Number>`).join('')
     + sipUsers.map((u) => `<User>${esc(sipUri(u))}</User>`).join('');
-  const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}"` : '';
+  const extra = Object.entries(extraHeaders || {})
+    .filter(([k, v]) => SIP_HEADER_RE.test(k) && SIP_HEADER_RE.test(String(v)))
+    .map(([k, v]) => `,${k}=${v}`).join('');
+  const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}${esc(extra)}"` : '';
   const live = stage === 'phone'
     ? ` callbackUrl="${esc(apiUrl(`/api/calls/dial-event?log=${logId}&stage=phone`))}" callbackMethod="POST"`
-    : '';
+    : callbackPath
+      ? ` callbackUrl="${esc(apiUrl(`${callbackPath}?log=${logId}`))}" callbackMethod="POST"`
+      : '';
+  const name = callerName ? ` callerName="${esc(callerName)}"` : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`
-    + `<Dial callerId="${esc(callerId || companyNumber())}" action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="${Number(timeLimit) || 3600}"${live}${sipHeaders}>${legs}</Dial>`,
+    + `<Dial callerId="${esc(callerId || companyNumber())}"${name} action="${dialUrl}" method="POST" redirect="true" timeout="${timeout}" timeLimit="${Number(timeLimit) || 3600}"${live}${sipHeaders}>${legs}</Dial>`,
   );
 }
 
@@ -396,7 +430,9 @@ function transferXml({ numbers = [], sipUsers = [], logId, transfer, step, say, 
 }
 
 const speakXml = (text) => xml(`<Speak language="en-IN">${esc(text)}</Speak><Hangup/>`);
-const hangupXml = () => xml('<Hangup/>');
+// reason 'busy' / 'rejected' tells an in-app caller's SDK why (a SIP busy
+// or decline instead of a plain end). No reason -> the old <Hangup/>.
+const hangupXml = (reason) => xml(['busy', 'rejected'].includes(reason) ? `<Hangup reason="${reason}"/>` : '<Hangup/>');
 const emptyXml = () => xml('');
 
 // ── AI telecaller (PILOT — services/aiCaller) ───────────────────────────
@@ -467,6 +503,7 @@ module.exports = {
   callFirstLeg, callTestRing, logCall, friendlyError, isValidSignature, checkSignature,
   ensureEndpoint, issueToken, applicationId, endpointAlias, sipUri,
   getEndpoint, linkEndpointToApp, resetEndpointPassword, listLiveCalls, listLiveCallIds, hangupCall, deleteEndpoint,
+  createEndpoint, SIP_DOMAIN,
   APP_RING_SECONDS, PHONE_RING_SECONDS, TRANSFER_RING_SECONDS,
   bridgeXml, transferXml, transferCall, speakXml, hangupXml, emptyXml,
   callAiLeg, aiStreamXml, aiHandoffXml,

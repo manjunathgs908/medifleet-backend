@@ -11,6 +11,7 @@ const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../controllers/callController');
 const tripCallCtrl = require('../controllers/tripCallController');
+const tripVoipCtrl = require('../controllers/tripVoipController');
 const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
 const { OPERATIONS: CRM_CALLS } = require('../middleware/auth');
@@ -35,6 +36,17 @@ router.all('/dial-event', ctrl.requirePlivoSignature, ctrl.dialEvent);
 // answer URL for the masking number's own application (a redial).
 router.all('/trip-answer',  ctrl.requirePlivoSignature, tripCallCtrl.answer);
 router.all('/trip-inbound', ctrl.requirePlivoSignature, tripCallCtrl.inbound);
+// In-app (VoIP) customer -> driver calls (controllers/tripVoipController.js):
+// the "SaveLife Trip VoIP" application's answer and hangup URLs, and the
+// Dial's action. They ring the driver's app only — never a phone.
+router.all('/trip-voip-answer', ctrl.requirePlivoSignature, tripVoipCtrl.answer);
+router.all('/trip-voip-dial',   ctrl.requirePlivoSignature, tripVoipCtrl.dial);
+router.all('/trip-voip-dial-event', ctrl.requirePlivoSignature, tripVoipCtrl.dialEvent);
+router.all('/trip-voip-hangup', ctrl.requirePlivoSignature, tripVoipCtrl.hangup);
+// The driver app's own in-app calling login (one endpoint per device) and
+// presence. Drivers only.
+router.get ('/driver-voip/login',    protect, authorize('driver'), tripVoipCtrl.driverLogin);
+router.post('/driver-voip/presence', protect, authorize('driver'), tripVoipCtrl.driverPresence);
 
 // CRM only. protect() resolves CRM Users only, so a fleet Owner's token
 // cannot reach these. Telecallers (CRM_CALLS) take and return customer

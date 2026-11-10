@@ -38,6 +38,21 @@ const customerBill = require('../services/customerBill');
 const trackingNotifications = require('../services/trackingNotifications');
 const { dispatchStateOf, countDispatchStates, hasCrew, parseScheduleDate } = require('../utils/dispatchUrgency');
 
+// In-app (VoIP) trip calls end with the trip (services/tripVoip.js): new
+// calls are refused by the trip's status; a call still RINGING is ended so
+// it never connects; a CONNECTED call runs on until someone presses End, and
+// the trip's customer login is removed once no call is left. Runs after the
+// commit, is never awaited, and can never fail the request that ended the
+// trip. Loaded on use, so this controller never pulls in the Plivo SDK.
+function closeTripVoip(tripId, reason) {
+  try {
+    // eslint-disable-next-line global-require
+    require('../services/tripVoip').closeTripVoip(tripId, reason).catch(() => {});
+  } catch (err) {
+    console.error('[trip-voip] close hook failed:', err?.message || err);
+  }
+}
+
 const GOOGLE_DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
 
 // Independently resolves the route server-side via Google Directions, using
@@ -769,6 +784,7 @@ exports.updateStatus = async (req, res, next) => {
     }
     if (!committed.ok) return busy(res);
     Object.assign(trip, { status, enRouteAt: committed.result.enRouteAt, cancelledAt: committed.result.cancelledAt });
+    if (status === 'cancelled') closeTripVoip(trip._id, 'cancelled');
 
     // Only reachable from 'dispatched' per validTransitions above — this
     // is the driver heading toward pickup, not toward the hospital (that
@@ -1382,6 +1398,7 @@ exports.completeTrip = async (req, res, next) => {
     }
     if (!committed.ok) return busy(res);
     const { trip, bill } = committed.result;
+    closeTripVoip(trip._id, 'completed');
 
     // After the commit only. The customer's bill on WhatsApp (trip_bill) is
     // the one completion message — trip_complete is no longer sent, so the
@@ -1559,6 +1576,7 @@ exports.cancelTrip = async (req, res, next) => {
     }
     if (!committed.ok) return busy(res);
     const trip = committed.result;
+    closeTripVoip(trip._id, 'cancelled');
 
     return res.json({ success: true, message: 'Trip cancelled.', trip });
   } catch (err) {
@@ -1619,6 +1637,7 @@ exports.customerCancelTrip = async (req, res, next) => {
     }
     if (!committed.ok) return res.status(409).json({ success: false, message: 'This trip was just updated. Please refresh, or call the helpline.' });
     Object.assign(trip, { status: committed.result.status, cancelledAt: committed.result.cancelledAt });
+    closeTripVoip(trip._id, 'cancelled');
 
     return res.json({
       success: true,

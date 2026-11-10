@@ -55,6 +55,8 @@ jest.mock('../services/whatsappNotifications', () => ({
 }));
 jest.mock('../services/trackingNotifications', () => ({ notifyTrackingLink: jest.fn(async () => {}) }));
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
+// The in-app call hook (services/tripVoip.js) — checked below, never run.
+jest.mock('../services/tripVoip', () => ({ closeTripVoip: jest.fn(async () => ({})) }));
 
 const { Trip, User, Bill, Income, Notification } = require('../models');
 const Ambulance = require('../models/Ambulance');
@@ -560,5 +562,53 @@ describe('an expired claim can never commit', () => {
     expect(+t().transitionClaimedAt).toBe(+mine);
     await ctrl._releaseTrip('T1', mine);
     expect(t().transitionClaimedAt).toBeUndefined();
+  });
+});
+
+describe('in-app (VoIP) call hook: runs once the trip has really ended', () => {
+  const tripVoip = require('../services/tripVoip');
+  beforeEach(() => {
+    useStore();
+    tripVoip.closeTripVoip.mockClear();
+    tripVoip.closeTripVoip.mockImplementation(async () => ({}));
+  });
+  const customerCancel = () => run(ctrl.customerCancelTrip, { params: { id: 'T1' }, body: { reason: 'Not needed' } });
+  const driverCancel = () => run(ctrl.updateStatus, { params: { id: 'T1' }, body: { status: 'cancelled', reason: 'Patient refused transport' }, user: { _id: 'd1', role: 'driver' } });
+
+  it.each([
+    ['completeTrip', 'completed', complete],
+    ['cancelTrip (CRM)', 'cancelled', cancel],
+    ['customerCancelTrip', 'cancelled', customerCancel],
+    ['updateStatus cancelled (driver)', 'cancelled', driverCancel],
+  ])('%s -> closeTripVoip(trip, "%s") after the commit', async (_l, reason, act) => {
+    const t = put({ status: 'en_route', ...CREW });
+    const res = await act();
+    expect(res.statusCode).toBe(200);
+    expect(t().status).toBe(reason);
+    expect(tripVoip.closeTripVoip).toHaveBeenCalledTimes(1);
+    expect(tripVoip.closeTripVoip).toHaveBeenCalledWith('T1', reason);
+  });
+
+  it('not on a refused or failed change, nor on start-trip', async () => {
+    put({ status: 'en_route', ...CREW });
+    await run(ctrl.cancelTrip, { params: { id: 'T1' }, body: { reason: 'x' } });          // no reason
+    const fareCalculator = require('../utils/fareCalculator');
+    fareCalculator.compute.mockRejectedValueOnce(new Error('No active pricing'));
+    expect((await complete()).statusCode).toBe(400);                                      // completion failed
+    put({ status: 'dispatched', ...CREW });
+    expect((await run(ctrl.updateStatus, { params: { id: 'T1' }, body: { status: 'en_route' }, user: { _id: 'd1', role: 'driver' } })).statusCode).toBe(200);
+    put({ status: 'completed', ...CREW });
+    expect((await cancel()).statusCode).toBe(400);                                        // already ended
+    expect(tripVoip.closeTripVoip).not.toHaveBeenCalled();
+  });
+
+  it('a failing hook never fails the request that ended the trip', async () => {
+    tripVoip.closeTripVoip.mockImplementation(() => { throw new Error('boom'); });
+    const t = put({ status: 'en_route', ...CREW });
+    expect((await complete()).statusCode).toBe(200);
+    expect(t().status).toBe('completed');
+    tripVoip.closeTripVoip.mockImplementation(async () => { throw new Error('async boom'); });
+    put({ status: 'en_route', ...CREW });
+    expect((await cancel()).statusCode).toBe(200);
   });
 });

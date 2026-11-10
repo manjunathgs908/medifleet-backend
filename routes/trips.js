@@ -4,6 +4,7 @@ const router = express.Router();
 const tripCtrl = require('../controllers/tripController');
 const paymentCtrl = require('../controllers/paymentController');
 const tripCallCtrl = require('../controllers/tripCallController');
+const tripVoipCtrl = require('../controllers/tripVoipController');
 // protectUserOrOwner on the two read routes only — a fleet Owner needs to
 // see their own trips, and protect() alone cannot serve them because it
 // looks subjects up in the User collection. Every other route here stays
@@ -36,6 +37,13 @@ router.put('/:id/push-token', tripCtrl.registerCustomerPushToken);
 // the driver login; from:'customer' must prove it is this trip's customer
 // (trackingToken or customer-app login). Only while the trip is active.
 router.post('/:id/call', tripCallCtrl.authenticate, tripCallCtrl.startCall);
+// In-app (VoIP) customer -> driver call (controllers/tripVoipController.js).
+// Auth: the trip's customer proves it (trackingToken in the body or the
+// X-Tracking-Token header, or the customer-app login) inside each handler,
+// same as /call's customer path. Only while the trip is active.
+router.post('/:id/voip/session', tripVoipCtrl.session);
+router.get('/:id/voip/:logId', tripVoipCtrl.status);
+router.post('/:id/voip/:logId/end', tripVoipCtrl.end);
 router.get('/live', protect, authorize(...OPERATIONS, 'driver'), tripCtrl.getLiveBoard);
 router.get('/', protectUserOrOwner, tripCtrl.getTrips);
 router.get('/:id', protectUserOrOwner, tripCtrl.getTripById);

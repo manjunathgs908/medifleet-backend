@@ -102,6 +102,21 @@ function resolveParties(trip) {
 }
 
 /**
+ * A trip's id travels in the customer app, so cap how often one trip can
+ * ring anybody -- cheap protection against a stuck button or abuse. Phone
+ * calls and in-app calls (services/tripVoip.js) share the one budget: both
+ * are tripMasked rows.
+ */
+async function assertRateLimit(tripId) {
+  const recent = await CallLog.countDocuments({
+    trip: tripId, tripMasked: true, startedAt: { $gte: new Date(Date.now() - RATE_WINDOW_MS) },
+  });
+  if (recent >= maxPerWindow()) {
+    throw new TripCallError(429, 'RATE_LIMITED', 'Too many calls on this trip in the last few minutes. Please wait a little and try again.');
+  }
+}
+
+/**
  * Validate, rate-limit, log and ring the initiator. `trip` must have
  * driver populated with name/phone/callPhone and carry patientPhone,
  * status and driverConfirmed.
@@ -119,14 +134,7 @@ async function placeTripCall(trip, from) {
     throw new TripCallError(503, 'NOT_CONFIGURED', 'Calling is not set up on the server right now.');
   }
 
-  // A trip's id travels in the customer app, so cap how often one trip can
-  // ring anybody -- cheap protection against a stuck button or abuse.
-  const recent = await CallLog.countDocuments({
-    trip: trip._id, tripMasked: true, startedAt: { $gte: new Date(Date.now() - RATE_WINDOW_MS) },
-  });
-  if (recent >= maxPerWindow()) {
-    throw new TripCallError(429, 'RATE_LIMITED', 'Too many calls on this trip in the last few minutes. Please wait a little and try again.');
-  }
+  await assertRateLimit(trip._id);
 
   const { number: callerId, dedicated } = maskingNumber();
   const log = await CallLog.create({
@@ -182,6 +190,7 @@ module.exports = {
   TripCallError,
   assertCallable,
   resolveParties,
+  assertRateLimit,
   placeTripCall,
   maskingNumber,
   maxSeconds,

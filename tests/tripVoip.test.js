@@ -368,6 +368,7 @@ describe('B. /api/calls/trip-voip-answer', () => {
     expect(xml).not.toContain('<Number>');
     expect(xml).toContain('timeout="25"');
     expect(xml).toContain(`/api/calls/trip-voip-dial?log=${s.body.callLogId}`);
+    expect(xml).toContain(`callbackUrl="https://api.savelife.health/api/calls/trip-voip-dial-event?log=${s.body.callLogId}"`); // live: picked up = connected
     expect(xml).not.toContain('/api/calls/events');
     expect(xml).toContain(`sipHeaders="logId=${s.body.callLogId},tripId=${TRIP_ID}"`);
     expect(xml).toContain('callerName="SaveLife Customer"');
@@ -541,55 +542,132 @@ describe('D. the app\'s status and End', () => {
 
 // ============================================================
 describe('E. trip completed / cancelled -> closeTripVoip', () => {
-  test('hangs up the live call, closes pending sessions, deletes the trip\'s endpoint', async () => {
-    const { s } = await startRinging();
-    const pending = await session();
-    trips[TRIP_ID].status = 'completed';
-    const r = await voip.closeTripVoip(TRIP_ID, 'completed');
-    expect(r).toEqual({ hungUp: 1, endpointDeleted: true });
-    expect(plivo.hangupCall).toHaveBeenCalledWith('call-a-1');
+  const caller = (s) => `sip:${s.body.username}@phone.plivo.com`;
+  const connect = (s) => run(ctrl.dialEvent, reqOf({ query: { log: s.body.callLogId }, body: { DialAction: 'answer', DialBLegUUID: 'b-1' } }));
+  const endTrip = async (status) => { trips[TRIP_ID].status = status; return voip.closeTripVoip(TRIP_ID, status); };
+
+  test.each(['completed', 'cancelled'])('(a) %s with no call in progress -> session cleaned up, new calls refused', async (status) => {
+    await driverLogin();
+    const s = await session();                     // an earlier session, never dialled
+    const r = await endTrip(status);
+    expect(r).toEqual({ sessionsClosed: 1, ringingEnded: 0, connectedLeftRunning: 0, endpointDeleted: true });
     expect(plivo.deleteEndpoint).toHaveBeenCalledTimes(1);
-    expect(customerEp()).toBeUndefined();
-    expect(logRow(pending.body.callLogId).status).toBe('blocked_trip_inactive');
-    // Plivo then reports the hang-up: recorded as ended by the trip, not as a customer cancel.
-    await hangup({ CallUUID: 'call-a-1', 'X-PH-logId': s.body.callLogId });
+    expect(customerEp()).toBeUndefined();          // the trip's Plivo login is gone
+    expect(plivo.hangupCall).not.toHaveBeenCalled();
+    // New calls refused: a new session, and the old session dialled late.
+    const again = await session();
+    expect(again.statusCode).toBe(409);
+    expect(again.body.code).toBe(status === 'completed' ? 'TRIP_COMPLETED' : 'TRIP_CANCELLED');
+    const late = await answer({ From: caller(s), 'X-PH-logId': s.body.callLogId, CallUUID: 'late' });
+    expect(late.body).not.toContain('<Dial');
     expect(logRow(s.body.callLogId).status).toBe('blocked_trip_inactive');
   });
 
-  test('after closing, the old login cannot place a call', async () => {
-    await driverLogin();
-    const s = await session();
-    trips[TRIP_ID].status = 'cancelled';
-    await voip.closeTripVoip(TRIP_ID, 'cancelled');
-    const a = await answer({ From: `sip:${s.body.username}@phone.plivo.com`, 'X-PH-logId': s.body.callLogId });
-    expect(a.body).not.toContain('<Dial');
+  test('(b) trip ends while the call is RINGING -> ended, and the driver\'s late answer never connects', async () => {
+    const { s } = await startRinging();
+    const r = await endTrip('completed');
+    expect(r).toEqual({ sessionsClosed: 0, ringingEnded: 1, connectedLeftRunning: 0, endpointDeleted: true });
+    expect(plivo.hangupCall).toHaveBeenCalledWith('call-a-1');   // the ringing call is ended
+    expect(logRow(s.body.callLogId).status).toBe('blocked_trip_inactive');
+    // The driver taps Answer a moment later: not connected, hung up again.
+    plivo.hangupCall.mockClear();
+    await connect(s);
+    expect(logRow(s.body.callLogId).status).toBe('blocked_trip_inactive');
+    expect(logRow(s.body.callLogId).answeredAt).toBeUndefined();
+    expect(plivo.hangupCall).toHaveBeenCalledWith('call-a-1');
+    // Plivo's reports then arrive; nothing turns it into a connected call.
+    await dial(s.body.callLogId, { DialStatus: 'no-answer' });
+    await hangup({ CallUUID: 'call-a-1', 'X-PH-logId': s.body.callLogId });
+    expect(logRow(s.body.callLogId).status).toBe('blocked_trip_inactive');
+    expect((await statusOf(s.body.callLogId)).body).toEqual(expect.objectContaining({ ok: false, code: 'TRIP_COMPLETED' }));
   });
 
-  test('a connected call cut by the trip end keeps its talk time', async () => {
+  test('(b) the answer arriving after the trip ended (hook not yet run) also never connects', async () => {
     const { s } = await startRinging();
-    await voip.closeTripVoip(TRIP_ID, 'completed');
-    await dial(s.body.callLogId, { DialStatus: 'completed', DialBLegDuration: '30' });
-    expect(logRow(s.body.callLogId)).toEqual(expect.objectContaining({ status: 'completed', talkSec: 30 }));
+    trips[TRIP_ID].status = 'cancelled';           // ended; closeTripVoip has not run yet
+    await connect(s);
+    expect(logRow(s.body.callLogId).status).toBe('blocked_trip_inactive');
+    expect(plivo.hangupCall).toHaveBeenCalledWith('call-a-1');
+  });
+
+  test('(c) trip ends while CONNECTED -> the call continues; cleaned up only after End', async () => {
+    const { s } = await startRinging();
+    await connect(s);
+    expect(logRow(s.body.callLogId).status).toBe('agent_answered');
+    expect((await statusOf(s.body.callLogId)).body).toEqual(expect.objectContaining({ ok: true, state: 'connected' }));
+
+    const r = await endTrip('completed');
+    expect(r).toEqual({ sessionsClosed: 0, ringingEnded: 0, connectedLeftRunning: 1, endpointDeleted: false });
+    expect(plivo.hangupCall).not.toHaveBeenCalled();   // NOT force-hung-up
+    expect(plivo.deleteEndpoint).not.toHaveBeenCalled(); // its login stays while it talks
+    expect(customerEp()).toBeTruthy();
+    expect(logRow(s.body.callLogId).status).toBe('agent_answered');
+    expect((await statusOf(s.body.callLogId)).body.state).toBe('connected');
+    // A sweep while it is still going leaves it alone too.
+    await voip.sweepEndedTrips({ force: true });
+    expect(customerEp()).toBeTruthy();
+    expect(plivo.hangupCall).not.toHaveBeenCalled();
+
+    // The customer presses End: the call is hung up, Plivo reports the end,
+    // and only now is the trip's login removed.
+    expect((await end(s.body.callLogId)).body.hungUp).toBe(true);
+    expect(customerEp()).toBeTruthy();
+    await hangup({ CallUUID: 'call-a-1', Duration: '95', 'X-PH-logId': s.body.callLogId });
+    await dial(s.body.callLogId, { DialStatus: 'completed', DialBLegDuration: '80' });
+    expect(logRow(s.body.callLogId)).toEqual(expect.objectContaining({ status: 'completed', talkSec: 80, totalSec: 95 }));
+    expect(plivo.deleteEndpoint).toHaveBeenCalledTimes(1);
+    expect(customerEp()).toBeUndefined();
+  });
+
+  test('(c) the DRIVER presses End after the trip ended -> same clean-up', async () => {
+    const { s } = await startRinging();
+    await connect(s);
+    await endTrip('cancelled');
+    // The driver's leg ends the Dial first, then the whole call.
+    await dial(s.body.callLogId, { DialStatus: 'completed', DialBLegDuration: '40' });
+    expect(customerEp()).toBeUndefined();
+    await hangup({ CallUUID: 'call-a-1', 'X-PH-logId': s.body.callLogId });
+    expect(logRow(s.body.callLogId)).toEqual(expect.objectContaining({ status: 'completed', talkSec: 40 }));
+    expect(plivo.deleteEndpoint).toHaveBeenCalledTimes(1);
+  });
+
+  test('(c) while one call is connected, no other call can start on the ended trip', async () => {
+    const { s } = await startRinging();
+    await connect(s);
+    await endTrip('completed');
+    expect((await session()).body.code).toBe('TRIP_COMPLETED');
+    const replay = await answer({ From: caller(s), 'X-PH-logId': s.body.callLogId, CallUUID: 'second' });
+    expect(replay.body).not.toContain('<Dial');
+  });
+
+  test('a call ending on an ACTIVE trip keeps the trip\'s login for the next call', async () => {
+    const { s } = await startRinging();
+    await connect(s);
+    await hangup({ CallUUID: 'call-a-1', 'X-PH-logId': s.body.callLogId });
+    expect(logRow(s.body.callLogId).status).toBe('completed');
+    expect(customerEp()).toBeTruthy();
+    expect(plivo.deleteEndpoint).not.toHaveBeenCalled();
+  });
+
+  test('a "connected" row whose hang-up never arrived does not keep the login forever', async () => {
+    const { s } = await startRinging();
+    await connect(s);
+    logRow(s.body.callLogId).startedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    expect((await endTrip('completed')).endpointDeleted).toBe(true);
   });
 
   test('never throws; a failed Plivo delete keeps the record for the sweep to retry', async () => {
     await driverLogin();
     await session();
+    trips[TRIP_ID].status = 'completed';
     plivo.deleteEndpoint.mockRejectedValueOnce(Object.assign(new Error('down'), { response: { status: 503 } }));
-    await expect(voip.closeTripVoip(TRIP_ID, 'completed')).resolves.toEqual({ hungUp: 0, endpointDeleted: false });
+    expect((await voip.closeTripVoip(TRIP_ID, 'completed')).endpointDeleted).toBe(false);
     expect(customerEp()).toBeTruthy();
     plivo.deleteEndpoint.mockRejectedValueOnce(Object.assign(new Error('gone'), { response: { status: 404 } }));
-    expect((await voip.closeTripVoip(TRIP_ID, 'completed')).endpointDeleted).toBe(true);
-    CallLog.find.mockImplementationOnce(() => { throw new Error('db down'); });
-    await expect(voip.closeTripVoip(TRIP_ID, 'completed')).resolves.toBeDefined();
-  });
-
-  test('the sweep closes endpoints of trips that ended by any path', async () => {
-    await driverLogin();
-    await session();
-    trips[TRIP_ID].status = 'completed';
     expect(await voip.sweepEndedTrips({ force: true })).toBe(1);
     expect(customerEp()).toBeUndefined();
+    CallLog.find.mockImplementationOnce(() => { throw new Error('db down'); });
+    await expect(voip.closeTripVoip(TRIP_ID, 'completed')).resolves.toBeDefined();
   });
 });
 
@@ -678,7 +756,7 @@ describe('H. wiring, and the shared bridge unchanged', () => {
   });
 
   test('webhooks: Plivo signature first', () => {
-    for (const [p, h] of [['/trip-voip-answer', ctrl.answer], ['/trip-voip-dial', ctrl.dial], ['/trip-voip-hangup', ctrl.hangup]]) {
+    for (const [p, h] of [['/trip-voip-answer', ctrl.answer], ['/trip-voip-dial', ctrl.dial], ['/trip-voip-dial-event', ctrl.dialEvent], ['/trip-voip-hangup', ctrl.hangup]]) {
       expect(layer(callsRouter, p, 'post').map((s) => s.handle)).toEqual([callCtrl.requirePlivoSignature, h]);
     }
   });

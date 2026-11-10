@@ -374,10 +374,13 @@ const PHONE_RING_SECONDS = 40;
 //               answered -> ring the on-duty phones" step there;
 //   sipHeaders  extra { key: value } pairs (letters/digits only) sent to
 //               the in-app legs after logId;
-//   callerName  the name the in-app leg shows.
+//   callerName  the name the in-app leg shows;
+//   callbackPath  the Dial's live callbackUrl (DialAction=answer the moment
+//               the other side picks up) — how a trip VoIP call knows it is
+//               CONNECTED, not just ringing.
 // Every existing caller passes none of them and gets exactly the old XML.
 const SIP_HEADER_RE = /^[A-Za-z0-9]{1,32}$/;
-function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS, callerId, timeLimit = 3600, actionPath, sipHeaders: extraHeaders, callerName }) {
+function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_RING_SECONDS, callerId, timeLimit = 3600, actionPath, sipHeaders: extraHeaders, callerName, callbackPath }) {
   const recordUrl = esc(apiUrl(`/api/calls/recording?log=${logId}`));
   const dialUrl = esc(apiUrl(actionPath
     ? `${actionPath}?log=${logId}`
@@ -390,7 +393,9 @@ function bridgeXml({ numbers = [], sipUsers = [], logId, stage, timeout = PHONE_
   const sipHeaders = sipUsers.length ? ` sipHeaders="logId=${esc(logId)}${esc(extra)}"` : '';
   const live = stage === 'phone'
     ? ` callbackUrl="${esc(apiUrl(`/api/calls/dial-event?log=${logId}&stage=phone`))}" callbackMethod="POST"`
-    : '';
+    : callbackPath
+      ? ` callbackUrl="${esc(apiUrl(`${callbackPath}?log=${logId}`))}" callbackMethod="POST"`
+      : '';
   const name = callerName ? ` callerName="${esc(callerName)}"` : '';
   return xml(
     `<Record action="${recordUrl}" method="POST" callbackUrl="${recordUrl}" callbackMethod="POST" redirect="false" startOnDialAnswer="true" maxLength="3600" fileFormat="mp3" playBeep="false"/>`

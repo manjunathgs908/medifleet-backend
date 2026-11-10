@@ -16,6 +16,7 @@
  *   Plivo, "SaveLife Trip VoIP" application (signature):
  *     ALL  /api/calls/trip-voip-answer         answer URL
  *     ALL  /api/calls/trip-voip-dial?log=      the Dial's action
+ *     ALL  /api/calls/trip-voip-dial-event?log=  live: the driver picked up
  *     ALL  /api/calls/trip-voip-hangup         hangup URL
  *
  * No response from here carries a phone number: none is read.
@@ -225,6 +226,17 @@ exports.dial = async (req, res, next) => {
     const logId = isId(req.query.log) ? String(req.query.log) : null;
     const { xml } = await voip().dialFinished(logId, plivoParams(req));
     return sendXml(res, xml);
+  } catch (err) {
+    return next(err);
+  }
+};
+
+// The Dial's live callbackUrl: DialAction=answer = the driver picked up.
+exports.dialEvent = async (req, res, next) => {
+  try {
+    const logId = isId(req.query.log) ? String(req.query.log) : null;
+    await voip().dialEvent(logId, plivoParams(req));
+    return sendXml(res, plivoSvc().emptyXml());
   } catch (err) {
     return next(err);
   }

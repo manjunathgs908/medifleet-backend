@@ -12,8 +12,10 @@
  *      endpoints. There is no phone leg anywhere: if the driver's app does
  *      not answer, the call ends as DRIVER_UNAVAILABLE. Nothing ever dials
  *      a real number.
- *   3. The trip completes or is cancelled -> closeTripVoip(): any live call
- *      is hung up and the trip's customer endpoint is deleted from Plivo.
+ *   3. The trip completes or is cancelled -> closeTripVoip(): no new call,
+ *      a call still RINGING is ended (it never connects), a CONNECTED call
+ *      runs on until someone presses End. The trip's customer endpoint is
+ *      deleted from Plivo once no call of the trip is still going.
  *
  * Neither phone number is read, stored or sent by anything in this file.
  * Recording is whatever the shared bridge (plivoService.bridgeXml) does.
@@ -42,7 +44,11 @@ const tripCalls = require('./tripCalls');
 const { TripCallError, ACTIVE_STATUSES } = tripCalls;
 
 const MAX_DRIVER_DEVICES = 3;
-const LIVE_STATUSES = ['initiated', 'ringing'];
+// initiated: session issued, not dialled yet; ringing: the driver's app is
+// ringing; agent_answered: the driver picked up — CONNECTED (the existing
+// CallLog status for "our side answered", so the CRM shows it as in-call).
+const CONNECTED = 'agent_answered';
+const LIVE_STATUSES = ['initiated', 'ringing', CONNECTED];
 
 const appId = () => String(process.env.PLIVO_TRIP_VOIP_APP_ID || '').trim() || null;
 const isConfigured = () => plivo.isConfigured() && !!appId();
@@ -53,6 +59,10 @@ const clamp = (v, lo, hi, dflt) => {
 const ringSeconds = () => clamp(process.env.TRIP_VOIP_RING_SECONDS, 10, 60, 25);
 const driverOnlineMs = () => clamp(process.env.TRIP_VOIP_DRIVER_ONLINE_MIN, 1, 7 * 24 * 60, 720) * 60 * 1000;
 const sessionTtlMs = () => clamp(process.env.TRIP_VOIP_SESSION_TTL_SEC, 30, 900, 120) * 1000;
+// No call can still be going after this (Plivo's own timeLimit + ringing +
+// slack): a "live" row older than it lost its last report and must not
+// keep a trip's login alive forever.
+const liveCapMs = () => (tripCalls.maxSeconds() + ringSeconds() + 10 * 60) * 1000;
 
 // What the app dials. Plivo sends every call from these endpoints to our
 // answer URL whatever the destination; the log id also rides in the
@@ -337,53 +347,115 @@ async function answerCall(params) {
       timeout   : ringSeconds(),
       timeLimit : tripCalls.maxSeconds(),
       actionPath: '/api/calls/trip-voip-dial',
+      callbackPath: '/api/calls/trip-voip-dial-event',
       sipHeaders: { tripId: String(trip._id) },
       callerName: 'SaveLife Customer',
     }),
   };
 }
 
-// Hung up by closeTripVoip (the trip completed / was cancelled mid-call)?
-const closedByTrip = (log) => (log.flow || []).some((f) => /^voip:trip_/.test(f));
+// A RINGING call ended by closeTripVoip (the trip completed / was cancelled
+// before the driver answered)? A connected call is never ended by the trip.
+const ringingEndedByTrip = (log) => (log.flow || []).some((f) => /^voip:trip_.*ringing_call_ended/.test(f));
 
-// ── The Dial's action: did the driver's app answer? ──────────────────────
+// Runs after a call's last report: if the trip has ended and none of its
+// in-app calls is still going, its customer login is removed. Never throws.
+async function afterCallEnded(tripId) {
+  try {
+    await cleanupIfTripEnded(tripId);
+  } catch (err) {
+    console.error(`[trip-voip] post-call cleanup failed trip=${tripId}:`, err?.message || err);
+  }
+}
+
+// ── The Dial's live report: the driver's app picked up ───────────────────
+
+/**
+ * DialAction=answer -> the call is CONNECTED from here on. If the trip has
+ * already ended (or the call was already stopped as a ringing call at trip
+ * end), it is not allowed to connect: hung up instead.
+ */
+async function dialEvent(logId, params) {
+  const log = logId ? await CallLog.findById(logId) : null;
+  if (!log || log.channel !== 'voip') return 'NO_LOG';
+  const action = String(params.DialAction || '').toLowerCase();
+  if (action !== 'answer') return 'IGNORED';
+
+  const trip = await Trip.findById(log.trip).select('status driver driverConfirmed').lean();
+  let tripOk = !!trip;
+  if (trip) {
+    try {
+      tripCalls.assertCallable(trip, 'customer');
+    } catch (err) {
+      if (!(err instanceof TripCallError)) throw err;
+      tripOk = false;
+    }
+  }
+
+  if (tripOk) {
+    const r = await CallLog.updateOne({ _id: log._id, status: 'ringing' }, {
+      $set : { status: CONNECTED, answeredAt: new Date(), ...(params.DialBLegUUID ? { customerLegId: params.DialBLegUUID } : {}) },
+      $push: { flow: 'voip:driver_answered→connected' },
+    });
+    if ((r.modifiedCount ?? r.nModified ?? 0) > 0) return 'CONNECTED';
+  }
+
+  // The trip ended while it rang (or the call was already stopped for that):
+  // it must not connect.
+  await CallLog.updateOne({ _id: log._id, status: { $in: LIVE_STATUSES } }, {
+    $set: { status: 'blocked_trip_inactive' },
+  });
+  await CallLog.updateOne({ _id: log._id }, { $push: { flow: 'voip:answered_after_trip_end→hung_up' } });
+  if (log.providerCallId) {
+    await plivo.hangupCall(log.providerCallId).catch((err) => {
+      if (plivoStatusOf(err) !== 404) console.warn(`[trip-voip] hangup failed log=${log._id}: status=${plivoStatusOf(err) ?? '-'}`);
+    });
+  }
+  console.info(`[trip-voip] driver answered after the trip ended — not connected log=${log._id}`);
+  return 'NOT_CONNECTED_TRIP_ENDED';
+}
+
+// ── The Dial's action: how did it end? ───────────────────────────────────
 
 async function dialFinished(logId, params) {
   const log = logId ? await CallLog.findById(logId) : null;
   if (!log || log.channel !== 'voip') return { xml: plivo.hangupXml(), outcome: 'NO_LOG' };
   const dialStatus = String(params.DialStatus || '').toLowerCase();
   const legCause = params.DialBLegHangupCause || params.DialHangupCause;
+  const done = (xml, outcome) => afterCallEnded(log.trip).then(() => ({ xml, outcome }));
 
   if (dialStatus === 'completed') {
     const talk = Number(params.DialBLegDuration ?? params.DialBLegBillDuration);
-    // May replace an end status a hang-up report set first: they talked.
+    // Talked: replaces whatever end status a hang-up report set first. Never
+    // for a call stopped as RINGING at trip end — that one did not connect.
     await CallLog.updateOne(
-      { _id: log._id, status: { $in: [...LIVE_STATUSES, 'customer_cancelled', 'blocked_trip_inactive'] } },
+      { _id: log._id, status: { $in: [...LIVE_STATUSES, 'completed', 'customer_cancelled'] } },
       {
         $set: {
           status: 'completed',
-          ...(Number.isFinite(talk) ? { talkSec: talk, answeredAt: new Date(Date.now() - talk * 1000) } : {}),
+          ...(Number.isFinite(talk) ? { talkSec: talk } : {}),
+          ...(!log.answeredAt && Number.isFinite(talk) ? { answeredAt: new Date(Date.now() - talk * 1000) } : {}),
           ...(params.DialBLegUUID ? { customerLegId: params.DialBLegUUID } : {}),
           ...(legCause ? { hangupCause: legCause } : {}),
         },
-        $push: { flow: 'voip:driver_answered' },
+        $push: { flow: 'voip:call_completed' },
       },
     );
-    return { xml: plivo.hangupXml(), outcome: 'COMPLETED' };
+    return done(plivo.hangupXml(), 'COMPLETED');
   }
 
   // The customer gave up while it rang.
   if (dialStatus === 'cancel') {
     await CallLog.updateOne({ _id: log._id, status: { $in: LIVE_STATUSES } }, {
-      $set : { status: 'customer_cancelled' },
+      $set : { status: ringingEndedByTrip(log) ? 'blocked_trip_inactive' : 'customer_cancelled' },
       $push: { flow: 'voip:caller_hung_up_while_ringing' },
     });
-    return { xml: plivo.hangupXml(), outcome: 'CUSTOMER_CANCELLED' };
+    return done(plivo.hangupXml(), 'CUSTOMER_CANCELLED');
   }
 
-  if (closedByTrip(log)) {
+  if (ringingEndedByTrip(log) || log.status === 'blocked_trip_inactive') {
     await CallLog.updateOne({ _id: log._id, status: { $in: LIVE_STATUSES } }, { $set: { status: 'blocked_trip_inactive' } });
-    return { xml: plivo.hangupXml(), outcome: 'TRIP_ENDED' };
+    return done(plivo.hangupXml(), 'TRIP_ENDED');
   }
 
   // Not answered, busy, declined, unreachable — no phone fallback, ever.
@@ -392,7 +464,7 @@ async function dialFinished(logId, params) {
     $push: { flow: `voip:driver_app:${dialStatus || 'none'}→driver_unavailable` },
   });
   console.info(`[trip-voip] driver app did not answer log=${log._id} DialStatus=${dialStatus || '-'}`);
-  return { xml: plivo.speakXml(MESSAGES.DRIVER_UNAVAILABLE), outcome: 'DRIVER_UNAVAILABLE' };
+  return done(plivo.speakXml(MESSAGES.DRIVER_UNAVAILABLE), 'DRIVER_UNAVAILABLE');
 }
 
 // ── The application's hangup URL ─────────────────────────────────────────
@@ -412,12 +484,17 @@ async function callEnded(params) {
   await CallLog.updateOne({ _id: log._id, endedAt: null }, {
     $set: { endedAt: new Date(), ...(Number.isFinite(total) ? { totalSec: total } : {}), ...(params.HangupCause ? { hangupCause: log.hangupCause || params.HangupCause } : {}) },
   });
-  // Ended before the Dial reported: the customer hung up first — or the
-  // trip ended and closeTripVoip hung it up.
-  await CallLog.updateOne({ _id: log._id, status: { $in: LIVE_STATUSES } }, {
-    $set : { status: closedByTrip(log) ? 'blocked_trip_inactive' : 'customer_cancelled' },
-    $push: { flow: 'voip:ended_before_dial_report' },
+  // Connected and now over (the Dial's report may follow with the talk time).
+  await CallLog.updateOne({ _id: log._id, status: CONNECTED }, {
+    $set: { status: 'completed' }, $push: { flow: 'voip:connected_call_ended' },
   });
+  // Ended before anyone answered: the customer hung up — or the trip ended
+  // and closeTripVoip stopped the ringing call.
+  await CallLog.updateOne({ _id: log._id, status: { $in: ['initiated', 'ringing'] } }, {
+    $set : { status: ringingEndedByTrip(log) ? 'blocked_trip_inactive' : 'customer_cancelled' },
+    $push: { flow: 'voip:ended_before_answer' },
+  });
+  await afterCallEnded(log.trip);
   return 'ENDED';
 }
 
@@ -425,7 +502,8 @@ async function callEnded(params) {
 
 const STATE_OF = {
   initiated             : { state: 'starting', ok: true },
-  ringing               : { state: 'in_progress', ok: true },
+  ringing               : { state: 'ringing', ok: true },
+  [CONNECTED]           : { state: 'connected', ok: true },
   completed             : { state: 'ended', ok: true, code: 'COMPLETED' },
   customer_cancelled    : { state: 'ended', ok: true, code: 'CANCELLED' },
   driver_unavailable    : { state: 'failed', ok: false, code: 'DRIVER_UNAVAILABLE', message: MESSAGES.DRIVER_UNAVAILABLE },
@@ -440,12 +518,12 @@ function publicState(log, trip) {
     return { state: 'failed', ok: false, code, message: MESSAGES.TRIP_ENDED };
   }
   const s = STATE_OF[log.status] || { state: 'ended', ok: false, code: 'NOT_CONNECTED', message: MESSAGES.NOT_CONNECTED };
-  // A live row older than any call can last is over, whatever it says.
+  // Plivo reported the hang-up; the final status is only a moment behind.
   if (LIVE_STATUSES.includes(log.status) && log.endedAt) return { state: 'ended', ok: true };
   return s;
 }
 
-/** The app's End button: hang the call up on Plivo's side too. */
+/** The app's End button (ringing or connected): hang the call up on Plivo too. */
 async function endCall(log) {
   if (!LIVE_STATUSES.includes(log.status) || log.endedAt) return { hungUp: false };
   let hungUp = false;
@@ -460,62 +538,105 @@ async function endCall(log) {
   await CallLog.updateOne({ _id: log._id, status: 'initiated' }, {
     $set: { status: 'customer_cancelled', endedAt: new Date() }, $push: { flow: 'voip:ended_by_app_before_dial' },
   });
-  if (log.status === 'ringing') await CallLog.updateOne({ _id: log._id }, { $push: { flow: 'voip:ended_by_app' } });
+  if (log.status !== 'initiated') await CallLog.updateOne({ _id: log._id }, { $push: { flow: 'voip:ended_by_app' } });
+  // A session never dialled has no Plivo report to wait for.
+  if (log.status === 'initiated') await afterCallEnded(log.trip);
   return { hungUp };
 }
 
 // ── Trip completed / cancelled ───────────────────────────────────────────
 
 /**
- * Hangs up every live in-app call of the trip and deletes the trip's
- * customer endpoint from Plivo (so its login stops working). Never throws:
- * it runs after a trip has already been completed or cancelled.
+ * Deletes the trip's customer endpoint (its login) from Plivo — only once
+ * the trip is no longer active AND none of its in-app calls is still going.
+ * Returns true when the endpoint is gone. Throws only on a DB error.
+ */
+async function cleanupIfTripEnded(tripId, { tripKnownEnded = false } = {}) {
+  if (!tripId) return false;
+  if (!tripKnownEnded) {
+    const trip = await Trip.findById(tripId).select('status').lean();
+    if (trip && ACTIVE_STATUSES.includes(trip.status)) return false;
+  }
+  const stillGoing = await CallLog.countDocuments({
+    trip: tripId, channel: 'voip', status: { $in: LIVE_STATUSES }, endedAt: null,
+    startedAt: { $gte: new Date(Date.now() - liveCapMs()) },
+  });
+  if (stillGoing) return false;
+
+  const ep = await TripVoipEndpoint.findOne({ kind: 'customer', trip: tripId }).select('endpointId').lean();
+  if (!ep) return false;
+  try {
+    await plivo.deleteEndpoint(ep.endpointId);
+  } catch (err) {
+    // Kept for the next sweep to retry. The answer URL refuses it anyway:
+    // its trip is no longer active.
+    if (plivoStatusOf(err) !== 404) {
+      console.warn(`[trip-voip] endpoint delete failed trip=${tripId}: status=${plivoStatusOf(err) ?? '-'}`);
+      return false;
+    }
+  }
+  await TripVoipEndpoint.deleteOne({ _id: ep._id });
+  console.info(`[trip-voip] trip=${tripId} ended — customer endpoint deleted`);
+  return true;
+}
+
+/**
+ * The trip completed or was cancelled (controllers/tripController.js, after
+ * the commit). New calls are already refused by the trip's status. Here:
+ *   - sessions issued but not dialled  -> closed;
+ *   - calls still RINGING (driver has not answered) -> ended, never connect;
+ *   - CONNECTED calls -> left running until someone presses End; the
+ *     trip's login is removed when the last one ends (callEnded/dialFinished).
+ * Then the login is removed at once if nothing is still going. Never throws.
  */
 async function closeTripVoip(tripId, reason = 'ended') {
-  const result = { hungUp: 0, endpointDeleted: false };
+  const result = { sessionsClosed: 0, ringingEnded: 0, connectedLeftRunning: 0, endpointDeleted: false };
   try {
     const live = await CallLog.find({ trip: tripId, channel: 'voip', status: { $in: LIVE_STATUSES }, endedAt: null })
       .select('status providerCallId').lean();
     for (const log of live) {
-      if (log.providerCallId) {
-        try {
-          await plivo.hangupCall(log.providerCallId);
-          result.hungUp += 1;
-        } catch (err) {
-          if (plivoStatusOf(err) !== 404) console.warn(`[trip-voip] trip-end hangup failed log=${log._id}: status=${plivoStatusOf(err) ?? '-'}`);
+      if (log.status === 'initiated') {
+        const r = await CallLog.updateOne({ _id: log._id, status: 'initiated' }, {
+          $set : { status: 'blocked_trip_inactive', endedAt: new Date() },
+          $push: { flow: `voip:trip_${reason}→session_closed` },
+        });
+        if ((r.modifiedCount ?? r.nModified ?? 0) > 0) result.sessionsClosed += 1;
+      } else if (log.status === 'ringing') {
+        // Only if it is STILL ringing: a driver who picked up a moment ago
+        // keeps the call.
+        const r = await CallLog.updateOne({ _id: log._id, status: 'ringing' }, {
+          $set : { status: 'blocked_trip_inactive' },
+          $push: { flow: `voip:trip_${reason}→ringing_call_ended` },
+        });
+        if ((r.modifiedCount ?? r.nModified ?? 0) > 0) {
+          result.ringingEnded += 1;
+          if (log.providerCallId) {
+            await plivo.hangupCall(log.providerCallId).catch((err) => {
+              if (plivoStatusOf(err) !== 404) console.warn(`[trip-voip] trip-end hangup failed log=${log._id}: status=${plivoStatusOf(err) ?? '-'}`);
+            });
+          }
+        } else {
+          result.connectedLeftRunning += 1;
         }
+      } else {
+        await CallLog.updateOne({ _id: log._id }, { $push: { flow: `voip:trip_${reason}→connected_call_left_running` } });
+        result.connectedLeftRunning += 1;
       }
-      await CallLog.updateOne({ _id: log._id, status: 'initiated' }, {
-        $set: { status: 'blocked_trip_inactive', endedAt: new Date() },
-      });
-      await CallLog.updateOne({ _id: log._id }, { $push: { flow: `voip:trip_${reason}→hung_up` } });
     }
-
-    const ep = await TripVoipEndpoint.findOne({ kind: 'customer', trip: tripId }).select('endpointId').lean();
-    if (ep) {
-      try {
-        await plivo.deleteEndpoint(ep.endpointId);
-      } catch (err) {
-        // Kept for the next sweep to retry. The answer URL refuses it anyway:
-        // its trip is no longer active.
-        if (plivoStatusOf(err) !== 404) {
-          console.warn(`[trip-voip] endpoint delete failed trip=${tripId}: status=${plivoStatusOf(err) ?? '-'}`);
-          return result;
-        }
-      }
-      await TripVoipEndpoint.deleteOne({ _id: ep._id });
-      result.endpointDeleted = true;
+    result.endpointDeleted = await cleanupIfTripEnded(tripId, { tripKnownEnded: true });
+    if (live.length || result.endpointDeleted) {
+      console.info(`[trip-voip] trip=${tripId} ${reason}: sessionsClosed=${result.sessionsClosed} ringingEnded=${result.ringingEnded} connectedLeftRunning=${result.connectedLeftRunning} endpointDeleted=${result.endpointDeleted}`);
     }
-    if (live.length || ep) console.info(`[trip-voip] closed trip=${tripId} (${reason}) hungUp=${result.hungUp} endpointDeleted=${result.endpointDeleted}`);
   } catch (err) {
     console.error(`[trip-voip] closeTripVoip failed trip=${tripId}:`, err?.message || err);
   }
   return result;
 }
 
-// Backstop for any path that ends a trip without the hook (or a failed
-// Plivo delete): customer endpoints whose trip is no longer active are
-// closed. Runs at most every 5 minutes, piggy-backed on sessions/logins.
+// Backstop for any path that ends a trip without the hook, a lost hang-up
+// report, or a failed Plivo delete: customer endpoints whose trip is no
+// longer active are closed (connected calls still left alone). Runs at
+// most every 5 minutes, piggy-backed on sessions / driver logins.
 const SWEEP_EVERY_MS = 5 * 60 * 1000;
 let lastSweepAt = 0;
 async function sweepEndedTrips({ force = false } = {}) {
@@ -546,10 +667,12 @@ module.exports = {
   ensureCustomerEndpoint,
   startSession,
   answerCall,
+  dialEvent,
   dialFinished,
   callEnded,
   publicState,
   endCall,
+  cleanupIfTripEnded,
   closeTripVoip,
   sweepEndedTrips,
   usernameFromSip,

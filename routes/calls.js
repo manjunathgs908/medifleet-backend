@@ -41,6 +41,7 @@ router.all('/trip-inbound', ctrl.requirePlivoSignature, tripCallCtrl.inbound);
 // Dial's action. They ring the driver's app only — never a phone.
 router.all('/trip-voip-answer', ctrl.requirePlivoSignature, tripVoipCtrl.answer);
 router.all('/trip-voip-dial',   ctrl.requirePlivoSignature, tripVoipCtrl.dial);
+router.all('/trip-voip-dial-event', ctrl.requirePlivoSignature, tripVoipCtrl.dialEvent);
 router.all('/trip-voip-hangup', ctrl.requirePlivoSignature, tripVoipCtrl.hangup);
 // The driver app's own in-app calling login (one endpoint per device) and
 // presence. Drivers only.

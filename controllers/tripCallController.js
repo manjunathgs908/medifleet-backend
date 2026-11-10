@@ -73,15 +73,22 @@ function customerPhoneFromToken(req) {
   }
 }
 
+// The trackingToken comes in the JSON body, or -- for a GET, which has no
+// body, and so it never sits in a URL -- in the X-Tracking-Token header.
+const trackingTokenOf = (req) => req.body?.trackingToken || req.get?.('X-Tracking-Token') || null;
+
 function assertCustomer(req, trip) {
-  if (sameSecret(req.body?.trackingToken, trip.trackingToken)) return;
+  const given = trackingTokenOf(req);
+  if (sameSecret(given, trip.trackingToken)) return;
   const phone = customerPhoneFromToken(req);
   if (phone && phone === normalisePhone(trip.patientPhone)) return;
-  if (phone || req.body?.trackingToken) {
+  if (phone || given) {
     throw tripCallError(403, 'NOT_THIS_TRIP', 'You can only call the driver of your own trip.');
   }
   throw tripCallError(401, 'CUSTOMER_PROOF_REQUIRED', 'Open this trip from your SaveLife booking or tracking link to call the driver.');
 }
+// Also the in-app call's proof (controllers/tripVoipController.js).
+exports.assertCustomer = assertCustomer;
 
 // ============================================================
 // @route   POST /api/trips/:id/call
@@ -137,7 +144,8 @@ exports.answer = async (req, res, next) => {
     const log = mongoose.Types.ObjectId.isValid(logId)
       ? await CallLog.findById(logId).select('+customerPhone +agentPhone')
       : null;
-    if (!log || !log.tripMasked || log.direction !== 'outbound') {
+    // An in-app call's row never bridges to a phone here.
+    if (!log || !log.tripMasked || log.direction !== 'outbound' || log.channel === 'voip') {
       return sendXml(res, plivoSvc().speakXml('Sorry, this call could not be connected.'));
     }
     const params = req.method === 'POST' ? (req.body || {}) : (req.query || {});

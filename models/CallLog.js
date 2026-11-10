@@ -46,6 +46,10 @@ const CallLogSchema = new mongoose.Schema(
     // Context stays 'trip', so the CRM lists these exactly like before.
     tripMasked  : { type: Boolean },
     tripCallFrom: { type: String, enum: ['driver', 'customer'] },
+    // 'voip': an in-app call (services/tripVoip.js) — the customer's app
+    // dialled the driver's app; no phone leg, and neither phone number is
+    // stored on the row. Unset: a phone call, as every row before this.
+    channel     : { type: String, enum: ['voip'] },
 
     // What the call was about.
     context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming', 'test_ring'], required: true },

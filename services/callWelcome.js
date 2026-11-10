@@ -115,12 +115,12 @@ async function send({ phone, source, callLog, sentBy } = {}) {
       const sentAt = new Date();
       const wamid = r.data?.messages?.[0]?.id;
       await WhatsAppWelcomeSend.updateOne({ _id: c.doc._id }, { $set: { status: 'sent', sentAt, ...(wamid ? { wamid } : {}) } });
-      console.info(`[callWelcome] sent (${source})`);
+      console.info(`[callWelcome] accepted (${source})`, { wamid: wamid ?? null });
       return { status: 'sent', sentAt, ...(wamid ? { wamid } : {}) };
     }
     const why = explain(r.error?.code, r.error?.message);
     await WhatsAppWelcomeSend.updateOne({ _id: c.doc._id }, { $set: { status: 'failed', error: { code: r.error?.code ?? undefined, ...why } } });
-    console.warn(`[callWelcome] not sent (${source}): ${why.reason}`);
+    console.warn(`[callWelcome] not sent (${source}): ${why.reason}`, { code: r.error?.code ?? null });
     return { status: 'failed', code: r.error?.code ?? null, ...why };
   } catch (err) {
     console.error('[callWelcome] send failed:', err.message);

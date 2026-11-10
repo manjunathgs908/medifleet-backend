@@ -278,9 +278,25 @@ router.post('/webhook', (req, res) => {
       const value = req.body?.entry?.[0]?.changes?.[0]?.value;
       const messages = value?.messages;
 
-      // No `messages` array means this delivery is a status callback
-      // (sent/delivered/read) rather than an actual inbound message --
-      // Meta posts both shapes to the same URL. Not handled yet.
+      // Record signed delivery callbacks separately from inbound messages.
+      // Log only the correlation ID, delivery state and numeric error codes.
+      for (const entry of req.body?.entry || []) {
+        for (const change of entry?.changes || []) {
+          const statuses = change?.value?.statuses;
+          if (!Array.isArray(statuses)) continue;
+          for (const report of statuses) {
+            if (typeof report?.id !== 'string' || !/^wamid\.[A-Za-z0-9_+/=-]+$/.test(report.id)) continue;
+            if (!['sent', 'delivered', 'read', 'failed'].includes(report.status)) continue;
+            const errors = Array.isArray(report.errors) ? report.errors : [];
+            console.info('[whatsapp delivery]', {
+              wamid: report.id,
+              status: report.status,
+              errorCodes: errors.map(error => error?.code).filter(Number.isInteger),
+            });
+          }
+        }
+      }
+
       if (!Array.isArray(messages) || messages.length === 0) {
         return;
       }

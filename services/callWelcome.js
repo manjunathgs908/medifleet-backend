@@ -2,10 +2,10 @@
 /**
  * services/callWelcome.js
  * ============================================================
- * Sends the approved Marketing template "savelife_welcome" (image header +
- * the quick-reply "📍 Send Location / ಕಳುಹಿಸಿ") to a caller, so they can
- * share their pickup on WhatsApp. What happens after the tap is
- * services/waWelcomeLocation.js — not here.
+ * Sends the approved Utility template "savelife_pickup" (static text, no
+ * header, no variables, one quick-reply "Send Location") to a caller, so
+ * they can share their pickup on WhatsApp. What happens after the tap is
+ * services/waWelcomeLocation.js — not here (it matches "Send Location").
  *
  *   onIncomingCall()  callController.incoming, for a customer's call
  *                     (CallLog.callbackEligible). Never awaited there; off
@@ -17,10 +17,12 @@
  * its unique (phone, istDate) index is the lock). A failed send may be
  * retried the same day; a sent one is not repeated until the next IST day.
  *
- * Template: WA_WELCOME_TEMPLATE (default savelife_welcome), language
- * WA_WELCOME_TEMPLATE_LANG (must be the approved template's exact code),
- * header image WA_WELCOME_IMAGE_URL (a public https JPG/PNG — WhatsApp
- * fetches it; an IMAGE-header template cannot be sent without one).
+ * Template: WA_WELCOME_TEMPLATE_NAME (default savelife_pickup), language
+ * WA_WELCOME_TEMPLATE_LANG (default en — must be the approved template's
+ * exact code). WA_WELCOME_IMAGE_URL only for a template WITH an image
+ * header: unset/empty -> the template is sent with no components at all
+ * (savelife_pickup has no header and no body variables); set -> it must be
+ * a public https JPG/PNG and goes in as the header image.
  * Never throws.
  * ============================================================
  */
@@ -32,8 +34,8 @@ const { IST_OFFSET_MS } = require('../utils/leadFollowUp');
 const SENDING_STALE_MS = 2 * 60 * 1000; // a 'sending' claim older than this crashed mid-send
 
 const autoEnabled = () => process.env.WA_CALL_WELCOME_ENABLED === 'true';
-const templateName = () => process.env.WA_WELCOME_TEMPLATE || 'savelife_welcome';
-const templateLang = () => process.env.WA_WELCOME_TEMPLATE_LANG || 'en';
+const templateName = () => (process.env.WA_WELCOME_TEMPLATE_NAME || '').trim() || 'savelife_pickup';
+const templateLang = () => (process.env.WA_WELCOME_TEMPLATE_LANG || '').trim() || 'en';
 const imageUrl = () => (process.env.WA_WELCOME_IMAGE_URL || '').trim();
 
 const isMobile = (ten) => /^[6-9]\d{9}$/.test(ten);
@@ -51,7 +53,9 @@ function explain(code, message) {
     case 132001:
       return { reason: 'template_not_approved', message: `WhatsApp has no approved template "${name}" in language "${lang}" — it may still be in review, or WA_WELCOME_TEMPLATE_LANG is not the template's exact language code.` };
     case 132000: case 132012: case 131008: case 131009: case 131053:
-      return { reason: 'template_rejected', message: `WhatsApp rejected the template's header image or parameters — check WA_WELCOME_IMAGE_URL is a public JPG/PNG (${message || 'no detail'}).` };
+      return { reason: 'template_rejected', message: imageUrl()
+        ? `WhatsApp rejected the template's header image or parameters — check WA_WELCOME_IMAGE_URL is a public JPG/PNG, and leave it empty for a template with no image header (${message || 'no detail'}).`
+        : `WhatsApp rejected the template's parameters — "${name}" was sent with none, so the approved template may expect a header or variables (${message || 'no detail'}).` };
     case 131026:
       return { reason: 'not_on_whatsapp', message: 'This number cannot receive WhatsApp messages (not on WhatsApp, or an old app version).' };
     case 131049:
@@ -99,17 +103,19 @@ async function send({ phone, source, callLog, sentBy } = {}) {
   try {
     const ten = normalisePhone(phone);
     if (!isMobile(ten)) return { status: 'not_mobile', message: 'No Indian mobile number on this call.' };
+    // No image configured -> no components at all (savelife_pickup: no
+    // header, no body variables, a static quick-reply that takes nothing).
     const link = imageUrl();
-    if (!/^https:\/\/\S+$/i.test(link)) {
-      return { status: 'failed', reason: 'image_url_missing', message: 'WA_WELCOME_IMAGE_URL is not set to a public https image — the template\'s image header needs it.' };
+    if (link && !/^https:\/\/\S+$/i.test(link)) {
+      return { status: 'failed', reason: 'image_url_invalid', message: 'WA_WELCOME_IMAGE_URL must be a public https image, or empty for a template with no image header.' };
     }
+    const components = link ? [{ type: 'header', parameters: [{ type: 'image', image: { link } }] }] : undefined;
 
     const day = istDate();
     const c = await claim(ten, day, { source, ...(callLog ? { callLog } : {}), ...(sentBy ? { sentBy } : {}) });
     if (c.already) return { status: 'already_sent_today', sentAt: c.already.sentAt || null };
     if (c.busy) return { status: 'in_progress', message: 'A welcome message to this number is being sent right now.' };
 
-    const components = [{ type: 'header', parameters: [{ type: 'image', image: { link } }] }];
     const r = await whatsapp.sendTemplateResult(`91${ten}`, templateName(), templateLang(), components);
     if (r.ok) {
       const sentAt = new Date();

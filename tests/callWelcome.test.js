@@ -1,15 +1,16 @@
 /**
  * tests/callWelcome.test.js
  * ============================================================
- * The savelife_welcome WhatsApp template to callers (services/callWelcome.js)
+ * The savelife_pickup WhatsApp template to callers (services/callWelcome.js)
  * and POST /api/calls/:id/send-welcome:
- *   A. the send — template name, language, image header (no button params),
+ *   A. the send — template name, language, NO components when no image is
+ *      configured (savelife_pickup), an image header only when one is,
  *      to the 91-prefixed real number
  *   B. once per number per IST calendar day — repeat calls the same day do
  *      not resend; the next IST day does (midnight IST, not UTC); two calls
  *      at the same moment send once; a failed send may be retried
  *   C. the auto-send switch — off unless WA_CALL_WELCOME_ENABLED=true
- *   D. failures explained — template not approved, image missing, opted
+ *   D. failures explained — template not approved, bad image URL, opted
  *      out, not on WhatsApp, token
  *   E. the endpoint — real number read server-side, statuses and HTTP codes,
  *      shares the day's limit with the automatic send, auth on the route
@@ -74,8 +75,9 @@ beforeEach(() => {
   WhatsAppWelcomeSend.reset();
   whatsapp.sendTemplateResult.mockClear();
   whatsapp.sendTemplateResult.mockImplementation(async () => ({ ok: true, data: { messages: [{ id: 'wamid.W1' }] } }));
-  process.env.WA_WELCOME_IMAGE_URL = IMG;
+  delete process.env.WA_WELCOME_IMAGE_URL;
   delete process.env.WA_WELCOME_TEMPLATE;
+  delete process.env.WA_WELCOME_TEMPLATE_NAME;
   delete process.env.WA_WELCOME_TEMPLATE_LANG;
   delete process.env.WA_CALL_WELCOME_ENABLED;
   jest.useRealTimers();
@@ -84,24 +86,40 @@ afterAll(() => jest.useRealTimers());
 
 // ============================================================
 describe('A. the send', () => {
-  test('savelife_welcome, the configured language, the banner as the image header, to 91 + the real number', async () => {
+  test('default: savelife_pickup in "en", NO components (no header, no body params, no button params), to 91 + the real number', async () => {
     const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
     expect(r).toMatchObject({ status: 'sent', wamid: 'wamid.W1' });
     expect(r.sentAt).toBeInstanceOf(Date);
-    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_welcome', 'en', [
-      { type: 'header', parameters: [{ type: 'image', image: { link: IMG } }] },
-    ]);
-    // the quick-reply "Send Location" button needs no send-time parameter
-    const components = whatsapp.sendTemplateResult.mock.calls[0][3];
-    expect(components.some((c) => c.type === 'button')).toBe(false);
+    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_pickup', 'en', undefined);
     expect(WhatsAppWelcomeSend.store[0]).toMatchObject({ phone: PHONE, status: 'sent', source: 'manual', wamid: 'wamid.W1' });
   });
 
-  test('template name and language come from WA_WELCOME_TEMPLATE / WA_WELCOME_TEMPLATE_LANG', async () => {
-    process.env.WA_WELCOME_TEMPLATE = 'savelife_welcome_v2';
+  test('WA_WELCOME_IMAGE_URL empty or blank behaves as unset: no components', async () => {
+    process.env.WA_WELCOME_IMAGE_URL = '   ';
+    expect((await callWelcome.send({ phone: PHONE, source: 'manual' })).status).toBe('sent');
+    expect(whatsapp.sendTemplateResult.mock.calls[0][3]).toBeUndefined();
+  });
+
+  test('template name and language come from WA_WELCOME_TEMPLATE_NAME / WA_WELCOME_TEMPLATE_LANG', async () => {
+    process.env.WA_WELCOME_TEMPLATE_NAME = 'savelife_pickup_v2';
     process.env.WA_WELCOME_TEMPLATE_LANG = 'en_US';
     await callWelcome.send({ phone: PHONE, source: 'manual' });
-    expect(whatsapp.sendTemplateResult.mock.calls[0].slice(1, 3)).toEqual(['savelife_welcome_v2', 'en_US']);
+    expect(whatsapp.sendTemplateResult.mock.calls[0].slice(1, 3)).toEqual(['savelife_pickup_v2', 'en_US']);
+  });
+
+  test('the old WA_WELCOME_TEMPLATE setting is no longer read', async () => {
+    process.env.WA_WELCOME_TEMPLATE = 'savelife_welcome';
+    await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(whatsapp.sendTemplateResult.mock.calls[0][1]).toBe('savelife_pickup');
+  });
+
+  test('an image-header template still works: with WA_WELCOME_IMAGE_URL set, the image is the only component', async () => {
+    process.env.WA_WELCOME_IMAGE_URL = IMG;
+    process.env.WA_WELCOME_TEMPLATE_NAME = 'savelife_welcome';
+    await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_welcome', 'en', [
+      { type: 'header', parameters: [{ type: 'image', image: { link: IMG } }] },
+    ]);
   });
 
   test('any number format resolves to the same 10 digits (+91, 91, spaces)', async () => {
@@ -203,17 +221,23 @@ describe('D. failures explained', () => {
     fail(132001, 'Template name does not exist in the translation');
     const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
     expect(r).toMatchObject({ status: 'failed', reason: 'template_not_approved', code: 132001 });
-    expect(r.message).toMatch(/no approved template "savelife_welcome" in language "en" — it may still be in review/);
+    expect(r.message).toMatch(/no approved template "savelife_pickup" in language "en" — it may still be in review/);
   });
 
-  test('no banner URL: refused before any send, with the setting to fix', async () => {
-    delete process.env.WA_WELCOME_IMAGE_URL;
-    const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
-    expect(r).toMatchObject({ status: 'failed', reason: 'image_url_missing' });
-    expect(r.message).toMatch(/WA_WELCOME_IMAGE_URL/);
+  test('an image URL that is set but not https: refused before any send, with the setting to fix', async () => {
     process.env.WA_WELCOME_IMAGE_URL = 'http://insecure.example/x.jpg';
-    expect((await callWelcome.send({ phone: PHONE, source: 'manual' })).reason).toBe('image_url_missing');
+    const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(r).toMatchObject({ status: 'failed', reason: 'image_url_invalid' });
+    expect(r.message).toMatch(/WA_WELCOME_IMAGE_URL/);
     expect(sentCount()).toBe(0);
+    expect(WhatsAppWelcomeSend.store).toHaveLength(0);
+  });
+
+  test('132012 with no image: the message points at the template, not at an image', async () => {
+    fail(132012, 'Parameter format does not match');
+    const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(r.reason).toBe('template_rejected');
+    expect(r.message).toMatch(/"savelife_pickup" was sent with none/);
   });
 
   test.each([

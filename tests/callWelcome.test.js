@@ -76,6 +76,7 @@ beforeEach(() => {
   whatsapp.sendTemplateResult.mockClear();
   whatsapp.sendTemplateResult.mockImplementation(async () => ({ ok: true, data: { messages: [{ id: 'wamid.W1' }] } }));
   delete process.env.WA_WELCOME_IMAGE_URL;
+  delete process.env.WA_WELCOME_TEMPLATE_HEADER;
   delete process.env.WA_WELCOME_TEMPLATE;
   delete process.env.WA_WELCOME_TEMPLATE_NAME;
   delete process.env.WA_WELCOME_TEMPLATE_LANG;
@@ -113,7 +114,37 @@ describe('A. the send', () => {
     expect(whatsapp.sendTemplateResult.mock.calls[0][1]).toBe('savelife_pickup');
   });
 
-  test('an image-header template still works: with WA_WELCOME_IMAGE_URL set, the image is the only component', async () => {
+  // The production bug (Meta 132018 "Template does not contain title
+  // component, no parameters allowed"): the old banner URL was still set on
+  // Render, and that alone added a header to savelife_pickup.
+  test('132018 regression: the old banner URL still set -> STILL no components', async () => {
+    process.env.WA_WELCOME_IMAGE_URL = 'https://api.savelife.health/welcome-banner.png';
+    expect((await callWelcome.send({ phone: PHONE, source: 'manual' })).status).toBe('sent');
+    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_pickup', 'en', undefined);
+  });
+
+  test.each(['none', 'NONE', 'text', 'imag', ''])('WA_WELCOME_TEMPLATE_HEADER=%p is not "image": no components', async (v) => {
+    process.env.WA_WELCOME_TEMPLATE_HEADER = v;
+    process.env.WA_WELCOME_IMAGE_URL = IMG;
+    await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(whatsapp.sendTemplateResult.mock.calls[0][3]).toBeUndefined();
+  });
+
+  test('every send logs template, language, components and the runtime WA_WELCOME_IMAGE_URL (no customer number)', async () => {
+    const spy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    process.env.WA_WELCOME_IMAGE_URL = 'https://api.savelife.health/welcome-banner.png';
+    await callWelcome.send({ phone: PHONE, source: 'manual' });
+    const line = spy.mock.calls.find((c) => String(c[0]).startsWith('[callWelcome] sending'));
+    spy.mockRestore();
+    expect(line[1]).toEqual({
+      template: 'savelife_pickup', language: 'en', header: 'none', components: 'none',
+      WA_WELCOME_IMAGE_URL: 'https://api.savelife.health/welcome-banner.png (set but ignored: WA_WELCOME_TEMPLATE_HEADER is not "image")',
+    });
+    expect(JSON.stringify(line)).not.toContain(PHONE);
+  });
+
+  test('an image-header template still works: WA_WELCOME_TEMPLATE_HEADER=image + WA_WELCOME_IMAGE_URL -> the image is the only component', async () => {
+    process.env.WA_WELCOME_TEMPLATE_HEADER = 'image';
     process.env.WA_WELCOME_IMAGE_URL = IMG;
     process.env.WA_WELCOME_TEMPLATE_NAME = 'savelife_welcome';
     await callWelcome.send({ phone: PHONE, source: 'manual' });
@@ -211,6 +242,13 @@ describe('C. the auto-send switch', () => {
     expect((await callWelcome.onIncomingCall(PHONE, 'log1')).status).toBe('sent');
     expect(WhatsAppWelcomeSend.store[0]).toMatchObject({ source: 'incoming_call', callLog: 'log1' });
   });
+
+  test('132018 regression on the auto-send path: old banner URL set -> payload has no components', async () => {
+    process.env.WA_CALL_WELCOME_ENABLED = 'true';
+    process.env.WA_WELCOME_IMAGE_URL = 'https://api.savelife.health/welcome-banner.png';
+    expect((await callWelcome.onIncomingCall(PHONE, 'log1')).status).toBe('sent');
+    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_pickup', 'en', undefined);
+  });
 });
 
 // ============================================================
@@ -224,13 +262,31 @@ describe('D. failures explained', () => {
     expect(r.message).toMatch(/no approved template "savelife_pickup" in language "en" — it may still be in review/);
   });
 
-  test('an image URL that is set but not https: refused before any send, with the setting to fix', async () => {
-    process.env.WA_WELCOME_IMAGE_URL = 'http://insecure.example/x.jpg';
-    const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
-    expect(r).toMatchObject({ status: 'failed', reason: 'image_url_invalid' });
-    expect(r.message).toMatch(/WA_WELCOME_IMAGE_URL/);
+  test('image header configured but no usable https URL: refused before any send, with the setting to fix', async () => {
+    process.env.WA_WELCOME_TEMPLATE_HEADER = 'image';
+    for (const v of ['http://insecure.example/x.jpg', '', undefined]) {
+      if (v === undefined) delete process.env.WA_WELCOME_IMAGE_URL; else process.env.WA_WELCOME_IMAGE_URL = v;
+      const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
+      expect(r).toMatchObject({ status: 'failed', reason: 'image_url_invalid' });
+      expect(r.message).toMatch(/WA_WELCOME_IMAGE_URL/);
+    }
     expect(sentCount()).toBe(0);
     expect(WhatsAppWelcomeSend.store).toHaveLength(0);
+  });
+
+  test('a bad image URL is irrelevant when no header is configured: sent with no components', async () => {
+    process.env.WA_WELCOME_IMAGE_URL = 'http://insecure.example/x.jpg';
+    expect((await callWelcome.send({ phone: PHONE, source: 'manual' })).status).toBe('sent');
+    expect(whatsapp.sendTemplateResult.mock.calls[0][3]).toBeUndefined();
+  });
+
+  test('132018 explained: with an image header configured, says to unset it', async () => {
+    process.env.WA_WELCOME_TEMPLATE_HEADER = 'image';
+    process.env.WA_WELCOME_IMAGE_URL = IMG;
+    fail(132018, 'header: Template does not contain title component, no parameters allowed');
+    const r = await callWelcome.send({ phone: PHONE, source: 'manual' });
+    expect(r).toMatchObject({ status: 'failed', reason: 'template_rejected', code: 132018 });
+    expect(r.message).toMatch(/unset WA_WELCOME_TEMPLATE_HEADER/);
   });
 
   test('132012 with no image: the message points at the template, not at an image', async () => {
@@ -294,6 +350,13 @@ describe('E. POST /api/calls/:id/send-welcome', () => {
     expect(whatsapp.sendTemplateResult.mock.calls[0][0]).toBe('919986844442');
     expect(WhatsAppWelcomeSend.store[0]).toMatchObject({ source: 'manual', callLog: LOG_ID, sentBy: 'u7' });
     expect(JSON.stringify(res.body)).not.toContain(PHONE); // the number never goes back to the CRM
+  });
+
+  test('132018 regression on the button path: old banner URL set -> payload has no components', async () => {
+    process.env.WA_WELCOME_IMAGE_URL = 'https://api.savelife.health/welcome-banner.png';
+    const res = await run(LOG_ID);
+    expect(res.body.status).toBe('sent');
+    expect(whatsapp.sendTemplateResult).toHaveBeenCalledWith('919986844442', 'savelife_pickup', 'en', undefined);
   });
 
   test('works even with the auto-send switched off', async () => {

@@ -70,6 +70,9 @@ jest.mock('../services/trackingNotifications', () => ({
   notifyTrackingLink: jest.fn(() => Promise.resolve()),
 }));
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
+// The Plivo SDK patches axios.defaults when loaded, which the bare axios
+// stub above lacks; section E only needs services/tripCalls' callNumberFor.
+jest.mock('plivo', () => ({ Client: jest.fn() }));
 // Pricing is not what these tests are about, and compute() throws without a
 // real serviceType — stubbed so a createTrip failure means a dispatch
 // failure, not a fare one.
@@ -460,5 +463,81 @@ describe('D. the historical trips still load', () => {
     // model would break exactly these 130 rows.
     const models = require('../models');
     expect(models.Vehicle).toBeDefined();
+  });
+});
+
+// ============================================================
+describe('E. callNumber (dial-pad masked calling) on trip responses', () => {
+  // The real services/tripCalls.callNumberFor; only env decides the number.
+  const ENV = ['PLIVO_AUTH_ID', 'PLIVO_AUTH_TOKEN', 'PLIVO_NUMBER', 'PLIVO_MASKING_NUMBER'];
+  let saved;
+  beforeEach(() => {
+    saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
+    process.env.PLIVO_AUTH_ID = 'MAXXXXXXXXXXXXXXXXXX';
+    process.env.PLIVO_AUTH_TOKEN = 'plivo-test-token';
+    process.env.PLIVO_NUMBER = '918065591088';
+    process.env.PLIVO_MASKING_NUMBER = '918071234567';
+  });
+  afterEach(() => {
+    for (const k of ENV) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  });
+
+  const tripDoc = (over = {}) => {
+    const d = {
+      _id: 't9', tripNumber: 'T-0009', status: 'en_route', driverConfirmed: true,
+      driver: { _id: 'd1', name: 'Ravi', ratingSum: 0, ratingCount: 0 }, pickup: {}, ...over,
+      getLiveWaitState: () => null,
+    };
+    d.toJSON = () => { const { toJSON, getLiveWaitState, ...rest } = d; return { ...rest }; };
+    return d;
+  };
+
+  test.each([
+    ['trackTrip', () => call(tripCtrl.trackTrip, { params: { id: 't9' } })],
+    ['trackTripByToken', () => call(tripCtrl.trackTripByToken, { params: { token: 'tok' } })],
+  ])('%s: the masking number while the customer may call; null otherwise', async (_n, act) => {
+    const show = (t) => { Trip.findById = jest.fn().mockReturnValue(chain(t)); Trip.findOne = jest.fn().mockReturnValue(chain(t)); };
+
+    show(tripDoc());
+    expect((await act()).body.trip.callNumber).toBe('+918071234567');
+
+    for (const over of [
+      { status: 'completed' }, { status: 'cancelled' },
+      { status: 'dispatched', driverConfirmed: false },   // driver has not accepted yet
+      { driver: null },
+    ]) {
+      show(tripDoc(over));
+      expect((await act()).body.trip.callNumber).toBeNull();
+    }
+  });
+
+  test('no dedicated masking number (unset, or the CRM line itself) -> null', async () => {
+    Trip.findById = jest.fn().mockReturnValue(chain(tripDoc()));
+    delete process.env.PLIVO_MASKING_NUMBER;
+    expect((await call(tripCtrl.trackTrip, { params: { id: 't9' } })).body.trip.callNumber).toBeNull();
+    process.env.PLIVO_MASKING_NUMBER = '918065591088';            // == PLIVO_NUMBER
+    expect((await call(tripCtrl.trackTrip, { params: { id: 't9' } })).body.trip.callNumber).toBeNull();
+  });
+
+  test('driver app: GET /api/trips and GET /api/trips/:id carry it for the driver only', async () => {
+    const mine = tripDoc({ driver: { _id: 'd1', name: 'Ravi' } });
+    const done = tripDoc({ _id: 't8', status: 'completed', driver: { _id: 'd1', name: 'Ravi' } });
+    Trip.countDocuments = jest.fn().mockResolvedValue(2);
+    Trip.find = jest.fn().mockReturnValue(chain([mine, done]));
+
+    const list = await call(tripCtrl.getTrips, { user: { _id: 'd1', role: 'driver' } });
+    expect(list.body.trips.map((t) => t.callNumber)).toEqual(['+918071234567', null]);
+    expect(list.body.trips[0].tripNumber).toBe('T-0009');           // same fields as before, plus callNumber
+
+    Trip.findById = jest.fn().mockReturnValue(chain(mine));
+    const one = await call(tripCtrl.getTripById, { params: { id: 't9' }, user: { _id: 'd1', role: 'driver' } });
+    expect(one.body.trip.callNumber).toBe('+918071234567');
+
+    // CRM responses are unchanged: no callNumber key at all.
+    Trip.find = jest.fn().mockReturnValue(chain([mine]));
+    const crm = await call(tripCtrl.getTrips, { user: { _id: 'crm1', role: 'owner' }, actorType: 'user' });
+    expect(crm.body.trips[0]).not.toHaveProperty('callNumber');
+    const crmOne = await call(tripCtrl.getTripById, { params: { id: 't9' }, user: { _id: 'crm1', role: 'owner' }, actorType: 'user' });
+    expect(crmOne.body.trip).not.toHaveProperty('callNumber');
   });
 });

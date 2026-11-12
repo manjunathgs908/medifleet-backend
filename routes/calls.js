@@ -33,9 +33,13 @@ router.all('/transfer-answer', ctrl.requirePlivoSignature, ctrl.transferAnswer);
 router.all('/dial-event', ctrl.requirePlivoSignature, ctrl.dialEvent);
 // Driver <-> customer masked trip calls (controllers/tripCallController.js):
 // the initiator answered -> bridge if the trip is still active; and the
-// answer URL for the masking number's own application (a redial).
+// masking number's own application (the dial-pad flow): answer URL, the
+// bridge's Dial action and live report, and the hangup URL.
 router.all('/trip-answer',  ctrl.requirePlivoSignature, tripCallCtrl.answer);
 router.all('/trip-inbound', ctrl.requirePlivoSignature, tripCallCtrl.inbound);
+router.all('/trip-inbound-dial',       ctrl.requirePlivoSignature, tripCallCtrl.inboundDial);
+router.all('/trip-inbound-dial-event', ctrl.requirePlivoSignature, tripCallCtrl.inboundDialEvent);
+router.all('/trip-inbound-hangup',     ctrl.requirePlivoSignature, tripCallCtrl.inboundHangup);
 // In-app (VoIP) customer -> driver calls (controllers/tripVoipController.js):
 // the "SaveLife Trip VoIP" application's answer and hangup URLs, and the
 // Dial's action. They ring the driver's app only — never a phone.

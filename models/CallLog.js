@@ -48,8 +48,13 @@ const CallLogSchema = new mongoose.Schema(
     tripCallFrom: { type: String, enum: ['driver', 'customer'] },
     // 'voip': an in-app call (services/tripVoip.js) — the customer's app
     // dialled the driver's app; no phone leg, and neither phone number is
-    // stored on the row. Unset: a phone call, as every row before this.
-    channel     : { type: String, enum: ['voip'] },
+    // stored on the row.
+    // 'dialpad': the driver or customer dialled the masking number from
+    // their own phone and services/tripCalls.js bridged them to the other
+    // side (no callback). Real numbers are stored select:false as for any
+    // trip call.
+    // Unset: a callback-style phone call, as every row before these.
+    channel     : { type: String, enum: ['voip', 'dialpad'] },
 
     // What the call was about.
     context     : { type: String, enum: ['trip', 'lead', 'quote', 'whatsapp', 'whatsapp_lead', 'call_back', 'incoming', 'test_ring'], required: true },

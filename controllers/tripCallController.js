@@ -6,8 +6,12 @@
  *
  *   POST /api/trips/:id/call          the apps (driver or customer)
  *   ALL  /api/calls/trip-answer?log=  Plivo: initiator answered -> bridge
- *   ALL  /api/calls/trip-inbound      Plivo: someone dialled the masking
- *                                     number back -> short message, no bridge
+ *   ALL  /api/calls/trip-inbound      Plivo: the driver or customer dialled
+ *                                     the masking number (dial-pad flow) ->
+ *                                     bridge to the other party of their
+ *                                     active trip, or a spoken refusal
+ *   ALL  /api/calls/trip-inbound-dial, -dial-event, -hangup
+ *                                     that bridge's Dial reports and hang-up
  *
  * WHO MAY ASK
  *   from: 'driver'   the driver's normal login (protect, role driver), and
@@ -190,16 +194,72 @@ exports.answer = async (req, res, next) => {
   }
 };
 
+const plivoParamsOf = (req) => (req.method === 'POST' ? (req.body || {}) : (req.query || {}));
+const SORRY = 'Sorry, this call could not be connected.';
+
 // ============================================================
 // @route   ALL /api/calls/trip-inbound
-// @desc    Answer URL for the masking number's own Plivo application:
-//          someone dialled it back. Nobody is bridged -- the number is
-//          not a way to reach a driver or a customer outside the app.
+// @desc    Answer URL for the masking number's own Plivo application (the
+//          dial-pad flow): the driver or customer dialled the masking
+//          number from their phone. Their number -> their one active trip
+//          -> dial the OTHER party from the masking number. Unknown
+//          caller, no active trip, trip ended, several trips -> a spoken
+//          message, nobody dialled. See services/tripCalls.js.
 // @access  Plivo (signature)
 // ============================================================
-exports.inbound = (req, res) => {
-  const company = plivoSvc().companyNumber();
-  const help = /^91\d{10}$/.test(company) ? ` For help, call ${company.slice(2).split('').join(' ')}.` : '';
-  console.info('[trip-calls] inbound call to the masking number — played the redirect message');
-  return sendXml(res, plivoSvc().speakXml(`This number only connects calls for a SaveLife trip. Please use the call button in the SaveLife app.${help}`));
+exports.inbound = async (req, res) => {
+  try {
+    const { xml } = await svc().bridgeInbound(plivoParamsOf(req));
+    return sendXml(res, xml);
+  } catch (err) {
+    // Never a 500 to Plivo: the caller would hear nothing at all.
+    console.error('[trip-calls] dialpad inbound failed:', err?.message || err);
+    return sendXml(res, plivoSvc().speakXml(SORRY));
+  }
+};
+
+// ============================================================
+// @route   ALL /api/calls/trip-inbound-dial?log=<id>
+// @desc    The dial-pad bridge's <Dial> action: answered and finished, or
+//          not answered ("the driver could not answer right now").
+// @access  Plivo (signature)
+// ============================================================
+exports.inboundDial = async (req, res) => {
+  try {
+    const { xml } = await svc().dialpadDialFinished(String(req.query.log || ''), plivoParamsOf(req));
+    return sendXml(res, xml);
+  } catch (err) {
+    console.error('[trip-calls] dialpad dial report failed:', err?.message || err);
+    return sendXml(res, plivoSvc().hangupXml());
+  }
+};
+
+// ============================================================
+// @route   ALL /api/calls/trip-inbound-dial-event?log=<id>
+// @desc    The bridge's live report: the other side picked up. Connects
+//          only if the trip is still active, else hangs up.
+// @access  Plivo (signature)
+// ============================================================
+exports.inboundDialEvent = async (req, res) => {
+  try {
+    await svc().dialpadDialEvent(String(req.query.log || ''), plivoParamsOf(req));
+  } catch (err) {
+    console.error('[trip-calls] dialpad live report failed:', err?.message || err);
+  }
+  return sendXml(res, plivoSvc().emptyXml());
+};
+
+// ============================================================
+// @route   ALL /api/calls/trip-inbound-hangup
+// @desc    The masking number's application hangup URL: the caller's leg
+//          ended. Records the end time.
+// @access  Plivo (signature)
+// ============================================================
+exports.inboundHangup = async (req, res) => {
+  try {
+    await svc().dialpadCallEnded(plivoParamsOf(req));
+  } catch (err) {
+    console.error('[trip-calls] dialpad hang-up report failed:', err?.message || err);
+  }
+  return sendXml(res, plivoSvc().emptyXml());
 };

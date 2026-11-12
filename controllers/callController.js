@@ -1372,7 +1372,7 @@ function sendCallWelcome(phone, logId) {
 
 // ============================================================
 // @route   POST /api/calls/:id/send-welcome
-// @desc    Send the savelife_welcome WhatsApp template ("📍 Send Location")
+// @desc    Send the welcome WhatsApp template (WA_WELCOME_TEMPLATE_NAME, default savelife_pickup; "Send Location")
 //          to this call's customer. The number is read here, server-side —
 //          the CRM only ever shows it masked. Once per number per IST day,
 //          shared with the automatic send on incoming calls; works whether

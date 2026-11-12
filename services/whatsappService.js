@@ -154,12 +154,17 @@ async function sendLocationRequest(to, bodyText) {
 // Same send as sendTemplate, but says WHY it failed: { ok: true, data } or
 // { ok: false, error: { code, message } } with Meta's error code (e.g.
 // 132001 = no approved template by that name + language). Never throws.
+// No components given (or an empty list) -> the template object carries no
+// `components` key at all: { name, language: { code } } — for a fully
+// static template such as savelife_pickup.
 async function sendTemplateResult(to, templateName, languageCode, components) {
+  const template = { name: templateName, language: { code: languageCode } };
+  if (Array.isArray(components) && components.length) template.components = components;
   const r = await postMessage({
     messaging_product: 'whatsapp',
     to,
     type: 'template',
-    template: { name: templateName, language: { code: languageCode }, components: components || [] },
+    template,
   });
   return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
 }

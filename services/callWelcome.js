@@ -19,10 +19,17 @@
  *
  * Template: WA_WELCOME_TEMPLATE_NAME (default savelife_pickup), language
  * WA_WELCOME_TEMPLATE_LANG (default en — must be the approved template's
- * exact code). WA_WELCOME_IMAGE_URL only for a template WITH an image
- * header: unset/empty -> the template is sent with no components at all
- * (savelife_pickup has no header and no body variables); set -> it must be
- * a public https JPG/PNG and goes in as the header image.
+ * exact code).
+ *
+ * Components: NONE unless WA_WELCOME_TEMPLATE_HEADER=image. By default the
+ * template goes out as exactly { name, language: { code } } — savelife_pickup
+ * has no header and no body variables, and Meta refuses ANY header
+ * parameter for it (132018 "Template does not contain title component").
+ * WA_WELCOME_IMAGE_URL alone no longer adds a header: a URL left over from
+ * the old image template was what broke the send. Only with
+ * WA_WELCOME_TEMPLATE_HEADER=image is WA_WELCOME_IMAGE_URL (public https
+ * JPG/PNG) sent as the header image.
+ * Every send logs the template, language and components it used.
  * Never throws.
  * ============================================================
  */
@@ -37,6 +44,37 @@ const autoEnabled = () => process.env.WA_CALL_WELCOME_ENABLED === 'true';
 const templateName = () => (process.env.WA_WELCOME_TEMPLATE_NAME || '').trim() || 'savelife_pickup';
 const templateLang = () => (process.env.WA_WELCOME_TEMPLATE_LANG || '').trim() || 'en';
 const imageUrl = () => (process.env.WA_WELCOME_IMAGE_URL || '').trim();
+// The template's header type, as approved in Meta. Only 'image' adds a
+// component; anything else (unset, 'none', a typo) sends none.
+const headerType = () => ((process.env.WA_WELCOME_TEMPLATE_HEADER || '').trim().toLowerCase() === 'image' ? 'image' : 'none');
+
+/**
+ * What goes to Meta for this template: { components } (undefined = no
+ * components key at all) or { error } when an image header is configured
+ * without a usable URL.
+ */
+function templateComponents() {
+  if (headerType() !== 'image') return { components: undefined };
+  const link = imageUrl();
+  if (!/^https:\/\/\S+$/i.test(link)) {
+    return { error: { status: 'failed', reason: 'image_url_invalid', message: 'WA_WELCOME_TEMPLATE_HEADER=image needs WA_WELCOME_IMAGE_URL set to a public https image.' } };
+  }
+  return { components: [{ type: 'header', parameters: [{ type: 'image', image: { link } }] }] };
+}
+
+// One line per send: enough to see from Render's logs exactly what was
+// sent, and what WA_WELCOME_IMAGE_URL holds at runtime. The URL is the
+// public banner address, not a secret; no customer number is logged.
+function describeSend(components) {
+  const url = imageUrl();
+  return {
+    template  : templateName(),
+    language  : templateLang(),
+    header    : headerType(),
+    components: components ? components.map((c) => c.type).join(',') : 'none',
+    WA_WELCOME_IMAGE_URL: url ? `${url}${headerType() === 'image' ? '' : ' (set but ignored: WA_WELCOME_TEMPLATE_HEADER is not "image")'}` : '(empty)',
+  };
+}
 
 const isMobile = (ten) => /^[6-9]\d{9}$/.test(ten);
 
@@ -53,9 +91,13 @@ function explain(code, message) {
     case 132001:
       return { reason: 'template_not_approved', message: `WhatsApp has no approved template "${name}" in language "${lang}" — it may still be in review, or WA_WELCOME_TEMPLATE_LANG is not the template's exact language code.` };
     case 132000: case 132012: case 131008: case 131009: case 131053:
-      return { reason: 'template_rejected', message: imageUrl()
-        ? `WhatsApp rejected the template's header image or parameters — check WA_WELCOME_IMAGE_URL is a public JPG/PNG, and leave it empty for a template with no image header (${message || 'no detail'}).`
+      return { reason: 'template_rejected', message: headerType() === 'image'
+        ? `WhatsApp rejected the template's header image or parameters — check WA_WELCOME_IMAGE_URL is a public JPG/PNG, and unset WA_WELCOME_TEMPLATE_HEADER for a template with no image header (${message || 'no detail'}).`
         : `WhatsApp rejected the template's parameters — "${name}" was sent with none, so the approved template may expect a header or variables (${message || 'no detail'}).` };
+    case 132018:
+      return { reason: 'template_rejected', message: headerType() === 'image'
+        ? `WhatsApp says "${name}" has no header, but an image header was sent — unset WA_WELCOME_TEMPLATE_HEADER (${message || 'no detail'}).`
+        : `WhatsApp refused the template's parameters (${message || 'no detail'}).` };
     case 131026:
       return { reason: 'not_on_whatsapp', message: 'This number cannot receive WhatsApp messages (not on WhatsApp, or an old app version).' };
     case 131049:
@@ -103,19 +145,17 @@ async function send({ phone, source, callLog, sentBy } = {}) {
   try {
     const ten = normalisePhone(phone);
     if (!isMobile(ten)) return { status: 'not_mobile', message: 'No Indian mobile number on this call.' };
-    // No image configured -> no components at all (savelife_pickup: no
-    // header, no body variables, a static quick-reply that takes nothing).
-    const link = imageUrl();
-    if (link && !/^https:\/\/\S+$/i.test(link)) {
-      return { status: 'failed', reason: 'image_url_invalid', message: 'WA_WELCOME_IMAGE_URL must be a public https image, or empty for a template with no image header.' };
-    }
-    const components = link ? [{ type: 'header', parameters: [{ type: 'image', image: { link } }] }] : undefined;
+    // Default: no components at all (savelife_pickup: no header, no body
+    // variables, a static quick-reply that takes nothing).
+    const { components, error } = templateComponents();
+    if (error) return error;
 
     const day = istDate();
     const c = await claim(ten, day, { source, ...(callLog ? { callLog } : {}), ...(sentBy ? { sentBy } : {}) });
     if (c.already) return { status: 'already_sent_today', sentAt: c.already.sentAt || null };
     if (c.busy) return { status: 'in_progress', message: 'A welcome message to this number is being sent right now.' };
 
+    console.info(`[callWelcome] sending (${source})`, describeSend(components));
     const r = await whatsapp.sendTemplateResult(`91${ten}`, templateName(), templateLang(), components);
     if (r.ok) {
       const sentAt = new Date();

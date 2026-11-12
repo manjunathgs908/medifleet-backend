@@ -57,6 +57,11 @@ jest.mock('../services/trackingNotifications', () => ({ notifyTrackingLink: jest
 jest.mock('axios', () => ({ get: jest.fn(), post: jest.fn() }));
 // The in-app call hook (services/tripVoip.js) — checked below, never run.
 jest.mock('../services/tripVoip', () => ({ closeTripVoip: jest.fn(async () => ({})) }));
+// ...and the dial-pad masked-call hook (services/tripCalls.js), same rule.
+jest.mock('../services/tripCalls', () => ({
+  endRingingDialpadCalls: jest.fn(async () => ({ ringingEnded: 0 })),
+  callNumberFor: jest.fn(() => null),
+}));
 
 const { Trip, User, Bill, Income, Notification } = require('../models');
 const Ambulance = require('../models/Ambulance');
@@ -565,12 +570,15 @@ describe('an expired claim can never commit', () => {
   });
 });
 
-describe('in-app (VoIP) call hook: runs once the trip has really ended', () => {
+describe('in-app (VoIP) and dial-pad call hooks: run once the trip has really ended', () => {
   const tripVoip = require('../services/tripVoip');
+  const tripCalls = require('../services/tripCalls');
   beforeEach(() => {
     useStore();
     tripVoip.closeTripVoip.mockClear();
     tripVoip.closeTripVoip.mockImplementation(async () => ({}));
+    tripCalls.endRingingDialpadCalls.mockClear();
+    tripCalls.endRingingDialpadCalls.mockImplementation(async () => ({ ringingEnded: 0 }));
   });
   const customerCancel = () => run(ctrl.customerCancelTrip, { params: { id: 'T1' }, body: { reason: 'Not needed' } });
   const driverCancel = () => run(ctrl.updateStatus, { params: { id: 'T1' }, body: { status: 'cancelled', reason: 'Patient refused transport' }, user: { _id: 'd1', role: 'driver' } });
@@ -587,6 +595,8 @@ describe('in-app (VoIP) call hook: runs once the trip has really ended', () => {
     expect(t().status).toBe(reason);
     expect(tripVoip.closeTripVoip).toHaveBeenCalledTimes(1);
     expect(tripVoip.closeTripVoip).toHaveBeenCalledWith('T1', reason);
+    expect(tripCalls.endRingingDialpadCalls).toHaveBeenCalledTimes(1);
+    expect(tripCalls.endRingingDialpadCalls).toHaveBeenCalledWith('T1', reason);
   });
 
   it('not on a refused or failed change, nor on start-trip', async () => {
@@ -600,6 +610,7 @@ describe('in-app (VoIP) call hook: runs once the trip has really ended', () => {
     put({ status: 'completed', ...CREW });
     expect((await cancel()).statusCode).toBe(400);                                        // already ended
     expect(tripVoip.closeTripVoip).not.toHaveBeenCalled();
+    expect(tripCalls.endRingingDialpadCalls).not.toHaveBeenCalled();
   });
 
   it('a failing hook never fails the request that ended the trip', async () => {
@@ -608,6 +619,17 @@ describe('in-app (VoIP) call hook: runs once the trip has really ended', () => {
     expect((await complete()).statusCode).toBe(200);
     expect(t().status).toBe('completed');
     tripVoip.closeTripVoip.mockImplementation(async () => { throw new Error('async boom'); });
+    put({ status: 'en_route', ...CREW });
+    expect((await cancel()).statusCode).toBe(200);
+  });
+
+  it('a failing dial-pad hook never fails the request, and the VoIP hook still runs', async () => {
+    tripCalls.endRingingDialpadCalls.mockImplementation(() => { throw new Error('boom'); });
+    const t = put({ status: 'en_route', ...CREW });
+    expect((await complete()).statusCode).toBe(200);
+    expect(t().status).toBe('completed');
+    expect(tripVoip.closeTripVoip).toHaveBeenCalledWith('T1', 'completed');
+    tripCalls.endRingingDialpadCalls.mockImplementation(async () => { throw new Error('async boom'); });
     put({ status: 'en_route', ...CREW });
     expect((await cancel()).statusCode).toBe(200);
   });

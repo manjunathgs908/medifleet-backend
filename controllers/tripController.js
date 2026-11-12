@@ -44,12 +44,33 @@ const { dispatchStateOf, countDispatchStates, hasCrew, parseScheduleDate } = req
 // the trip's customer login is removed once no call is left. Runs after the
 // commit, is never awaited, and can never fail the request that ended the
 // trip. Loaded on use, so this controller never pulls in the Plivo SDK.
+// Dial-pad masked calls (services/tripCalls.js) follow the same rule: one
+// still RINGING is stopped, a CONNECTED one runs on.
 function closeTripVoip(tripId, reason) {
   try {
     // eslint-disable-next-line global-require
     require('../services/tripVoip').closeTripVoip(tripId, reason).catch(() => {});
   } catch (err) {
     console.error('[trip-voip] close hook failed:', err?.message || err);
+  }
+  try {
+    // eslint-disable-next-line global-require
+    require('../services/tripCalls').endRingingDialpadCalls(tripId, reason).catch(() => {});
+  } catch (err) {
+    console.error('[trip-calls] close hook failed:', err?.message || err);
+  }
+}
+
+// The number the app's Call button dials (dial-pad masked calling): the
+// masking number while `from` may call on this trip, else null. Additive
+// field on the read responses below; never throws.
+function callNumberOf(trip, from) {
+  try {
+    // eslint-disable-next-line global-require
+    return require('../services/tripCalls').callNumberFor(trip, from) || null;
+  } catch (err) {
+    console.error('[trip-calls] callNumber failed:', err?.message || err);
+    return null;
   }
 }
 
@@ -1872,12 +1893,18 @@ exports.getTrips = async (req, res, next) => {
 
     // No caller gets the customer's number (see the Trip toJSON rule in
     // models/index.js); everyone calls through POST /api/calls/click-to-call.
+    // The driver app also gets callNumber (dial-pad masked calling): the
+    // masking number while the trip is callable, else null. Other callers'
+    // responses are unchanged.
+    const out = req.user.role === 'driver'
+      ? trips.map((t) => ({ ...(typeof t.toJSON === 'function' ? t.toJSON() : t), callNumber: callNumberOf(t, 'driver') }))
+      : trips;
     return res.json({
       success: true,
       total,
       pages: Math.ceil(total / limit),
       currentPage: Number(page),
-      trips,
+      trips: out,
     });
   } catch (err) {
     next(err);
@@ -2052,6 +2079,8 @@ exports.getTripById = async (req, res, next) => {
     // same as on every other trip response.
     const tripObj = trip.toJSON();
     tripObj.waitState = trip.getLiveWaitState();
+    // Driver only: the dial-pad Call button's number (null when not callable).
+    if (req.user.role === 'driver') tripObj.callNumber = callNumberOf(trip, 'driver');
 
     return res.json({ success: true, trip: tripObj });
   } catch (err) {
@@ -2208,6 +2237,9 @@ exports.trackTripByToken = async (req, res, next) => {
         estimatedFare       : trip.estimatedFare,
 
         waitState: trip.getLiveWaitState(),
+        // Dial-pad masked calling: tel: this to reach the driver, calling
+        // from the trip's registered number. Null when not callable.
+        callNumber: callNumberOf(trip, 'customer'),
       },
     });
   } catch (err) {
@@ -2313,6 +2345,8 @@ exports.trackTrip = async (req, res, next) => {
         estimatedFare      : trip.estimatedFare,
         bill,
         waitState: trip.getLiveWaitState(),
+        // Dial-pad masked calling (see trackTripByToken).
+        callNumber: callNumberOf(trip, 'customer'),
       },
     });
   } catch (err) {

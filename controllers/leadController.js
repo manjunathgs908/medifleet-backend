@@ -5,6 +5,7 @@
  *
  *   GET   /                     ?status=&view=unassigned|due_today|overdue|mine&assignedTo=
  *   GET   /summary              counts for the dashboard and the nav badge
+ *   GET   /:id                  one lead (+ customerRef) — mobile lead details
  *   GET   /assignees            who a lead can be assigned to
  *   PATCH /:id/assign           { userId | null, rev }
  *   PATCH /:id/follow-up        { at | null, rev }  (India time if no zone)
@@ -30,6 +31,7 @@ const CallbackTask = require('../models/CallbackTask');
 const { OPERATIONS } = require('../middleware/auth');
 const { parseScheduleDate } = require('../utils/dispatchUrgency');
 const { ACTIVE_STATUSES, isActive, followUpStateOf, viewFilter, VIEWS } = require('../utils/leadFollowUp');
+const { customerRef } = require('../utils/customerPhone');
 
 const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
 const LEAD_STATUSES = Lead.schema.path('status').enumValues;
@@ -63,10 +65,13 @@ async function decorate(leads, { now = Date.now() } = {}) {
 }
 
 async function countsFor(userId, now = Date.now()) {
-  const [unassigned, dueToday, overdue, mine] = await Promise.all(
-    ['unassigned', 'due_today', 'overdue', 'mine'].map((v) => Lead.countDocuments(viewFilter(v, { now, userId }))),
-  );
-  return { unassigned, dueToday, overdue, mine };
+  const [unassigned, dueToday, overdue, mine, fresh] = await Promise.all([
+    ...['unassigned', 'due_today', 'overdue', 'mine'].map((v) => Lead.countDocuments(viewFilter(v, { now, userId }))),
+    // Additive (mobile CRM home): leads in status "new" — the same set
+    // GET /api/leads?status=new lists, so a count and its list always agree.
+    Lead.countDocuments({ status: 'new' }),
+  ]);
+  return { unassigned, dueToday, overdue, mine, new: fresh };
 }
 
 // ============================================================
@@ -117,6 +122,28 @@ exports.list = async (req, res, next) => {
 exports.summary = async (req, res, next) => {
   try {
     return res.json({ success: true, counts: await countsFor(req.user._id) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   GET /api/leads/:id
+// @desc    One lead, decorated exactly like a list row (masked number:
+//          full only for the owner, via the Lead toJSON), plus its
+//          customerRef — the opaque token GET /api/whatsapp/customer/:ref
+//          (customer history) and click-to-call accept. Same audience as
+//          the list (owner + telecaller); the number itself is never added.
+// ============================================================
+exports.getOne = async (req, res, next) => {
+  try {
+    if (!isObjectId(req.params.id)) return res.status(404).json({ success: false, message: 'Lead not found.' });
+    const lead = await Lead.findById(req.params.id);
+    if (!lead) return res.status(404).json({ success: false, message: 'Lead not found.' });
+    const [json] = await decorate([lead]);
+    let ref = null;
+    try { ref = lead.phone ? customerRef(lead.phone) : null; } catch { ref = null; }
+    return res.json({ success: true, lead: { ...json, customerRef: ref } });
   } catch (err) {
     next(err);
   }

@@ -355,7 +355,10 @@ exports.createTrip = async (req, res, next) => {
       claimed = r.capture;
       body = callCaptureBooking.withPhone(req.body, r.capture, r.callerPhone);
     }
-    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, ...(claimed ? { bookingSource: 'ai_call_entry' } : {}) });
+    const bookingSource = claimed
+      ? 'ai_call_entry'
+      : !req.user && body?.utmSource === 'chatgpt_ads' ? 'chatgpt_ads' : undefined;
+    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, bookingSource });
     if (claimed) { await callCaptureBooking.link(claimed, trip); claimed = null; }
     // Background push to the CRM — fire-and-forget, never affects the
     // booking. Sends only if the trip is incoming (not an operator's own).

@@ -76,6 +76,14 @@ jest.mock('plivo', () => ({ Client: jest.fn() }));
 // Pricing is not what these tests are about, and compute() throws without a
 // real serviceType — stubbed so a createTrip failure means a dispatch
 // failure, not a fare one.
+// Booking from a lead: the claim rules are tested in leadBooking.test.js;
+// here only that createTrip uses them (and only when staff send leadId).
+jest.mock('../services/leadBooking', () => ({
+  claim: jest.fn(), withPhone: jest.fn((b, l) => ({ ...b, leadId: String(l._id), patientPhone: b.patientPhone || l.phone })),
+  // Stand-in for the transaction: create the trip, then convert the lead.
+  createWithClaim: jest.fn(async (c, data, convert) => { const { Trip } = require('../models'); const t = await Trip.create(data); await convert(t, null); return t; }),
+  settle: jest.fn(async () => ({ released: true })), statusOf: jest.fn(async () => null),
+}));
 jest.mock('../utils/fareCalculator', () => ({
   compute: jest.fn(async () => ({ total: 1000, baseFare: 1000, distanceKm: 5, gst: 0 })),
 }));
@@ -218,6 +226,99 @@ describe('A. createTrip never assigns', () => {
 });
 
 // ============================================================
+describe('A2. createTrip from a lead (CRM staff)', () => {
+  const leadBooking = require('../services/leadBooking');
+  const { Lead } = require('../models');
+  const LEAD = '64b0000000000000000000a1';
+  const body = { patientName: 'Ravi', patientPhone: '', pickupAddress: 'X', pickupLat: 12.97, pickupLng: 77.59, dropAddress: 'Y', emergencyType: 'emergency', leadId: LEAD };
+  const created = () => {
+    const t = { _id: 't9', tripNumber: 'TRP-9', status: 'booked', populate: jest.fn().mockResolvedValue(undefined), save: jest.fn().mockResolvedValue(undefined) };
+    Trip.create = jest.fn().mockResolvedValue(t);
+    Trip.countDocuments = jest.fn().mockResolvedValue(0);
+    return t;
+  };
+  beforeEach(() => {
+    leadBooking.claim.mockReset(); leadBooking.createWithClaim.mockClear(); leadBooking.settle.mockClear();
+    Lead.findById = jest.fn().mockReturnValue(chain({ _id: LEAD, status: 'contacted', rev: 1 }));
+    Lead.findOneAndUpdate = jest.fn().mockResolvedValue({ _id: LEAD });
+    User.findById = jest.fn().mockReturnValue(chain({ name: 'Asha' }));
+  });
+
+  test('claims the lead, fills its number server-side, books in the claim’s transaction', async () => {
+    const t = created();
+    leadBooking.claim.mockResolvedValue({ ok: true, claim: { leadId: LEAD, token: 'x', at: new Date() }, lead: { _id: LEAD, phone: '9986844442' } });
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'telecaller' } });
+    expect(res.statusCode).toBe(201);
+    expect(leadBooking.claim).toHaveBeenCalledWith(LEAD, expect.objectContaining({ role: 'telecaller' }));
+    expect(Trip.create.mock.calls[0][0]).toMatchObject({ patientPhone: '9986844442', leadId: LEAD });
+    expect(leadBooking.createWithClaim).toHaveBeenCalledWith(expect.objectContaining({ leadId: LEAD }), expect.objectContaining({ leadId: LEAD }), expect.any(Function));
+    expect(res.body.trip).toBe(t);
+  });
+
+  test('already booked -> 409 ALREADY_BOOKED with that booking; no trip created', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: false, status: 409, code: 'ALREADY_BOOKED', message: 'This lead is already booked.', booking: { _id: 't1', tripNumber: 'TRP-1' } });
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'telecaller' } });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'ALREADY_BOOKED', booking: { tripNumber: 'TRP-1' } });
+    expect(Trip.create).not.toHaveBeenCalled();
+  });
+
+  test('a second submission while the first is running -> 409 IN_PROGRESS; no trip created', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: false, status: 409, code: 'IN_PROGRESS', message: 'This lead is being booked right now.' });
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'telecaller' } });
+    expect(res.body.code).toBe('IN_PROGRESS');
+    expect(Trip.create).not.toHaveBeenCalled();
+  });
+
+  test('a fare failure settles the claim (freed, since no trip exists)', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: true, claim: { leadId: LEAD, token: 'x', at: new Date() }, lead: { _id: LEAD, phone: '9986844442' } });
+    fareCalculator.compute.mockRejectedValueOnce(Object.assign(new Error('No active pricing'), { isFareError: true }));
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'telecaller' } });
+    expect(res.statusCode).toBe(400);
+    expect(leadBooking.settle).toHaveBeenCalledTimes(1);
+    expect(leadBooking.createWithClaim).not.toHaveBeenCalled();
+  });
+
+  test('without leadId, or without a staff login, the lead flow is not used (website / repeat bookings unchanged)', async () => {
+    created();
+    await call(tripCtrl.createTrip, { body: { ...body, leadId: undefined, patientPhone: '9876543210' }, user: { _id: 'u1', role: 'owner' } });
+    await call(tripCtrl.createTrip, { body: { ...body, patientPhone: '9876543210' } });
+    expect(leadBooking.claim).not.toHaveBeenCalled();
+  });
+
+  test('a claim taken over by another attempt -> 409 with the lead’s current state, no trip', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: true, claim: { leadId: LEAD, token: 'old', at: new Date() }, lead: { _id: LEAD, phone: '9986844442' } });
+    leadBooking.createWithClaim.mockRejectedValueOnce(Object.assign(new Error('taken over'), { code: 'LEAD_CLAIM_LOST' }));
+    leadBooking.statusOf.mockResolvedValueOnce({ code: 'ALREADY_BOOKED', message: 'This lead is already booked.', booking: { _id: 't5', tripNumber: 'TRP-5' } });
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'telecaller' } });
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'ALREADY_BOOKED', booking: { tripNumber: 'TRP-5' } });
+    expect(Trip.create).not.toHaveBeenCalled();
+  });
+
+  test('convertLead never overwrites a lead already linked to a different trip', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: true, claim: { leadId: LEAD, token: 'x', at: new Date() }, lead: { _id: LEAD, phone: '9986844442' } });
+    Lead.findById = jest.fn().mockReturnValue(chain({ _id: LEAD, status: 'converted', rev: 3, convertedTrip: 't-older' }));
+    const res = await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'owner' } });
+    expect(res.statusCode).toBe(201);
+    expect(Lead.findOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('an unlinked lead is converted only while still unlinked (guard in the update filter)', async () => {
+    created();
+    leadBooking.claim.mockResolvedValue({ ok: true, claim: { leadId: LEAD, token: 'x', at: new Date() }, lead: { _id: LEAD, phone: '9986844442' } });
+    await call(tripCtrl.createTrip, { body, user: { _id: 'u1', role: 'owner' } });
+    const filter = Lead.findOneAndUpdate.mock.calls[0][0];
+    expect(filter.$or).toEqual(expect.arrayContaining([{ convertedTrip: null }]));
+    expect(Lead.findOneAndUpdate.mock.calls[0][1].$push.history).toMatchObject({ type: 'status', detail: { to: 'converted', trip: 'TRP-9' } });
+  });
+});
+
 describe('B. manual assign to an on-duty ambulance', () => {
   const trip = () => ({
     _id: 't1', status: 'booked', vehicle: undefined, ambulance: undefined,

@@ -18,6 +18,8 @@ const WhatsAppLead = require('../models/WhatsAppLead');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const Quote = require('../models/Quote');
+const CallbackTask = require('../models/CallbackTask');
+const Payment = require('../models/Payment');
 const { protect, authorize, OPERATIONS } = require('../middleware/auth');
 const { runAsViewer, fullPhone } = require('../utils/phoneViewer');
 const { customerRef } = require('../utils/customerPhone');
@@ -61,6 +63,15 @@ beforeAll(async () => {
   jest.spyOn(WhatsAppCallLog, 'find').mockReturnValue(chain([{ phone: `91${PHONE}`, outcome: 'booked', createdAt: new Date() }]));
   jest.spyOn(Trip, 'find').mockReturnValue(chain([{ tripNumber: 'TRP-1', patientPhone: PHONE, status: 'completed' }]));
   jest.spyOn(Quote, 'find').mockReturnValue(chain([{ _id: 'q1', phone: PHONE, status: 'sent', sentAt: new Date(), expiresAt: new Date(Date.now() + 3600e3) }]));
+  // The customer history's overview reads these too (services/customerOverview):
+  // records that carry the full number, which must never reach a telecaller.
+  jest.spyOn(CallLog, 'find').mockReturnValue(chain([{ _id: 'c1', direction: 'inbound', status: 'completed', customerPhone: PHONE, agentName: 'Asha', startedAt: new Date(), talkSec: 30 }]));
+  jest.spyOn(CallLog, 'findOne').mockReturnValue(chain({ _id: 'c1', direction: 'inbound', status: 'completed', customerPhone: PHONE, agentName: 'Asha', startedAt: new Date(), talkSec: 30 }));
+  jest.spyOn(CallLog, 'aggregate').mockResolvedValue([{ logicalCalls: 1, rows: 1 }]);
+  jest.spyOn(CallLog, 'distinct').mockResolvedValue([]); // the customer's CallUUIDs (services/callStats)
+  jest.spyOn(CallbackTask, 'find').mockReturnValue(chain([{ _id: 'cb1', state: 'open', customerPhone: PHONE, firstMissedAt: new Date(), lastMissedAt: new Date() }]));
+  jest.spyOn(Lead, 'find').mockReturnValue(chain([{ _id: 'l1', patientName: 'L', phone: PHONE, status: 'new', followUpNotes: [], history: [] }]));
+  jest.spyOn(Payment, 'find').mockReturnValue(chain([]));
 
   const app = express();
   const ops = [protect, authorize(...OPERATIONS)];

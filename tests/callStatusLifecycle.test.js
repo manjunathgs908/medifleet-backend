@@ -43,7 +43,22 @@ jest.mock('../models/Quote', () => ({ findById: jest.fn() }));
 jest.mock('../models/WhatsAppLead', () => ({ findById: jest.fn() }));
 jest.mock('../models/CallLog', () => ({
   create: jest.fn(), findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), updateOne: jest.fn(),
+  aggregate: jest.fn(), distinct: jest.fn(async () => []), // GET /api/calls/performance (canonical calls)
 }));
+// One record = one call (no CallUUID): its canonical form, as
+// services/callStats.js produces it (the real aggregation is tested on
+// MongoDB in tests/performance.mongo.test.js).
+const perfCalls = (records) => records.map((r, i) => {
+  const { liveStateOf } = jest.requireActual('../utils/callLiveness');
+  const kind = r.tripMasked ? 'driver' : r.direction === 'inbound' ? 'incoming' : 'outgoing';
+  const done = r.status === 'completed';
+  const outcome = kind !== 'incoming' ? (done ? 'connected' : 'not_connected')
+    : done ? 'answered' : ['missed', 'no_agents', 'not_routed'].includes(r.status) ? 'missed'
+      : liveStateOf(r)?.state === 'unconfirmed' ? 'unconfirmed' : 'in_progress';
+  return { _id: `row:${i}`, kind, outcome, at: r.startedAt, rows: 1, recs: [{ completed: done, agentUser: r.agentUser || null, answeredAt: r.answeredAt || null, xfer: (r.transfers || []).map((t) => ({ o: t.outcome, by: t.answeredBy })) }] };
+});
+const aggOf = (records) => ({ allowDiskUse: () => Promise.resolve(perfCalls(records)) });
+
 jest.mock('../models/WebrtcDebugEvent', () => ({ create: jest.fn(async (d) => d), insertMany: jest.fn(), find: jest.fn() }));
 jest.mock('../models/WebrtcEndpoint', () => ({ find: jest.fn(), findOne: jest.fn(), updateMany: jest.fn() }));
 jest.mock('axios', () => {
@@ -416,7 +431,7 @@ describe('Call Logs list: checked against Plivo\'s live calls (read only)', () =
 
 describe('performance totals', () => {
   it('counts an ended-without-outcome call as unconfirmed, not ringing, missed or answered', async () => {
-    CallLog.find.mockReturnValue(chain([
+    CallLog.aggregate.mockReturnValue(aggOf([
       { direction: 'inbound', status: 'ringing', startedAt: new Date(Date.now() - 3 * 3600 * 1000) },
       { direction: 'inbound', status: 'ringing', startedAt: new Date() },
       { direction: 'inbound', status: 'missed', startedAt: new Date() },

@@ -1619,10 +1619,36 @@ exports.listLogs = async (req, res, next) => {
 //          for the team, never against one person.
 //          The owner sees every person; a telecaller only their own row
 //          (and the team totals, which name nobody).
+//
+//          Counted per LOGICAL CALL, with the same canonical classification
+//          as the customer overview and the Call Logs views
+//          (services/callStats.js): every call is rebuilt from ALL its linked
+//          records (same Plivo CallUUID) — its time is the earliest record's
+//          (that decides whether it is in the period), its outcome the
+//          strongest any record shows. A replayed record is never a second
+//          call, and a replayed "missed" record of an answered call is never
+//          a missed call. Masked driver<->customer trip calls are not staff
+//          work: they are not in `incoming` (team.driverCalls counts them).
+//
+//          Staff credit (unchanged rules, applied once per call):
+//            answered  the agent on the call's connected record(s), and each
+//                      person who took it as a transfer (transfer outcome
+//                      answered / rang_back) — ONCE per person per call,
+//                      however many records or transfers name them. A call
+//                      several people took is in each one's "answered", but
+//                      in the team totals ONCE.
+//            answeredUnattributed  an answered call no record names an agent on
+//            avgAnswerSec  answeredAt of that person's connected record minus
+//                      the call's start (earliest record), 0–600 s
+//            placed / connected  outgoing calls the person placed (named on
+//                      any record), once per call; connected = the call
+//                      connected (the customer's leg answered)
+//          An agent answering their own leg (agent_answered), the app's
+//          "answered" claim, talk time or a recording alone never makes a
+//          call answered or connected.
 // @access  Private [owner, telecaller]
 // ============================================================
 const PERFORMANCE_MAX_DAYS = 93;
-const MISSED_STATUSES = ['missed', 'no_agents', 'not_routed'];
 
 exports.performance = async (req, res, next) => {
   try {
@@ -1635,10 +1661,11 @@ exports.performance = async (req, res, next) => {
       return res.status(400).json({ success: false, message: `Pick a period of at most ${PERFORMANCE_MAX_DAYS} days.` });
     }
     const isOwner = req.user.role === 'owner';
+    const callStats = require('../services/callStats'); // eslint-disable-line global-require
 
     const [calls, staff] = await Promise.all([
-      CallLog.find({ startedAt: { $gte: from, $lt: to }, context: { $ne: 'test_ring' } })
-        .select('direction status agentUser transfers startedAt answeredAt endedAt createdAt').lean(),
+      callStats.callPipeline({ candidate: { startedAt: { $gte: from, $lt: to } }, post: { from, to }, withRecords: 'staff', CallLog })
+        .then((stages) => CallLog.aggregate(stages).allowDiskUse(true)),
       isOwner
         ? User.find({ role: { $in: ['owner', 'telecaller'] }, isActive: true }).select('name role').lean()
         : Promise.resolve([{ _id: req.user._id, name: req.user.name, role: req.user.role }]),
@@ -1648,45 +1675,60 @@ exports.performance = async (req, res, next) => {
       user: u._id, name: u.name, role: u.role,
       answered: 0, answerSecTotal: 0, answerSecCount: 0, placed: 0, connected: 0,
     }]));
-    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0, unconfirmed: 0 };
+    const team = { incoming: 0, answered: 0, answeredUnattributed: 0, missed: 0, inProgress: 0, unconfirmed: 0, driverCalls: 0 };
+    let records = 0;
 
     for (const c of calls || []) {
-      const row = c.agentUser ? rows.get(String(c.agentUser)) : null;
-      if (c.direction === 'inbound') {
+      records += c.rows || 0;
+      const recs = c.recs || [];
+      if (c.kind === 'driver') { team.driverCalls += 1; continue; }
+      if (c.kind === 'incoming') {
         team.incoming += 1;
-        if (c.status === 'completed') {
+        if (c.outcome === 'answered') {
           team.answered += 1;
-          if (!c.agentUser) team.answeredUnattributed += 1;
-          if (row) {
+          // The agent(s) on the connected record(s), then transfer takers —
+          // each person once per call.
+          const credited = new Set();
+          for (const r of recs) {
+            if (!r.completed || !r.agentUser) continue;
+            const by = String(r.agentUser);
+            if (credited.has(by)) continue;
+            credited.add(by);
+            const row = rows.get(by);
+            if (!row) continue;
             row.answered += 1;
-            if (c.answeredAt && c.startedAt) {
-              const sec = (new Date(c.answeredAt) - new Date(c.startedAt)) / 1000;
+            if (r.answeredAt && c.at) {
+              const sec = (new Date(r.answeredAt) - new Date(c.at)) / 1000;
               if (sec >= 0 && sec < 600) { row.answerSecTotal += sec; row.answerSecCount += 1; }
             }
           }
-          // Each person who took it as a transfer is credited too — once per
-          // call, however many times it came back to them. The team counts
-          // the call once. A transfer ring nobody picked up counts against
-          // nobody.
-          const credited = new Set(row ? [String(c.agentUser)] : []);
-          for (const t of c.transfers || []) {
-            const by = t?.answeredBy ? String(t.answeredBy) : null;
-            if (!by || !TRANSFER_ANSWERED.includes(t.outcome) || credited.has(by)) continue;
-            credited.add(by);
-            const tRow = rows.get(by);
-            if (tRow) tRow.answered += 1;
+          if (!credited.size) team.answeredUnattributed += 1;
+          for (const r of recs) {
+            for (const t of r.xfer || []) {
+              const by = t?.by ? String(t.by) : null;
+              if (!by || !TRANSFER_ANSWERED.includes(t.o) || credited.has(by)) continue;
+              credited.add(by);
+              const tRow = rows.get(by);
+              if (tRow) tRow.answered += 1;
+            }
           }
-        } else if (MISSED_STATUSES.includes(c.status)) {
+        } else if (c.outcome === 'missed') {
           team.missed += 1;
-        } else if (liveStateOf(c)?.state === 'unconfirmed') {
+        } else if (c.outcome === 'unconfirmed') {
           // Ended, but its outcome never arrived — neither answered nor missed.
           team.unconfirmed += 1;
         } else {
           team.inProgress += 1;
         }
-      } else if (row) {
-        row.placed += 1;
-        if (c.status === 'completed') row.connected += 1;
+      } else {
+        // Outgoing: each person who placed it (named on any record), once.
+        const placers = new Set(recs.filter((r) => r.agentUser).map((r) => String(r.agentUser)));
+        for (const by of placers) {
+          const row = rows.get(by);
+          if (!row) continue;
+          row.placed += 1;
+          if (c.outcome === 'connected') row.connected += 1;
+        }
       }
     }
 
@@ -1695,7 +1737,11 @@ exports.performance = async (req, res, next) => {
       avgAnswerSec: answerSecCount ? Math.round(answerSecTotal / answerSecCount) : null,
     })).sort((a, b) => b.answered - a.answered || String(a.name).localeCompare(String(b.name)));
 
-    return res.json({ success: true, from, to, scope: isOwner ? 'team' : 'self', team, people });
+    return res.json({
+      success: true, from, to, scope: isOwner ? 'team' : 'self', team, people,
+      // Additive: what the figures count (services/callStats.js).
+      basis: { unit: 'logical_call', logicalCalls: (calls || []).length, callRecords: records },
+    });
   } catch (err) {
     next(err);
   }

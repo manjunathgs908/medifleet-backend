@@ -12,6 +12,7 @@ const router  = express.Router();
 const ctrl    = require('../controllers/callController');
 const tripCallCtrl = require('../controllers/tripCallController');
 const tripVoipCtrl = require('../controllers/tripVoipController');
+const historyCtrl = require('../controllers/callHistoryController');
 const { protect, protectUserOrOwner, authorize } = require('../middleware/auth');
 
 const { OPERATIONS: CRM_CALLS } = require('../middleware/auth');
@@ -58,6 +59,11 @@ router.post('/driver-voip/presence', protect, authorize('driver'), tripVoipCtrl.
 router.get('/logs', protect, authorize(...CRM_CALLS), ctrl.listLogs);
 // Who took the calls: every person for the owner, only yourself otherwise.
 router.get('/performance', protect, authorize(...CRM_CALLS), ctrl.performance);
+// Read-only Call Logs views (controllers/callHistoryController.js): "All call
+// events" (paged call cards) and "By customer". Same roles as /logs; numbers
+// masked except for the owner. (Not /events — that is Plivo's webhook.)
+router.get('/history', protect, authorize(...CRM_CALLS), historyCtrl.history);
+router.get('/customers', protect, authorize(...CRM_CALLS), historyCtrl.customers);
 router.get('/duty', protect, authorize(...CRM_CALLS), ctrl.getDuty);
 router.put('/duty', protect, authorize(...CRM_CALLS), ctrl.setDuty);
 router.get('/me',     protect, authorize(...CRM_CALLS), ctrl.getMe);

@@ -533,6 +533,10 @@ const leadSchema = new Schema(
     // made from an out-of-date view is refused (409), never applied over
     // someone else's.
     rev: { type: Number },
+    // Who added the lead by hand (POST /api/leads). Unset on leads that
+    // arrived from ads, calls or WhatsApp.
+    createdBy    : { type: Schema.Types.ObjectId, ref: 'User' },
+    createdByName: { type: String },
 
     // â”€â”€ Call popup data (populated from telephony webhook) â”€â”€â”€
     callHistory: [

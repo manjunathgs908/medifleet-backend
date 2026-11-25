@@ -850,6 +850,23 @@ router.get('/customer/:phone', protect, authorize(...OPERATIONS), async (req, re
       lastOutcome: calls[0]?.outcome || null, // calls already sorted newest first
     };
 
+    // Additive: the customer overview (services/customerOverview.js) —
+    // every recorded call (Plivo CallLog, the same set as "Recorded calls"),
+    // callbacks, enquiries, bookings and, for the owner only, payments, with
+    // counts by direction and period and one timeline. summary.totalCallsMade
+    // above stays as it was: it counts only outcomes logged by hand from the
+    // WhatsApp Chats page (WhatsAppCallLog), not phone calls.
+    // Never allowed to break the history above: on any failure the response
+    // is exactly as before, with overview: null.
+    let overview = null;
+    try {
+      overview = await require('../services/customerOverview').buildOverview(normalized, {
+        role: req.user?.role, waCalls: calls, conversations, trips,
+      });
+    } catch (err) {
+      console.error('[customer-overview] could not build:', err?.message || err);
+    }
+
     res.json({
       success: true,
       customerRef: customerRef(normalized),
@@ -859,6 +876,7 @@ router.get('/customer/:phone', protect, authorize(...OPERATIONS), async (req, re
       conversations,
       calls: callRows,
       trips: tripRows,
+      overview,
     });
   } catch (err) {
     next(err);

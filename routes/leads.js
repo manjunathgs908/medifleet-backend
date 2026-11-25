@@ -15,6 +15,7 @@ router.patch('/:id/status',     ctrl.setStatus);
 router.post ('/:id/notes',      ctrl.addNote);
 router.put  ('/:id',            ctrl.legacyUpdate);
 router.get  ('/',               ctrl.list);
+router.post ('/',               ctrl.create);
 // After /summary and /assignees, so neither is read as an id.
 router.get  ('/:id',            ctrl.getOne);
 

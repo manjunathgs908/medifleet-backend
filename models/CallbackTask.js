@@ -1,6 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
-const { maskPhone } = require('../utils/customerPhone');
+const { maskPhone, customerRef } = require('../utils/customerPhone');
 const { fullPhone } = require('../utils/phoneViewer');
 
 // One customer to call back: every missed incoming call from one number
@@ -106,6 +106,8 @@ CallbackTaskSchema.set('toJSON', {
   transform(doc, ret) {
     if ('customerPhone' in ret) {
       ret.customerMasked = maskPhone(ret.customerPhone);
+      // Opaque link to the customer overview (never the number).
+      try { ret.customerRef = ret.customerPhone ? customerRef(ret.customerPhone) : undefined; } catch { /* not a usable number */ }
       const full = fullPhone(ret.customerPhone); // CRM owner only
       delete ret.customerPhone;
       if (full) ret.customerPhone = full;

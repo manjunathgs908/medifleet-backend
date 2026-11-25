@@ -7,8 +7,13 @@
  *
  *   GET  /                      open (or ?state=resolved) tasks, with each
  *                               task's missed calls, callback attempts,
- *                               later connected calls and due time
- *   GET  /summary               { open, overdue } for the nav badge
+ *                               later connected calls and due time. Open
+ *                               tasks come most urgent first (due time);
+ *                               ?page=&limit=&assignee=all|me|unassigned|<id>
+ *                               &due=all|overdue|today|due pages through the
+ *                               whole queue with accurate totals
+ *   GET  /summary               { open, overdue } for the nav badge, plus
+ *                               personal / unassigned counts
  *   GET  /assignees             who a task can be assigned to
  *   PATCH /:id/assign           { userId | null, rev }
  *   PATCH /:id/schedule         { at | null, rev }  (India time if no zone)
@@ -37,6 +42,7 @@ const { OPERATIONS } = require('../middleware/auth');
 const { dueStateOf, dueMinutes } = require('../utils/callbackDue');
 const { parseScheduleDate } = require('../utils/dispatchUrgency');
 const { normalisePhone } = require('../utils/phone');
+const { istDayBounds } = require('../utils/leadFollowUp');
 const queue = require('../services/callbackQueue');
 
 const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
@@ -119,25 +125,127 @@ async function ready(res) {
   return false;
 }
 
+// ── Open-queue ordering, filters and totals ──────────────────────
+// Every open task's timing fields are small, so the whole open queue is
+// read once and ordered by the canonical due rule (utils/callbackDue
+// dueStateOf — the same rule the badge and each task's `due` use). The full
+// records are then loaded only for the rows returned. Most urgent first:
+// due time ascending, _id as the tie-break, so pages never shift or repeat.
+const SLIM = 'state firstMissedAt lastMissedAt lastQueuedAt nextCallbackAt scheduledAt assignedTo';
+const LEGACY_OPEN_MAX = 300;
+const PAGE_MAX = 100;
+const ASSIGNEE = ['all', 'me', 'unassigned'];
+const DUE = ['all', 'overdue', 'today', 'due']; // due = overdue or later today (India day)
+
+async function openQueue(now = Date.now()) {
+  const slim = await CallbackTask.find({ state: 'open' }).select(SLIM).lean();
+  const end = istDayBounds(now).end.getTime();
+  return slim.map((t) => {
+    const due = dueStateOf(t, { now });
+    const dueAt = due ? due.dueAt.getTime() : Number.POSITIVE_INFINITY;
+    return { _id: t._id, assignedTo: t.assignedTo ? String(t.assignedTo) : null, dueAt, overdue: !!due?.overdue, today: !due?.overdue && dueAt < end };
+  }).sort((a, b) => (a.dueAt - b.dueAt) || String(a._id).localeCompare(String(b._id)));
+}
+
+// Accurate totals for the whole open queue, whatever page is loaded.
+// mine* = assigned to this user; unassigned* = nobody's yet (kept apart
+// from personal work).
+function totalsOf(rows, userId) {
+  const me = userId ? String(userId) : null;
+  const t = { open: rows.length, overdue: 0, dueToday: 0, mine: 0, mineOverdue: 0, mineDueToday: 0, unassigned: 0, unassignedOverdue: 0, unassignedDueToday: 0 };
+  for (const r of rows) {
+    if (r.overdue) t.overdue += 1;
+    if (r.today) t.dueToday += 1;
+    if (me && r.assignedTo === me) { t.mine += 1; if (r.overdue) t.mineOverdue += 1; if (r.today) t.mineDueToday += 1; }
+    if (!r.assignedTo) { t.unassigned += 1; if (r.overdue) t.unassignedOverdue += 1; if (r.today) t.unassignedDueToday += 1; }
+  }
+  return t;
+}
+
+// Full records for these ids, in this order.
+async function loadInOrder(ids) {
+  if (!ids.length) return [];
+  const docs = await CallbackTask.find({ _id: { $in: ids } })
+    .select('+customerPhone')
+    .populate('trip', 'tripNumber patientName')
+    .populate('lead', 'patientName');
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+  return ids.map((id) => byId.get(String(id))).filter(Boolean);
+}
+
+// Paged mode is used when any of these is given; otherwise the list keeps
+// its original shape (the desktop Callbacks page).
+const PAGED_KEYS = ['page', 'limit', 'assignee', 'due'];
+function pagedParams(q) {
+  const assignee = q.assignee === undefined || q.assignee === '' ? 'all' : q.assignee;
+  if (typeof assignee !== 'string' || (!ASSIGNEE.includes(assignee) && !isObjectId(assignee))) return { error: 'Unknown assignee filter.' };
+  const due = q.due === undefined || q.due === '' ? 'all' : q.due;
+  if (typeof due !== 'string' || !DUE.includes(due)) return { error: 'Unknown due filter.' };
+  const page = Math.max(1, Number.parseInt(q.page, 10) || 1);
+  const limit = Math.min(PAGE_MAX, Math.max(1, Number.parseInt(q.limit, 10) || 25));
+  return { assignee, due, page, limit };
+}
+
 exports.list = async (req, res, next) => {
   try {
     if (!(await ready(res))) return undefined;
     await queue.sweepSoon();
     const resolved = req.query.state === 'resolved';
-    const tasks = await CallbackTask.find({ state: resolved ? { $in: ['resolved', 'withdrawn'] } : 'open' })
-      .select('+customerPhone')
-      .sort(resolved ? { updatedAt: -1 } : { lastMissedAt: -1 })
-      .limit(resolved ? 50 : 300)
-      .populate('trip', 'tripNumber patientName')
-      .populate('lead', 'patientName');
-    const open = resolved
-      ? await CallbackTask.find({ state: 'open' }).select('state firstMissedAt lastMissedAt lastQueuedAt nextCallbackAt scheduledAt').lean()
-      : tasks;
+    const paged = !resolved && PAGED_KEYS.some((k) => req.query[k] !== undefined);
+
+    if (resolved) {
+      const tasks = await CallbackTask.find({ state: { $in: ['resolved', 'withdrawn'] } })
+        .select('+customerPhone')
+        .sort({ updatedAt: -1 })
+        .limit(50)
+        .populate('trip', 'tripNumber patientName')
+        .populate('lead', 'patientName');
+      const open = await CallbackTask.find({ state: 'open' }).select('state firstMissedAt lastMissedAt lastQueuedAt nextCallbackAt scheduledAt').lean();
+      return res.json({ success: true, config: { dueMinutes: dueMinutes() }, counts: summaryOf(open), tasks: await decorate(tasks) });
+    }
+
+    const now = Date.now();
+    const rows = await openQueue(now);
+    const totals = totalsOf(rows, req.user?._id);
+
+    if (!paged) {
+      // Original shape for the desktop page: the most URGENT open tasks
+      // (it was the newest 300, which hid the oldest overdue ones), with
+      // counts over the whole queue, not just the rows returned.
+      const take = rows.slice(0, LEGACY_OPEN_MAX);
+      return res.json({
+        success: true,
+        config: { dueMinutes: dueMinutes() },
+        counts: { open: totals.open, overdue: totals.overdue },
+        totals,
+        truncated: Math.max(0, rows.length - take.length),
+        tasks: await decorate(await loadInOrder(take.map((r) => r._id))),
+      });
+    }
+
+    const p = pagedParams(req.query);
+    if (p.error) return res.status(400).json({ success: false, message: p.error });
+    const me = String(req.user?._id || '');
+    // Filters BEFORE pagination, so a page and its total always agree.
+    const matched = rows.filter((r) => {
+      if (p.assignee === 'me' && r.assignedTo !== me) return false;
+      if (p.assignee === 'unassigned' && r.assignedTo) return false;
+      if (isObjectId(p.assignee) && r.assignedTo !== p.assignee) return false;
+      if (p.due === 'overdue' && !r.overdue) return false;
+      if (p.due === 'today' && !r.today) return false;
+      if (p.due === 'due' && !r.overdue && !r.today) return false;
+      return true;
+    });
+    const start = (p.page - 1) * p.limit;
+    const slice = matched.slice(start, start + p.limit);
     return res.json({
       success: true,
       config: { dueMinutes: dueMinutes() },
-      counts: summaryOf(open),
-      tasks: await decorate(tasks),
+      counts: { open: totals.open, overdue: totals.overdue },
+      totals,
+      filters: { assignee: p.assignee, due: p.due },
+      page: { page: p.page, limit: p.limit, total: matched.length, pages: Math.max(1, Math.ceil(matched.length / p.limit)), hasMore: start + p.limit < matched.length },
+      tasks: await decorate(await loadInOrder(slice.map((r) => r._id)), { now }),
     });
   } catch (err) {
     next(err);
@@ -151,8 +259,15 @@ exports.summary = async (req, res, next) => {
   try {
     if (!(await ready(res))) return undefined;
     await queue.sweepSoon();
-    const open = await CallbackTask.find({ state: 'open' }).select('state firstMissedAt lastMissedAt lastQueuedAt nextCallbackAt scheduledAt').lean();
-    return res.json({ success: true, ...summaryOf(open), dueMinutes: dueMinutes() });
+    const rows = await openQueue();
+    const t = totalsOf(rows, req.user?._id);
+    // open/overdue exactly as before; the rest added for the personal
+    // My Work badge — same due rule and India day as the list's filters.
+    return res.json({
+      success: true, open: t.open, overdue: t.overdue, dueMinutes: dueMinutes(),
+      dueToday: t.dueToday, mine: t.mine, mineOverdue: t.mineOverdue, mineDueToday: t.mineDueToday,
+      unassigned: t.unassigned, unassignedOverdue: t.unassignedOverdue, unassignedDueToday: t.unassignedDueToday,
+    });
   } catch (err) {
     next(err);
   }

@@ -25,6 +25,8 @@ jest.mock('../models', () => ({
     schema: { path: () => ({ enumValues: ['new', 'contacted', 'converted', 'lost', 'spam'] }) },
   },
   User: { find: () => ({ select: () => ({ lean: async () => [{ _id: 'u1', name: 'Asha' }] }) }) },
+  // GET /api/leads/:id asks whether a trip already carries the lead (none here).
+  Trip: (() => { const q = { select: () => q, sort: () => q, limit: () => q, lean: () => q, session: () => q, then: (r, j) => Promise.resolve([]).then(r, j) }; return { find: () => q, countDocuments: () => ({ session: () => {}, then: (r, j) => Promise.resolve(0).then(r, j) }) }; })(),
 }));
 jest.mock('../models/CallbackTask', () => ({ find: () => ({ select: () => ({ lean: async () => [] }) }) }));
 
@@ -70,7 +72,9 @@ describe('A. GET /api/leads/summary', () => {
       return 5;                                          // overdue
     });
     const res = await run(handlerFor('/summary'), {});
-    expect(res.body).toEqual({ success: true, counts: { unassigned: 3, dueToday: 2, overdue: 5, mine: 4, new: 7 } });
+    expect(res.body.success).toBe(true);
+    // The existing counts, unchanged (later additions are extra fields).
+    expect(res.body.counts).toMatchObject({ unassigned: 3, dueToday: 2, overdue: 5, mine: 4, new: 7 });
     expect(mockCount).toHaveBeenCalledWith({ status: 'new' });
   });
 });

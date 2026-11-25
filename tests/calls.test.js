@@ -40,7 +40,22 @@ jest.mock('../models/Quote', () => ({ findById: jest.fn() }));
 jest.mock('../models/WhatsAppLead', () => ({ findById: jest.fn() }));
 jest.mock('../models/CallLog', () => ({
   create: jest.fn(), findById: jest.fn(), findOne: jest.fn(), find: jest.fn(), updateOne: jest.fn(),
+  aggregate: jest.fn(), distinct: jest.fn(async () => []), // GET /api/calls/performance (canonical calls)
 }));
+// One record = one call (no CallUUID): its canonical form, as
+// services/callStats.js produces it (the real aggregation is tested on
+// MongoDB in tests/performance.mongo.test.js).
+const perfCalls = (records) => records.map((r, i) => {
+  const { liveStateOf } = jest.requireActual('../utils/callLiveness');
+  const kind = r.tripMasked ? 'driver' : r.direction === 'inbound' ? 'incoming' : 'outgoing';
+  const done = r.status === 'completed';
+  const outcome = kind !== 'incoming' ? (done ? 'connected' : 'not_connected')
+    : done ? 'answered' : ['missed', 'no_agents', 'not_routed'].includes(r.status) ? 'missed'
+      : liveStateOf(r)?.state === 'unconfirmed' ? 'unconfirmed' : 'in_progress';
+  return { _id: `row:${i}`, kind, outcome, at: r.startedAt, rows: 1, recs: [{ completed: done, agentUser: r.agentUser || null, answeredAt: r.answeredAt || null, xfer: (r.transfers || []).map((t) => ({ o: t.outcome, by: t.answeredBy })) }] };
+});
+const aggOf = (records) => ({ allowDiskUse: () => Promise.resolve(perfCalls(records)) });
+
 jest.mock('../services/exotelService', () => ({ connectCall: jest.fn() }));
 jest.mock('../services/callWelcome', () => ({ onIncomingCall: jest.fn(async () => ({ status: 'disabled' })), send: jest.fn() }));
 jest.mock('../models/WebrtcDebugEvent', () => ({
@@ -1483,19 +1498,19 @@ describe('telecaller performance', () => {
   const period = { from: '2026-10-26T00:00:00Z', to: '2026-10-27T00:00:00Z' };
 
   it('owner: a row per person, missed counted once for the team', async () => {
-    CallLog.find.mockReturnValue(chain(CALLS));
+    CallLog.aggregate.mockReturnValue(aggOf(CALLS));
     User.find.mockReturnValue(chain([owner, santosh]));
     const { res } = await run(ctrl.performance, { user: owner, query: period });
     expect(res.body.scope).toBe('team');
-    expect(res.body.team).toEqual({ incoming: 6, answered: 4, answeredUnattributed: 1, missed: 2, inProgress: 0, unconfirmed: 0 });
+    expect(res.body.team).toEqual({ incoming: 6, answered: 4, answeredUnattributed: 1, missed: 2, inProgress: 0, unconfirmed: 0, driverCalls: 0 });
     const s = res.body.people.find((p) => p.name === 'santosh');
     expect(s).toEqual(expect.objectContaining({ answered: 2, avgAnswerSec: 15, placed: 2, connected: 1 }));
     expect(res.body.people.find((p) => p.name === 'Manjunath')).toEqual(expect.objectContaining({ answered: 1, avgAnswerSec: 5 }));
-    expect(CallLog.find.mock.calls[0][0].context).toEqual({ $ne: 'test_ring' });
+    expect(JSON.stringify(CallLog.aggregate.mock.calls[0][0][0])).toContain('"context":{"$ne":"test_ring"}');
   });
 
   it('telecaller: only their own row, never anyone else\'s', async () => {
-    CallLog.find.mockReturnValue(chain(CALLS));
+    CallLog.aggregate.mockReturnValue(aggOf(CALLS));
     const { res } = await run(ctrl.performance, { user: santosh, query: period });
     expect(res.body.scope).toBe('self');
     expect(res.body.people).toHaveLength(1);

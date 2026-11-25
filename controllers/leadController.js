@@ -26,12 +26,14 @@
 'use strict';
 
 const mongoose = require('mongoose');
-const { Lead, User } = require('../models');
+const { Lead, User, Trip } = require('../models');
 const CallbackTask = require('../models/CallbackTask');
 const { OPERATIONS } = require('../middleware/auth');
 const { parseScheduleDate } = require('../utils/dispatchUrgency');
 const { ACTIVE_STATUSES, isActive, followUpStateOf, viewFilter, VIEWS } = require('../utils/leadFollowUp');
 const { customerRef } = require('../utils/customerPhone');
+const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
+const LeadClaim = require('../models/LeadClaim');
 
 const isObjectId = (v) => typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
 const LEAD_STATUSES = Lead.schema.path('status').enumValues;
@@ -39,6 +41,7 @@ const NOTE_MAX = 1000;
 const REASON_MAX = 500;
 const FOLLOW_UP_MAX_DAYS = 180;
 const LIST_MAX = 500;
+const PAGE_MAX = 100;
 
 // Leads written before rev existed have none: they count as rev 0.
 const revFilter = (rev) => (rev === 0 ? { rev: { $in: [0, null] } } : { rev });
@@ -60,18 +63,29 @@ async function decorate(leads, { now = Date.now() } = {}) {
     if (json.assignedTo && !json.assignedToName) json.assignedToName = names.get(String(json.assignedTo)) || null;
     json.followUp = followUpStateOf(l, now);
     json.openCallback = callbackFor.get(String(l._id)) || null;
+    // Opaque link to the customer overview (never the number).
+    try { if (l.phone) json.customerRef = customerRef(l.phone); } catch { /* not a usable number */ }
     return json;
   });
 }
 
 async function countsFor(userId, now = Date.now()) {
-  const [unassigned, dueToday, overdue, mine, fresh] = await Promise.all([
-    ...['unassigned', 'due_today', 'overdue', 'mine'].map((v) => Lead.countDocuments(viewFilter(v, { now, userId }))),
+  const v = (name) => viewFilter(name, { now, userId });
+  const nobody = { $or: [{ assignedTo: { $exists: false } }, { assignedTo: null }] };
+  const [unassigned, dueToday, overdue, mine, fresh, mineOverdue, mineDueToday, unassignedOverdue, unassignedDueToday] = await Promise.all([
+    ...['unassigned', 'due_today', 'overdue', 'mine'].map((n) => Lead.countDocuments(v(n))),
     // Additive (mobile CRM home): leads in status "new" — the same set
     // GET /api/leads?status=new lists, so a count and its list always agree.
     Lead.countDocuments({ status: 'new' }),
+    // Additive (personal My Work badge): the overdue / due_today views,
+    // narrowed to this user, or to nobody — exactly what the list returns
+    // for ?view=overdue&assignedTo=<me> (and the unassigned equivalent).
+    Lead.countDocuments({ ...v('overdue'), assignedTo: userId }),
+    Lead.countDocuments({ ...v('due_today'), assignedTo: userId }),
+    Lead.countDocuments({ $and: [v('overdue'), nobody] }),
+    Lead.countDocuments({ $and: [v('due_today'), nobody] }),
   ]);
-  return { unassigned, dueToday, overdue, mine, new: fresh };
+  return { unassigned, dueToday, overdue, mine, new: fresh, mineOverdue, mineDueToday, unassignedOverdue, unassignedDueToday };
 }
 
 // ============================================================
@@ -101,10 +115,31 @@ exports.list = async (req, res, next) => {
       Object.assign(filter, v, filter.status ? { status: filter.status } : {});
       if (view === 'due_today' || view === 'overdue') sort = { nextFollowUpAt: 1 };
     }
-    if (assignedTo !== undefined && assignedTo !== '') {
+    // assignedTo=none (additive): leads nobody is assigned to, combinable
+    // with a view (e.g. unassigned AND overdue, for My Work).
+    if (assignedTo === 'none') {
+      filter.$and = [...(filter.$and || []), { $or: [{ assignedTo: { $exists: false } }, { assignedTo: null }] }];
+    } else if (assignedTo !== undefined && assignedTo !== '') {
       if (!isObjectId(assignedTo)) return res.status(400).json({ success: false, message: 'Unknown staff member.' });
       if (view === 'unassigned') return res.json({ success: true, leads: [] });
       filter.assignedTo = assignedTo;
+    }
+    // ?page=&limit= (additive): stable pages through every match, with the
+    // total counted on the same filter. Without them the response is as
+    // before (plain status tabs return every lead; views stop at 500).
+    if (req.query.page !== undefined || req.query.limit !== undefined) {
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(PAGE_MAX, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
+      const stable = { ...sort, _id: sort.nextFollowUpAt ? 1 : -1 };
+      const [total, rows] = await Promise.all([
+        Lead.countDocuments(filter),
+        Lead.find(filter).sort(stable).skip((page - 1) * limit).limit(limit),
+      ]);
+      return res.json({
+        success: true,
+        leads: await decorate(rows),
+        page: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)), hasMore: page * limit < total },
+      });
     }
     // The plain status tabs return every lead, as they always have.
     let query = Lead.find(filter).sort(sort);
@@ -143,7 +178,100 @@ exports.getOne = async (req, res, next) => {
     const [json] = await decorate([lead]);
     let ref = null;
     try { ref = lead.phone ? customerRef(lead.phone) : null; } catch { ref = null; }
-    return res.json({ success: true, lead: { ...json, customerRef: ref } });
+    // Already booked: the booking it became, so the screen can open it
+    // instead of offering another booking from this lead.
+    let booking = null;
+    if (lead.convertedTrip) {
+      const t = await Trip.findById(lead.convertedTrip).select('tripNumber status createdAt').lean();
+      booking = t ? { _id: t._id, tripNumber: t.tripNumber, status: t.status, createdAt: t.createdAt } : { _id: lead.convertedTrip };
+    } else {
+      // An older booking the lead never recorded (Trip.leadId = this lead,
+      // convertedTrip unset): shown as a booking that needs review, so the
+      // screen opens it instead of offering a second one. Read only — the
+      // lead is not changed (services/leadBooking.js).
+      const { count, trips } = await require('../services/leadBooking').tripsOfLead(lead._id); // eslint-disable-line global-require
+      if (count) booking = { ...trips[0], needsReview: true, tripCount: count };
+    }
+    return res.json({ success: true, lead: { ...json, customerRef: ref, booking } });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ============================================================
+// @route   POST /api/leads
+// @body    { patientName, phone, message?, source?, assignToMe?, confirmDuplicate? }
+// @desc    A lead added by hand (owner / telecaller). Same model, statuses
+//          and masking as every other lead; records source, who added it
+//          and when (history 'created' + createdBy).
+//          Possible duplicates — any lead already on this number — are
+//          returned (409 DUPLICATE, masked) instead of silently creating a
+//          second record or merging; the operator can open the existing
+//          lead, or resend with confirmDuplicate: true to add a new one.
+//          No unique-phone rule: existing duplicates are left as they are.
+//          A per-number claim in the same transaction means two people
+//          saving the same number at once are serialised: the second sees
+//          the first one's lead as a possible duplicate.
+// ============================================================
+const MANUAL_SOURCES = ['manual', 'walk_in', 'referral', 'inbound_call'];
+const NAME_MAX = 100;
+const MESSAGE_MAX = 1000;
+exports.create = async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const patientName = typeof b.patientName === 'string' ? b.patientName.trim().slice(0, NAME_MAX) : '';
+    const phone = normalisePhone(typeof b.phone === 'string' ? b.phone : '');
+    const message = typeof b.message === 'string' ? b.message.trim().slice(0, MESSAGE_MAX) : '';
+    const source = b.source === undefined || b.source === '' ? 'manual' : b.source;
+    if (!patientName) return res.status(400).json({ success: false, code: 'NAME_REQUIRED', message: 'Enter the customer’s name.' });
+    if (!/^[6-9]\d{9}$/.test(phone)) return res.status(400).json({ success: false, code: 'PHONE_INVALID', message: 'Enter a 10-digit Indian mobile number.' });
+    if (typeof source !== 'string' || !MANUAL_SOURCES.includes(source)) return res.status(400).json({ success: false, code: 'SOURCE_INVALID', message: 'Unknown lead source.' });
+
+    const now = new Date();
+    const by = { by: req.user._id, byName: req.user.name };
+    const doc = {
+      source, phone, patientName, ...(message ? { message } : {}),
+      status: 'new', receivedAt: now, rev: 0,
+      createdBy: req.user._id, createdByName: req.user.name,
+      ...(b.assignToMe ? { assignedTo: req.user._id, assignedToName: req.user.name } : {}),
+      history: [
+        { type: 'created', at: now, ...by, detail: { source } },
+        ...(b.assignToMe ? [{ type: 'assigned', at: now, ...by, detail: { to: req.user.name } }] : []),
+      ],
+    };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let created = null;
+      let duplicates = [];
+      const session = await Lead.startSession();
+      try {
+        await session.withTransaction(async () => {
+          created = null; duplicates = [];
+          await LeadClaim.updateOne({ _id: `manual:${phone}` }, { $inc: { hits: 1 } }, { upsert: true, session });
+          if (!b.confirmDuplicate) {
+            duplicates = await Lead.find({ phone: phoneSuffixQuery(phone) }).sort({ createdAt: -1 }).limit(5).session(session);
+            if (duplicates.length) return;
+          }
+          [created] = await Lead.create([doc], { session });
+        });
+      } catch (err) {
+        if (err?.code !== 11000) throw err; // the claim's first insert raced: try again
+        continue;
+      } finally {
+        await session.endSession();
+      }
+      if (duplicates.length) {
+        return res.status(409).json({
+          success: false, code: 'DUPLICATE',
+          message: 'A lead with this number already exists. Open it, or add a new lead anyway.',
+          duplicates: await decorate(duplicates),
+        });
+      }
+      console.info(`[leads] created by hand lead=${created._id} source=${source} by=${req.user._id}`);
+      const [json] = await decorate([created]);
+      return res.status(201).json({ success: true, lead: json });
+    }
+    return res.status(409).json({ success: false, code: 'BUSY', message: 'Someone is saving a lead for this number right now. Try again in a moment.' });
   } catch (err) {
     next(err);
   }

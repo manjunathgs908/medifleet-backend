@@ -1,6 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
-const { maskPhone } = require('../utils/customerPhone');
+const { maskPhone, customerRef } = require('../utils/customerPhone');
 const { phoneLegVerdict } = require('../utils/phoneLegVerdict');
 const { fullPhone } = require('../utils/phoneViewer');
 const { maskNumbersInText } = require('../utils/maskNumbersInText');
@@ -173,6 +173,8 @@ CallLogSchema.set('toJSON', {
   transform(doc, ret) {
     if ('customerPhone' in ret) {
       ret.customerMasked = maskPhone(ret.customerPhone);
+      // Opaque link to the customer overview (never the number).
+      try { ret.customerRef = ret.customerPhone ? customerRef(ret.customerPhone) : undefined; } catch { /* not a usable number */ }
       const full = fullPhone(ret.customerPhone); // CRM owner only
       delete ret.customerPhone;
       if (full) ret.customerPhone = full;

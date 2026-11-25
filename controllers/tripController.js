@@ -28,6 +28,7 @@ const incomingBookings = require('../services/incomingBookings');
 const incomingAlerts = require('../services/incomingAlerts');
 const bookingPush = require('../services/bookingPush');
 const callCaptureBooking = require('../services/callCapture/booking');
+const leadBooking = require('../services/leadBooking');
 const fareCalculator = require('../utils/fareCalculator');
 const { applyAdvancesToNewBill } = require('../services/payments');
 const smsService = require('../utils/smsService');
@@ -344,6 +345,7 @@ exports.estimateTrip = async (req, res, next) => {
 // ============================================================
 exports.createTrip = async (req, res, next) => {
   let claimed = null;
+  let leadClaim = null;
   try {
     // Booked by an operator from a LIVE CALL CAPTURE draft (optional
     // callCaptureId, CRM staff only): the same booking, sourced
@@ -355,14 +357,42 @@ exports.createTrip = async (req, res, next) => {
       claimed = r.capture;
       body = callCaptureBooking.withPhone(req.body, r.capture, r.callerPhone);
     }
-    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, ...(claimed ? { bookingSource: 'ai_call_entry' } : {}) });
+    // Booked by CRM staff FROM A LEAD (services/leadBooking.js): one booking
+    // per lead, its number filled in server-side when left blank, an
+    // already-booked lead answered with its booking (409 ALREADY_BOOKED),
+    // a second submission at the same time refused (409 IN_PROGRESS), a lead
+    // that already carries an unrecorded older trip refused for review (409
+    // ALREADY_BOOKED, needsReview, bookings, tripCount).
+    // Only when staff send leadId; every other booking is unchanged.
+    if (req.body?.leadId && req.user) {
+      const r = await leadBooking.claim(req.body.leadId, req.user);
+      if (!r.ok) {
+        const { ok: _ok, status: _st, code, message, ...extra } = r;
+        return res.status(r.status).json({ success: false, code, message, ...extra });
+      }
+      leadClaim = r.claim;
+      body = leadBooking.withPhone(body, r.lead);
+    }
+    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, ...(claimed ? { bookingSource: 'ai_call_entry' } : {}), ...(leadClaim ? { leadClaim } : {}) });
     if (claimed) { await callCaptureBooking.link(claimed, trip); claimed = null; }
+    leadClaim = null; // completed inside the booking's transaction
     // Background push to the CRM — fire-and-forget, never affects the
     // booking. Sends only if the trip is incoming (not an operator's own).
     bookingPush.notifyIncomingBooking(trip._id);
     return res.status(201).json({ success: true, trip });
   } catch (err) {
     if (claimed) callCaptureBooking.release(claimed).catch(() => {});
+    // A failed booking from a lead created nothing (one transaction): free
+    // the claim so it can be retried. A claim taken over by another attempt
+    // is answered with that lead's current state (in progress / booked).
+    // So is a lead found, inside the transaction, to already carry a trip
+    // (an older orphaned booking): 409 ALREADY_BOOKED with needsReview.
+    if (leadClaim) await leadBooking.settle(leadClaim).catch(() => {});
+    if (err.code === 'LEAD_CLAIM_LOST' || err.code === 'LEAD_HAS_TRIP') {
+      const now = await leadBooking.statusOf(req.body.leadId).catch(() => null);
+      const { ok: _ok, status: _st, code, message, ...extra } = now || {};
+      return res.status(409).json({ success: false, code: code || 'IN_PROGRESS', message: message || 'This lead is being booked right now.', ...extra });
+    }
     if (err.isFareError) return res.status(400).json({ success: false, message: err.message });
     next(err);
   }
@@ -380,33 +410,11 @@ exports.createTrip = async (req, res, next) => {
 // replaced (a change that lands in between is re-read, not overwritten
 // blindly); a dashboard change from before the booking then gets a 409.
 // The follow-up reminder ends; its time stays in the history entry.
-async function convertLead(leadId, trip, bookedBy) {
-  const booker = bookedBy ? await User.findById(bookedBy).select('name').lean() : null;
-  const entry = (before) => ({
-    type: 'status', at: new Date(), by: bookedBy || undefined, byName: booker?.name,
-    detail: {
-      from: before ? before.status || 'new' : null, to: 'converted', trip: trip.tripNumber,
-      ...(before?.nextFollowUpAt ? { followUpCleared: before.nextFollowUpAt } : {}),
-    },
-  });
-  const update = (before) => ({
-    $set  : { status: 'converted', convertedTrip: trip._id },
-    $unset: { nextFollowUpAt: 1, lostReason: 1 },
-    $inc  : { rev: 1 },
-    $push : { history: entry(before) },
-  });
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const before = await Lead.findById(leadId).select('status nextFollowUpAt rev').lean();
-    if (!before) return;
-    const rev = before.rev || 0;
-    const done = await Lead.findOneAndUpdate({ _id: leadId, ...(rev === 0 ? { rev: { $in: [0, null] } } : { rev }) }, update(before));
-    if (done) return;
-  }
-  // Still contended after five tries: convert anyway — the trip exists.
-  await Lead.findByIdAndUpdate(leadId, update(null));
-}
+// (Moved to services/leadConversion.js — exactly-once, transaction-capable.)
+const { convertLead } = require('../services/leadConversion');
+const { customerRef: customerRefOf } = require('../utils/customerPhone');
 
-async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
+async function createBookedTrip(body, { bookedBy, bookingSource, leadClaim } = {}) {
   const {
     // Internal (owner/CRM) fields
     patientName, patientPhone, emergencyType,
@@ -494,10 +502,19 @@ async function createBookedTrip(body, { bookedBy, bookingSource } = {}) {
     ...(bookingSource ? { bookingSource } : {}),
   };
 
-  const trip = await Trip.create(tripData);
-
-  // Mark lead as converted if applicable
-  if (leadId) await convertLead(leadId, trip, bookedBy);
+  // Booked from a lead by CRM staff (createTrip, services/leadBooking.js):
+  // the claim check, the trip, the claim's completion and the lead's
+  // conversion (with its history entry) commit together in ONE transaction —
+  // a crash cannot leave a trip without its lead link, and a request whose
+  // claim was taken over cannot create a second trip.
+  let trip;
+  if (leadClaim) {
+    trip = await leadBooking.createWithClaim(leadClaim, tripData, (t, session) => convertLead(leadId, t, bookedBy, { session }));
+  } else {
+    trip = await Trip.create(tripData);
+    // Mark lead as converted if applicable
+    if (leadId) await convertLead(leadId, trip, bookedBy);
+  }
 
   // ── No auto-assign. Dispatch is a human decision. ─────────
   //
@@ -1896,9 +1913,16 @@ exports.getTrips = async (req, res, next) => {
     // The driver app also gets callNumber (dial-pad masked calling): the
     // masking number while the trip is callable, else null. Other callers'
     // responses are unchanged.
+    // CRM staff (a signed-in owner or telecaller User — never a fleet partner
+    // or driver) also get the opaque customer link for "View customer"
+    // (customerRef: never the number). Added field only.
+    const staffView = req.actorType === 'user' && ['owner', 'telecaller'].includes(req.user.role);
+    const refOf = (t) => { try { return t.patientPhone ? customerRefOf(t.patientPhone) : undefined; } catch { return undefined; } };
     const out = req.user.role === 'driver'
       ? trips.map((t) => ({ ...(typeof t.toJSON === 'function' ? t.toJSON() : t), callNumber: callNumberOf(t, 'driver') }))
-      : trips;
+      : staffView
+        ? trips.map((t) => { const ref = refOf(t); return { ...(typeof t.toJSON === 'function' ? t.toJSON() : t), ...(ref ? { customerRef: ref } : {}) }; })
+        : trips;
     return res.json({
       success: true,
       total,
@@ -1959,7 +1983,10 @@ exports.getLiveBoard = async (req, res, next) => {
     // plus how urgent it is — read-only: an overdue booking stays booked
     // and counted until an operator assigns or cancels it.
     const now = Date.now();
-    const liveTrips = activeTrips.map((t) => ({ ...t.toJSON(), dispatch: dispatchStateOf(t, now) }));
+    // CRM staff (not drivers) also get the opaque customer link (never the number).
+    const staffView = ['owner', 'telecaller'].includes(req.user?.role);
+    const refOf = (t) => { try { return staffView && t.patientPhone ? require('../utils/customerPhone').customerRef(t.patientPhone) : undefined; } catch { return undefined; } };
+    const liveTrips = activeTrips.map((t) => ({ ...t.toJSON(), dispatch: dispatchStateOf(t, now), ...(refOf(t) ? { customerRef: refOf(t) } : {}) }));
     return res.json({
       success: true,
       liveTrips,

@@ -668,7 +668,7 @@ const tripSchema = new Schema(
     // 'ai_call_entry': typed by an operator from a LIVE CALL CAPTURE draft
     // (services/callCapture) — the form the transcriber pre-filled, reviewed
     // and booked by that person (bookedBy set, so it does not ring).
-    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web', 'ai_telecaller', 'ai_call_entry'], default: 'app' },
+    bookingSource: { type: String, enum: ['app', 'crm', 'whatsapp', 'web', 'ai_telecaller', 'ai_call_entry', 'chatgpt_ads'], default: 'app' },
 
     // Set once at booking time from the customer's WhatsAppSession.language
     // and read back for every notification after -- the session itself is
@@ -1441,4 +1441,3 @@ module.exports = {
   ChatMessage,
   computeSegmentAmount,
 };
-

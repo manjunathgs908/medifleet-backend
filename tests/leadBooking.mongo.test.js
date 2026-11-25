@@ -256,4 +256,20 @@ maybe('lead booking on a real isolated MongoDB', () => {
     expect(String(json.lead.booking._id)).toBe(String(old._id));
     expect(await leadSnapshot()).toEqual(before);
   });
+  // ── booking attribution (origin/main: ChatGPT Ads) alongside the lead guard ──
+  test('attribution: an anonymous booking tagged chatgpt_ads is chatgpt_ads; staff, lead and untagged bookings keep their source; the lead guard still holds', async () => {
+    const anon = await post(undefined, { patientPhone: '9000000181', utmSource: 'chatgpt_ads' });
+    expect(anon.status).toBe(201);
+    expect((await Trip.findById(anon.json.trip._id).lean()).bookingSource).toBe('chatgpt_ads');
+    const plain = await post(undefined, { patientPhone: '9000000182' });
+    expect((await Trip.findById(plain.json.trip._id).lean()).bookingSource).toBe('app'); // schema default, unchanged
+    const staffTagged = await post(staff, { patientPhone: '9000000183', utmSource: 'chatgpt_ads' });
+    expect((await Trip.findById(staffTagged.json.trip._id).lean()).bookingSource).toBe('app'); // staff bookings are not ad traffic
+    const fromLead = await post(staff, { leadId: String(lead._id), utmSource: 'chatgpt_ads' });
+    expect(fromLead.status).toBe(201);
+    expect((await Trip.findById(fromLead.json.trip._id).lean()).bookingSource).toBe('app');
+    const again = await post(owner, { leadId: String(lead._id) });
+    expect(again).toMatchObject({ status: 409, json: { code: 'ALREADY_BOOKED' } });
+    expect(await state()).toMatchObject({ trips: 1, history: 1 });
+  });
 });

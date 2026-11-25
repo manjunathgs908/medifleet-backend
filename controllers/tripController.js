@@ -373,7 +373,14 @@ exports.createTrip = async (req, res, next) => {
       leadClaim = r.claim;
       body = leadBooking.withPhone(body, r.lead);
     }
-    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, ...(claimed ? { bookingSource: 'ai_call_entry' } : {}), ...(leadClaim ? { leadClaim } : {}) });
+    // Attribution (origin/main 5edea8c/cf36e7b): a live-call-capture draft is
+    // ai_call_entry; an anonymous booking tagged utmSource=chatgpt_ads is
+    // chatgpt_ads; anything else keeps the schema default. (Bookings from a
+    // lead always have req.user, so they are never chatgpt_ads.)
+    const bookingSource = claimed
+      ? 'ai_call_entry'
+      : !req.user && body?.utmSource === 'chatgpt_ads' ? 'chatgpt_ads' : undefined;
+    const trip = await createBookedTrip(body, { bookedBy: req.user?._id, bookingSource, ...(leadClaim ? { leadClaim } : {}) });
     if (claimed) { await callCaptureBooking.link(claimed, trip); claimed = null; }
     leadClaim = null; // completed inside the booking's transaction
     // Background push to the CRM — fire-and-forget, never affects the

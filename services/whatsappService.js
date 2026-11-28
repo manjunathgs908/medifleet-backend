@@ -169,4 +169,42 @@ async function sendTemplateResult(to, templateName, languageCode, components) {
   return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
 }
 
-module.exports = { sendText, sendButtons, sendList, sendTemplate, sendTemplateResult, sendDocument, sendLocationRequest };
+// ── Team inbox (services/waIntro.js): additive, never used by the bot ──
+// Each returns { ok: true, data } or { ok: false, error: { code, message } }
+// and never throws. Free-form messages: only inside WhatsApp's 24-hour
+// customer-service window — the caller checks that first.
+
+// Uploads an image to WhatsApp's own media store (not a public URL);
+// returns its media id in data.id.
+async function uploadMediaResult(buffer, contentType) {
+  try {
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('type', contentType);
+    form.append('file', new Blob([buffer], { type: contentType }), contentType === 'image/png' ? 'photo.png' : 'photo.jpg');
+    const res = await axios.post(`https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}/media`, form, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      timeout: 30000,
+    });
+    return res.data?.id ? { ok: true, data: res.data } : { ok: false, error: { code: null, message: 'WhatsApp returned no media id.' } };
+  } catch (err) {
+    console.error('[whatsappService] Media upload failed:', err.response?.data || err.message);
+    const e = err.response?.data?.error;
+    return { ok: false, error: { code: e?.code ?? null, message: e?.error_data?.details || e?.message || err.message } };
+  }
+}
+
+async function sendImageResult(to, mediaId, caption) {
+  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, ...(caption ? { caption } : {}) } });
+  return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
+}
+
+async function sendTextResult(to, body) {
+  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } });
+  return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
+}
+
+module.exports = {
+  sendText, sendButtons, sendList, sendTemplate, sendTemplateResult, sendDocument, sendLocationRequest,
+  uploadMediaResult, sendImageResult, sendTextResult,
+};

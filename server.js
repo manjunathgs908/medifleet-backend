@@ -100,6 +100,8 @@ app.use('/api/call',      require('./routes/callRoutes'));
 app.use('/api/sos',       sosRoutes);
 app.use('/api/whatsapp',  whatsappRoutes);
 app.use('/api/whatsapp-leads', whatsappLeadRoutes);
+app.use('/api/whatsapp-chats', require('./routes/waChats'));       // team inbox: assign / claim / intro (operations staff)
+app.use('/api/staff-profile', require('./routes/staffProfile'));   // own intro profile: photo, name, languages, consent
 
 app.use('/api/app/auth',  require('./routes/appAuth'));   // customer app phone login
 app.use('/api/seo',       require('./routes/seo'));       // owner-only

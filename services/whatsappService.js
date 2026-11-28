@@ -17,7 +17,18 @@ if (!WA_TOKEN || !WA_PHONE_NUMBER_ID) {
 // failure (bad token, invalid template, rate limit) must not crash
 // whatever flow step triggered it -- callers check the return value
 // (null on failure) instead of relying on a caught exception.
-async function postMessage(payload) {
+//
+// Every send is also written to the two-way message log AFTER it is made
+// (services/waMessageLog.js: never throws, never changes the payload, gives
+// up after a few seconds). meta tags who sent it (default: the bot);
+// meta.log === false skips it for a caller that logs the send itself.
+async function postMessage(payload, meta) {
+  const result = await postMessageRaw(payload);
+  if (meta?.log !== false) await require('./waMessageLog').logOutbound(payload, result, meta || {});
+  return result;
+}
+
+async function postMessageRaw(payload) {
   try {
     const res = await axios.post(BASE_URL, payload, {
       headers: {
@@ -194,13 +205,14 @@ async function uploadMediaResult(buffer, contentType) {
   }
 }
 
-async function sendImageResult(to, mediaId, caption) {
-  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, ...(caption ? { caption } : {}) } });
+// meta (optional): the message log's sender tag — see postMessage.
+async function sendImageResult(to, mediaId, caption, meta) {
+  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'image', image: { id: mediaId, ...(caption ? { caption } : {}) } }, meta);
   return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
 }
 
-async function sendTextResult(to, body) {
-  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } });
+async function sendTextResult(to, body, meta) {
+  const r = await postMessage({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }, meta);
   return r.data ? { ok: true, data: r.data } : { ok: false, error: r.error };
 }
 

@@ -34,6 +34,9 @@ const WhatsAppConversation = require('../models/WhatsAppConversation'); // team 
 const WhatsAppContact = require('../models/WhatsAppContact');
 const StaffProfile = require('../models/StaffProfile');
 const waIntro = require('../services/waIntro');
+const waChat = require('../services/waChat');           // two-way chat: message log + human takeover
+const waMessageLog = require('../services/waMessageLog');
+const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { Trip, Lead } = require('../models');
 const LeadClaim = require('../models/LeadClaim');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
@@ -297,6 +300,7 @@ router.post('/webhook', (req, res) => {
               status: report.status,
               errorCodes: errors.map(error => error?.code).filter(Number.isInteger),
             });
+            await waMessageLog.onStatus(report); // ✓ / ✓✓ in the CRM thread; never throws
           }
         }
       }
@@ -308,6 +312,12 @@ router.post('/webhook', (req, res) => {
       for (const message of messages) {
         if (!message?.id || isDuplicateMessage(message.id)) continue;
         try {
+          // Two-way chat (services/waChat.js, additive): every inbound
+          // message is logged first. A customer a staff member has taken
+          // over (mode 'human') gets NO automated reply — nothing below
+          // runs for them until the chat is handed back to the bot. Any
+          // doubt (database error) returns false: the bot runs as before.
+          if (await waChat.onInbound(message)) continue;
           // A pickup pin (or template button tap) answering a call's
           // "share your location" request is handled there, not by the bot
           // (services/locationRequests.js). The welcome template's "📍 Send
@@ -529,17 +539,22 @@ router.post('/call-outcome', protect, authorize(...OPERATIONS), async (req, res,
 // Each row also carries (additive) its assignee, rev, introduction, the
 // WhatsApp 24-hour window and the team-inbox buttons as THIS user may use
 // them (services/waIntro.js actionsFor) — never the number.
+// Two-way chat (additive): `mode` (bot | human, services/waChat.js), the
+// reply/takeover buttons in `actions`, and `lastMessage` — a preview of the
+// newest logged message, phone-like digits masked for non-owners.
 // ============================================================
 // Team-inbox fields for one /conversations row, as `user` sees them.
 function teamInbox(row, user, profile) {
-  const conv = row.conv?.rev != null || row.conv?.assignedTo ? row.conv : null;
+  const conv = row.conv?.rev != null || row.conv?.assignedTo || row.conv?.mode ? row.conv : null;
   const win = waIntro.windowFrom(row.lastInboundAt);
   return {
     assignee: conv?.assignedTo ? { _id: conv.assignedTo, name: conv.assignedToName } : null,
     rev: conv?.rev || 0,
     intro: conv?.intro?.at ? { sent: true, at: conv.intro.at, byName: conv.intro.byName } : { sent: false },
     window: { open: win.open, closesAt: win.closesAt },
-    actions: waIntro.actionsFor(conv, user, profile, win),
+    actions: { ...waIntro.actionsFor(conv, user, profile, win), ...waChat.chatActionsFor(conv, user, win) },
+    mode: waChat.modeState(conv),
+    lastMessage: waChat.lastMessagePreview(row.lastMessage),
   };
 }
 
@@ -576,6 +591,20 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
     rowsPipeline.push(
       { $sort: { lastSeenAt: -1 } },
       { $limit: 300 },
+      // Two-way chat: the newest logged message (preview on the card).
+      {
+        $lookup: {
+          from: WhatsAppMessage.collection.name,
+          let: { p: '$_p10' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$phone', '$$p'] } } },
+            { $sort: { at: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, direction: 1, sender: 1, type: 1, body: 1, at: 1 } },
+          ],
+          as: '_lastMessage',
+        },
+      },
       {
         $project: {
           _id: 0,
@@ -598,7 +627,9 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
           conv: {
             assignedTo: '$_conv.assignedTo', assignedToName: '$_conv.assignedToName', assignedAt: '$_conv.assignedAt',
             rev: '$_conv.rev', intro: '$_conv.intro', handoverFrom: '$_conv.handoverFrom', handovers: '$_conv.handovers',
+            mode: '$_conv.mode', modeAt: '$_conv.modeAt', modeByName: '$_conv.modeByName',
           },
+          lastMessage: { $arrayElemAt: ['$_lastMessage', 0] },
         },
       },
     );

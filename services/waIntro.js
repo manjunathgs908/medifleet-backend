@@ -141,7 +141,8 @@ async function sendIntro(phone10, user, { now = Date.now() } = {}) {
   const caption = introCaption(profile);
   const media = await whatsapp.uploadMediaResult(Buffer.from(profile.photo.data.buffer || profile.photo.data), profile.photo.contentType);
   if (!media.ok) { await release(); return fail(502, 'WHATSAPP', `WhatsApp did not accept the photo: ${media.error?.message || 'unknown error'}. Nothing was sent.`); }
-  const sentMsg = await whatsapp.sendImageResult(waTo(phone10), media.data.id, caption);
+  const sentMsg = await whatsapp.sendImageResult(waTo(phone10), media.data.id, caption,
+    { sender: 'staff', senderName: user.name, senderUser: user._id, kind: 'intro', media: { kind: 'profile', user: user._id } }); // message log tag
   if (!sentMsg.ok) { await release(); return fail(502, 'WHATSAPP', `WhatsApp did not send the introduction: ${sentMsg.error?.message || 'unknown error'}.`); }
   const wamid = sentMsg.data?.messages?.[0]?.id || null;
   const byName = profile.displayName || user.name;
@@ -171,7 +172,7 @@ async function sendHandover(phone10, user, { now = Date.now() } = {}) {
   );
   if (!claimed) return fail(409, 'IN_PROGRESS', 'The handover message is being sent or was just sent — refresh the chat.');
   const text = handoverText(profile.displayName);
-  const r = await whatsapp.sendTextResult(waTo(phone10), text);
+  const r = await whatsapp.sendTextResult(waTo(phone10), text, { sender: 'staff', senderName: user.name, senderUser: user._id, kind: 'handover' }); // message log tag
   if (!r.ok) {
     await WhatsAppConversation.updateOne({ phone: phone10 }, { $pull: { handovers: { by: user._id, sendingAt: new Date(now), at: null } } });
     return fail(502, 'WHATSAPP', `WhatsApp did not send the handover message: ${r.error?.message || 'unknown error'}.`);

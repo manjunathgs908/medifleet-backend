@@ -60,6 +60,8 @@ beforeAll(async () => {
     rows  : [{ phone: `91${PHONE}`, lastStep: 'X', completed: false }],
   }]);
   jest.spyOn(WhatsAppFunnelEvent, 'find').mockReturnValue(chain([{ step: 'AWAITING_LANGUAGE', enteredAt: new Date() }]));
+  // WhatsApp Chats list: the viewer's own introduction profile (team inbox).
+  jest.spyOn(require('../models/StaffProfile'), 'findOne').mockReturnValue(chain(null));
   jest.spyOn(WhatsAppCallLog, 'find').mockReturnValue(chain([{ phone: `91${PHONE}`, outcome: 'booked', createdAt: new Date() }]));
   jest.spyOn(Trip, 'find').mockReturnValue(chain([{ tripNumber: 'TRP-1', patientPhone: PHONE, status: 'completed' }]));
   jest.spyOn(Quote, 'find').mockReturnValue(chain([{ _id: 'q1', phone: PHONE, status: 'sent', sentAt: new Date(), expiresAt: new Date(Date.now() + 3600e3) }]));

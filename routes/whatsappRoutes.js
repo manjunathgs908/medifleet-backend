@@ -30,6 +30,10 @@ const waWelcomeLocation = require('../services/waWelcomeLocation');
 const WhatsAppFunnelEvent = require('../models/WhatsAppFunnelEvent');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const WhatsAppCallLog = require('../models/WhatsAppCallLog');
+const WhatsAppConversation = require('../models/WhatsAppConversation'); // team inbox (routes/waChats.js)
+const WhatsAppContact = require('../models/WhatsAppContact');
+const StaffProfile = require('../models/StaffProfile');
+const waIntro = require('../services/waIntro');
 const { Trip, Lead } = require('../models');
 const LeadClaim = require('../models/LeadClaim');
 const { normalisePhone, phoneSuffixQuery } = require('../utils/phone');
@@ -520,7 +524,25 @@ router.post('/call-outcome', protect, authorize(...OPERATIONS), async (req, res,
 //   bucket - all | needs_call | done (default all) -- needsCall/done are
 //            computed from WhatsAppCallLog, independent of status, and
 //            combine with it (both filters apply together).
+//   assignee - all (default) | me | unassigned | <userId> (owner only) --
+//            the team-inbox owner of the chat (models/WhatsAppConversation).
+// Each row also carries (additive) its assignee, rev, introduction, the
+// WhatsApp 24-hour window and the team-inbox buttons as THIS user may use
+// them (services/waIntro.js actionsFor) — never the number.
 // ============================================================
+// Team-inbox fields for one /conversations row, as `user` sees them.
+function teamInbox(row, user, profile) {
+  const conv = row.conv?.rev != null || row.conv?.assignedTo ? row.conv : null;
+  const win = waIntro.windowFrom(row.lastInboundAt);
+  return {
+    assignee: conv?.assignedTo ? { _id: conv.assignedTo, name: conv.assignedToName } : null,
+    rev: conv?.rev || 0,
+    intro: conv?.intro?.at ? { sent: true, at: conv.intro.at, byName: conv.intro.byName } : { sent: false },
+    window: { open: win.open, closesAt: win.closesAt },
+    actions: waIntro.actionsFor(conv, user, profile, win),
+  };
+}
+
 router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res, next) => {
   try {
     const parsedDays = parseInt(req.query.days, 10);
@@ -529,6 +551,17 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
 
     const status = ['all', 'dropped', 'completed'].includes(req.query.status) ? req.query.status : 'all';
     const bucket = ['all', 'needs_call', 'done'].includes(req.query.bucket) ? req.query.bucket : 'all';
+
+    // Team inbox: whose chats.
+    const assignee = String(req.query.assignee || 'all');
+    let assigneeMatch = null;
+    if (assignee === 'me') assigneeMatch = { _assignedTo: req.user._id };
+    else if (assignee === 'unassigned') assigneeMatch = { _assignedTo: null };
+    else if (assignee !== 'all') {
+      if (!mongoose.isValidObjectId(assignee)) return res.status(400).json({ success: false, message: 'Unknown staff member.' });
+      if (req.user.role !== 'owner' && assignee !== String(req.user._id)) return res.status(403).json({ success: false, message: 'You can filter by your own chats only.' });
+      assigneeMatch = { _assignedTo: new mongoose.Types.ObjectId(assignee) };
+    }
 
     const { TERMINAL_STEP, STEP_LABELS } = whatsappFlow;
 
@@ -561,6 +594,11 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
           noAnswerCount: 1,
           needsCall: 1,
           isReturning: 1,
+          lastInboundAt: '$_lastInboundAt',
+          conv: {
+            assignedTo: '$_conv.assignedTo', assignedToName: '$_conv.assignedToName', assignedAt: '$_conv.assignedAt',
+            rev: '$_conv.rev', intro: '$_conv.intro', handoverFrom: '$_conv.handoverFrom', handovers: '$_conv.handovers',
+          },
         },
       },
     );
@@ -588,6 +626,16 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
           completed: { $max: { $cond: [{ $eq: ['$step', TERMINAL_STEP] }, true, false] } },
         },
       },
+
+      // Team inbox (additive): the chat's assignee + introduction, and the
+      // customer's last inbound message (the 24-hour window). Both are keyed
+      // by the 10-digit number; WhatsApp numbers here carry the 91 prefix.
+      { $addFields: { _p10: { $substrCP: ['$_id', { $max: [0, { $subtract: [{ $strLenCP: '$_id' }, 10] }] }, 10] } } },
+      { $lookup: { from: WhatsAppConversation.collection.name, localField: '_p10', foreignField: 'phone', as: '_conv' } },
+      { $lookup: { from: WhatsAppContact.collection.name, localField: '_p10', foreignField: 'phone', as: '_contact' } },
+      { $addFields: { _conv: { $arrayElemAt: ['$_conv', 0] }, _lastInboundAt: { $arrayElemAt: ['$_contact.lastInboundAt', 0] } } },
+      { $addFields: { _assignedTo: { $ifNull: ['$_conv.assignedTo', null] } } },
+      ...(assigneeMatch ? [{ $match: assigneeMatch }] : []),
 
       // Cross-reference the live (non-TTL-expired) session collection --
       // .collection.name rather than a hardcoded 'whatsappsessions' string,
@@ -711,6 +759,7 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
     // customerRef stands in for the number everywhere the CRM used it: the
     // row key, logging an outcome, opening history and placing a masked
     // call. phoneMasked is what it displays.
+    const myProfile = await StaffProfile.findOne({ user: req.user._id }).lean();
     const conversations = result.rows.map((row) => ({
       customerRef: customerRef(row.phone),
       phoneMasked: maskPhone(row.phone),
@@ -730,6 +779,7 @@ router.get('/conversations', protect, authorize(...OPERATIONS), async (req, res,
       noAnswerCount: row.noAnswerCount,
       needsCall: row.needsCall,
       isReturning: row.isReturning,
+      ...teamInbox(row, req.user, myProfile),
     }));
 
     res.json({

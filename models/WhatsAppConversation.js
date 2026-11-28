@@ -38,14 +38,23 @@ const WhatsAppConversationSchema = new mongoose.Schema({
   assignedToName: { type: String },
   assignedAt    : { type: Date },
   rev           : { type: Number, default: 0 },
+  // Human takeover (services/waChat.js): 'human' = a staff member is
+  // handling this customer, and the webhook only LOGS their messages — no
+  // bot, no automated reply — until someone hands the chat back ('bot').
+  // Affects this one customer only. A missing field means 'bot'.
+  mode          : { type: String, enum: ['bot', 'human'], default: 'bot' },
+  modeAt        : { type: Date },
+  modeBy        : { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  modeByName    : { type: String },
   history       : [{
     _id   : false,
-    type  : { type: String, enum: ['assigned', 'claimed', 'unassigned'] },
+    type  : { type: String, enum: ['assigned', 'claimed', 'unassigned', 'takeover', 'handback'] },
     at    : Date,
     by    : { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     byName: String,
     from  : String,
     to    : String,
+    via   : String, // takeover/handback: 'button' | 'reply' | 'unassigned'
   }],
   intro: {
     ...sent,
